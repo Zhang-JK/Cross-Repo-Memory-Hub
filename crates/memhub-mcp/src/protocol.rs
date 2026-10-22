@@ -32,10 +32,19 @@ pub struct Message {
 impl Message {
     pub fn parse(value: Value) -> Result<Self, Value> {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
-        let msg: Message = serde_json::from_value(value)
-            .map_err(|e| error_response(id.clone(), INVALID_REQUEST, &format!("invalid request: {e}")))?;
+        let msg: Message = serde_json::from_value(value).map_err(|e| {
+            error_response(
+                id.clone(),
+                INVALID_REQUEST,
+                &format!("invalid request: {e}"),
+            )
+        })?;
         if msg.jsonrpc.as_deref() != Some("2.0") {
-            return Err(error_response(id, INVALID_REQUEST, "jsonrpc must be \"2.0\""));
+            return Err(error_response(
+                id,
+                INVALID_REQUEST,
+                "jsonrpc must be \"2.0\"",
+            ));
         }
         Ok(msg)
     }

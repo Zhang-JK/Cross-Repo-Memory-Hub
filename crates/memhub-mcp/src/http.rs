@@ -24,7 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memhub_app::{AppError, ConnInfo, Hub};
+use memhub_app::{ConnInfo, Hub};
 use serde_json::{json, Value};
 
 use crate::{
@@ -33,9 +33,10 @@ use crate::{
 };
 
 pub const SESSION_HEADER: &str = "mcp-session-id";
-/// Optional pre-authentication at `initialize` time.
+/// Optional identification at `initialize` time (same as calling `connect_agent`).
 pub const AGENT_HEADER: &str = "x-memhub-agent";
-pub const TOKEN_HEADER: &str = "x-memhub-token";
+/// Role used to create the agent if `x-memhub-agent` names a new one.
+pub const ROLE_HEADER: &str = "x-memhub-role";
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
@@ -91,9 +92,8 @@ impl HttpState {
             let ids: Vec<String> = sessions
                 .iter()
                 .filter(|(_, conn)| {
-                    conn.try_lock().is_ok_and(|c| {
-                        now.duration_since(c.last_seen()) > self.config.idle_timeout
-                    })
+                    conn.try_lock()
+                        .is_ok_and(|c| now.duration_since(c.last_seen()) > self.config.idle_timeout)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -123,14 +123,18 @@ fn close_shared(conn: SharedConnection, reason: &str) {
 
 pub fn router(state: Arc<HttpState>) -> Router {
     Router::new()
-        .route("/mcp", post(handle_post).get(handle_get).delete(handle_delete))
+        .route(
+            "/mcp",
+            post(handle_post).get(handle_get).delete(handle_delete),
+        )
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
         .with_state(state)
 }
 
 /// Background task that periodically reaps idle sessions.
 pub fn spawn_reaper(state: Arc<HttpState>) -> tokio::task::JoinHandle<()> {
-    let period = (state.config.idle_timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
+    let period =
+        (state.config.idle_timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
         loop {
@@ -194,7 +198,11 @@ async fn handle_post(
     body: Bytes,
 ) -> Response {
     if !origin_allowed(&state.config, &headers) {
-        return rpc_error(StatusCode::FORBIDDEN, protocol::INVALID_REQUEST, "origin not allowed");
+        return rpc_error(
+            StatusCode::FORBIDDEN,
+            protocol::INVALID_REQUEST,
+            "origin not allowed",
+        );
     }
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -209,7 +217,11 @@ async fn handle_post(
     let batch = payload.is_array();
     let raw: Vec<Value> = match payload {
         Value::Array(items) if items.is_empty() => {
-            return rpc_error(StatusCode::BAD_REQUEST, protocol::INVALID_REQUEST, "empty batch")
+            return rpc_error(
+                StatusCode::BAD_REQUEST,
+                protocol::INVALID_REQUEST,
+                "empty batch",
+            )
         }
         Value::Array(items) => items,
         other => vec![other],
@@ -280,9 +292,14 @@ async fn handle_post(
     }
 }
 
-async fn initialize(state: Arc<HttpState>, ip: String, headers: &HeaderMap, msg: Message) -> Response {
+async fn initialize(
+    state: Arc<HttpState>,
+    ip: String,
+    headers: &HeaderMap,
+    msg: Message,
+) -> Response {
     let agent = header_str(headers, AGENT_HEADER).map(str::to_owned);
-    let token = header_str(headers, TOKEN_HEADER).map(str::to_owned);
+    let role = header_str(headers, ROLE_HEADER).map(str::to_owned);
     let hub = state.hub.clone();
     let opened = tokio::task::spawn_blocking(move || {
         let conn_info = ConnInfo {
@@ -292,8 +309,8 @@ async fn initialize(state: Arc<HttpState>, ip: String, headers: &HeaderMap, msg:
         };
         let (mut conn, response) = McpConnection::initialize(&hub, conn_info, &msg);
         if let Some(agent) = agent {
-            if let Err(e) = conn.session_mut().login(&agent, token.as_deref()) {
-                conn.close("auth_failed");
+            if let Err(e) = conn.session_mut().connect(&agent, role.as_deref(), None) {
+                conn.close("connect_failed");
                 return Err(e);
             }
         }
@@ -304,11 +321,11 @@ async fn initialize(state: Arc<HttpState>, ip: String, headers: &HeaderMap, msg:
     let (conn, response) = match opened {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            let status = match e {
-                AppError::AuthFailed(_) | AppError::UnknownAgent(_) => StatusCode::UNAUTHORIZED,
-                _ => StatusCode::BAD_REQUEST,
-            };
-            return rpc_error(status, protocol::INVALID_REQUEST, &e.to_string());
+            return rpc_error(
+                StatusCode::BAD_REQUEST,
+                protocol::INVALID_REQUEST,
+                &e.to_string(),
+            );
         }
         Err(e) => {
             tracing::error!("initialize panicked: {e}");

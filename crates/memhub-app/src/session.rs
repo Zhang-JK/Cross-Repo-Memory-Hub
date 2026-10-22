@@ -11,8 +11,8 @@ use serde::Serialize;
 use crate::{
     diff::unified_diff,
     error::{AppError, Result},
-    hub::{AuthMode, Hub},
-    registry::{hash_token, new_token, AgentInfo, AgentProfile, RepoProfile},
+    hub::Hub,
+    registry::{AgentProfile, RepoProfile},
 };
 
 /// Transport-level facts about a connection.
@@ -27,15 +27,15 @@ pub struct ConnInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Registration {
-    pub agent: AgentInfo,
-    /// Shown once. Required by `connect_agent` when the hub runs in token mode.
-    pub token: String,
+pub struct Connected {
+    pub agent: AgentProfile,
+    /// The agent did not exist before and was created by this call.
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WhoAmI {
-    pub agent: AgentInfo,
+    pub agent: AgentProfile,
     pub session_id: String,
     pub ip: String,
     pub transport: String,
@@ -72,13 +72,12 @@ pub struct AddMemory {
     pub slug: Option<String>,
 }
 
-/// One agent connection. Identity is established with [`register`] or
-/// [`login`]; every memory operation is permission-checked and audited.
+/// One agent connection. Identity is established with [`connect`]; every
+/// memory operation is permission-checked and audited.
 ///
 /// Dropping a session without [`close`] still logs a disconnect.
 ///
-/// [`register`]: AgentSession::register
-/// [`login`]: AgentSession::login
+/// [`connect`]: AgentSession::connect
 /// [`close`]: AgentSession::close
 pub struct AgentSession {
     hub: Arc<Hub>,
@@ -151,96 +150,77 @@ impl AgentSession {
 
     // ---- identity -------------------------------------------------------
 
-    /// First-time registration. Identifies this session as the new agent.
-    pub fn register(&mut self, name: &str, role: &str, description: &str) -> Result<Registration> {
-        if let Some(current) = &self.agent {
-            return Err(AppError::AlreadyIdentified(current.clone()));
-        }
-        let name = name.trim();
-        let role = role.trim();
-        validate_name("agent name", name)?;
-        validate_label("role", role)?;
-
-        let token = new_token();
-        let now = Utc::now();
-        let profile = AgentProfile {
-            name: name.to_string(),
-            role: role.to_string(),
-            description: description.trim().to_string(),
-            repos: Vec::new(),
-            created_at: now,
-            last_seen_at: Some(now),
-            token_hash: hash_token(&token),
-        };
-        self.hub.registry().create_agent(&profile)?;
-        self.agent = Some(name.to_string());
-        self.hub.audit().record(AuditEvent::AgentRegistered {
-            actor: self.actor(),
-            role: role.to_string(),
-        });
-        Ok(Registration {
-            agent: profile.info(),
-            token,
-        })
-    }
-
-    /// Identifies this session as an existing agent.
-    pub fn login(&mut self, name: &str, token: Option<&str>) -> Result<AgentInfo> {
+    /// Identifies this session by agent name. The name is the identity: any
+    /// user running the same agent shares its memory space. An unknown name
+    /// is created when `role` is given; for an existing agent `role` and
+    /// `description` are ignored.
+    pub fn connect(
+        &mut self,
+        name: &str,
+        role: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<Connected> {
         let name = name.trim();
         if let Some(current) = &self.agent {
             if current != name {
                 return Err(AppError::AlreadyIdentified(current.clone()));
             }
+            return Ok(Connected {
+                agent: self.profile()?,
+                created: false,
+            });
         }
         validate_name("agent name", name)?;
 
-        let fail = |this: &Self, err: AppError| {
-            this.hub.audit().record(AuditEvent::AuthFailed {
-                actor: this.actor(),
-                claimed_agent: name.to_string(),
-                reason: err.code().to_string(),
-            });
-            Err(err)
-        };
-
-        let Some(profile) = self.hub.registry().agent(name)? else {
-            return fail(self, AppError::UnknownAgent(name.to_string()));
-        };
-        if self.hub.config().auth == AuthMode::Token
-            && !token.is_some_and(|t| profile.token_matches(t.trim()))
-        {
-            return fail(self, AppError::AuthFailed(name.to_string()));
+        let mut created = false;
+        if self.hub.registry().agent(name)?.is_none() {
+            let role = role
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .ok_or_else(|| AppError::UnknownAgent(name.to_string()))?;
+            validate_label("role", role)?;
+            let now = Utc::now();
+            // `false` means a concurrent connection created it first; join that one.
+            created = self.hub.registry().create_agent(&AgentProfile {
+                name: name.to_string(),
+                role: role.to_string(),
+                description: description.unwrap_or_default().trim().to_string(),
+                repos: Vec::new(),
+                created_at: now,
+                last_seen_at: Some(now),
+            })?;
         }
 
-        let first_login = self.agent.is_none();
         self.agent = Some(name.to_string());
-        self.hub.touch_agent(name)?;
-        if first_login {
+        if created {
+            self.hub.audit().record(AuditEvent::AgentRegistered {
+                actor: self.actor(),
+                role: role.unwrap_or_default().trim().to_string(),
+            });
+        } else {
+            self.hub.touch_agent(name)?;
             self.hub.audit().record(AuditEvent::AgentLogin {
                 actor: self.actor(),
             });
         }
-        Ok(self.profile()?.info())
+        Ok(Connected {
+            agent: self.profile()?,
+            created,
+        })
     }
 
     pub fn whoami(&self) -> Result<WhoAmI> {
         Ok(WhoAmI {
-            agent: self.profile()?.info(),
+            agent: self.profile()?,
             session_id: self.id.clone(),
             ip: self.conn.ip.clone(),
             transport: self.conn.transport.clone(),
         })
     }
 
-    pub fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+    pub fn list_agents(&self) -> Result<Vec<AgentProfile>> {
         self.require_agent()?;
-        Ok(self
-            .hub
-            .registry()
-            .agents()?
-            .iter()
-            .map(AgentProfile::info)
-            .collect())
+        self.hub.registry().agents()
     }
 
     fn require_agent(&self) -> Result<&str> {

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use memhub_app::{audit::LogQuery, AuthMode, Hub, HubConfig};
+use memhub_app::{audit::LogQuery, Hub, HubConfig};
 use memhub_mcp::{
     http::{self, HttpConfig, HttpState},
     stdio::{self, StdioLogin},
@@ -11,15 +11,20 @@ use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "memhub", version, about = "Cross-Repo Memory Hub: shared memory for multiple agents across multiple repos")]
+#[command(
+    name = "memhub",
+    version,
+    about = "Cross-Repo Memory Hub: shared memory for multiple agents across multiple repos"
+)]
 struct Cli {
     /// Data directory holding memories, registry and audit logs.
-    #[arg(long, global = true, env = "MEMHUB_DATA_DIR", default_value = "./memhub-data")]
+    #[arg(
+        long,
+        global = true,
+        env = "MEMHUB_DATA_DIR",
+        default_value = "./memhub-data"
+    )]
     data_dir: PathBuf,
-
-    /// Agent authentication: "token" (register issues a token) or "open" (name only).
-    #[arg(long, global = true, env = "MEMHUB_AUTH", default_value = "token")]
-    auth: AuthMode,
 
     #[command(subcommand)]
     command: Command,
@@ -43,16 +48,15 @@ enum Command {
     },
     /// Run the MCP server over stdio (one agent per process).
     Stdio {
-        /// Log in as this agent right after initialize.
+        /// Connect as this agent right after initialize.
         #[arg(long, env = "MEMHUB_AGENT")]
         agent: Option<String>,
-        #[arg(long, env = "MEMHUB_TOKEN", hide_env_values = true)]
-        token: Option<String>,
+        /// Role used to create the agent if it does not exist yet.
+        #[arg(long, env = "MEMHUB_ROLE")]
+        role: Option<String>,
     },
     /// List registered agents.
     Agents,
-    /// Issue a new token for an agent that lost its own.
-    ResetToken { agent: String },
     /// Show audit log records (connections and memory changes).
     Logs {
         #[arg(long)]
@@ -85,11 +89,8 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let hub = Hub::open(HubConfig {
-        data_root: cli.data_dir.clone(),
-        auth: cli.auth,
-    })
-    .with_context(|| format!("cannot open data dir {}", cli.data_dir.display()))?;
+    let hub = Hub::open(HubConfig::new(&cli.data_dir))
+        .with_context(|| format!("cannot open data dir {}", cli.data_dir.display()))?;
 
     match cli.command {
         Command::Serve {
@@ -105,8 +106,8 @@ fn main() -> anyhow::Result<()> {
             };
             tokio::runtime::Runtime::new()?.block_on(serve(hub, bind, config))
         }
-        Command::Stdio { agent, token } => {
-            stdio::run(hub, StdioLogin { agent, token })?;
+        Command::Stdio { agent, role } => {
+            stdio::run(hub, StdioLogin { agent, role })?;
             Ok(())
         }
         Command::Agents => {
@@ -122,11 +123,6 @@ fn main() -> anyhow::Result<()> {
                     agent.repos.join(", ")
                 );
             }
-            Ok(())
-        }
-        Command::ResetToken { agent } => {
-            let token = hub.reset_token(&agent)?;
-            println!("{token}");
             Ok(())
         }
         Command::Logs {
@@ -158,7 +154,11 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn serve(hub: std::sync::Arc<Hub>, bind: SocketAddr, config: HttpConfig) -> anyhow::Result<()> {
+async fn serve(
+    hub: std::sync::Arc<Hub>,
+    bind: SocketAddr,
+    config: HttpConfig,
+) -> anyhow::Result<()> {
     let state = HttpState::new(hub.clone(), config);
     let reaper = http::spawn_reaper(state.clone());
     let app = http::router(state.clone());
@@ -167,9 +167,8 @@ async fn serve(hub: std::sync::Arc<Hub>, bind: SocketAddr, config: HttpConfig) -
         .await
         .with_context(|| format!("cannot bind {bind}"))?;
     tracing::info!(
-        "memhub listening on http://{bind}/mcp (data dir {}, auth {:?})",
-        hub.data_root().display(),
-        hub.config().auth
+        "memhub listening on http://{bind}/mcp (data dir {})",
+        hub.data_root().display()
     );
     axum::serve(
         listener,
@@ -192,18 +191,26 @@ fn print_record(r: &Value, with_diff: bool) {
     let agent = r.get("agent").and_then(Value::as_str).unwrap_or("-");
     let event = s("event");
     let detail = match event {
-        "connect" => format!("client={}", r.get("client").and_then(Value::as_str).unwrap_or("?")),
+        "connect" => format!(
+            "client={}",
+            r.get("client").and_then(Value::as_str).unwrap_or("?")
+        ),
         "disconnect" => format!(
             "reason={} after {:.1}s",
             s("reason"),
-            r.get("duration_secs").and_then(Value::as_f64).unwrap_or(0.0)
+            r.get("duration_secs")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
         ),
         "agent_registered" => format!("role={}", s("role")),
-        "auth_failed" => format!("claimed={} reason={}", s("claimed_agent"), s("reason")),
         "repo_joined" | "repo_left" => format!(
             "repo={}{}",
             s("repo"),
-            if r.get("created") == Some(&Value::Bool(true)) { " (new)" } else { "" }
+            if r.get("created") == Some(&Value::Bool(true)) {
+                " (new)"
+            } else {
+                ""
+            }
         ),
         "memory_changed" => {
             let v = |k: &str| r.get(k).and_then(Value::as_u64);
@@ -216,7 +223,12 @@ fn print_record(r: &Value, with_diff: bool) {
             let fields = r
                 .get("changed_fields")
                 .and_then(Value::as_array)
-                .map(|f| f.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
+                .map(|f| {
+                    f.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
                 .unwrap_or_default();
             let mut d = format!(
                 "{} {} \"{}\" {versions}",

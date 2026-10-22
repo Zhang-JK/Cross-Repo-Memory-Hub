@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Actor {
     pub session_id: String,
-    /// `None` until the connection has registered or logged in.
+    /// `None` until the connection has identified itself by agent name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// Remote IP of the connector (`"local"` for stdio).
@@ -61,16 +61,6 @@ pub enum AuditEvent {
         #[serde(flatten)]
         actor: Actor,
     },
-    TokenReset {
-        #[serde(flatten)]
-        actor: Actor,
-    },
-    AuthFailed {
-        #[serde(flatten)]
-        actor: Actor,
-        claimed_agent: String,
-        reason: String,
-    },
     RepoJoined {
         #[serde(flatten)]
         actor: Actor,
@@ -110,8 +100,6 @@ impl AuditEvent {
             AuditEvent::Disconnect { .. } => "disconnect",
             AuditEvent::AgentRegistered { .. } => "agent_registered",
             AuditEvent::AgentLogin { .. } => "agent_login",
-            AuditEvent::TokenReset { .. } => "token_reset",
-            AuditEvent::AuthFailed { .. } => "auth_failed",
             AuditEvent::RepoJoined { .. } => "repo_joined",
             AuditEvent::RepoLeft { .. } => "repo_left",
             AuditEvent::MemoryChanged { .. } => "memory_changed",

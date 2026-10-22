@@ -1,5 +1,8 @@
-//! Application layer: agent registration and login, working repos,
-//! permission checks and auditing on top of [`memhub_store`].
+//! Application layer: agent identification, working repos, permission
+//! checks and auditing on top of [`memhub_store`].
+//!
+//! Agents are identified by name only, so every user running the same agent
+//! shares that agent's memory space.
 //!
 //! Access rules:
 //! - every memory is readable by every identified agent;
@@ -13,9 +16,9 @@ mod registry;
 mod session;
 
 pub use error::{AppError, Result};
-pub use hub::{AuthMode, Hub, HubConfig};
-pub use registry::{AgentInfo, AgentProfile, RepoProfile};
-pub use session::{AddMemory, AgentSession, ConnInfo, Registration, RepoJoin, RepoSummary, WhoAmI};
+pub use hub::{Hub, HubConfig};
+pub use registry::{AgentProfile, RepoProfile};
+pub use session::{AddMemory, AgentSession, ConnInfo, Connected, RepoJoin, RepoSummary, WhoAmI};
 
 pub use memhub_audit as audit;
 pub use memhub_store as store;

@@ -14,7 +14,6 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 
@@ -31,47 +30,11 @@ pub struct AgentProfile {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// SHA-256 of the agent's access token.
-    #[serde(default)]
-    pub token_hash: String,
-}
-
-/// Public view of an agent (no credentials).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentInfo {
-    pub name: String,
-    pub role: String,
-    pub description: String,
-    pub repos: Vec<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 impl AgentProfile {
-    pub fn info(&self) -> AgentInfo {
-        AgentInfo {
-            name: self.name.clone(),
-            role: self.role.clone(),
-            description: self.description.clone(),
-            repos: self.repos.clone(),
-            created_at: self.created_at,
-            last_seen_at: self.last_seen_at,
-        }
-    }
-
     pub fn works_on(&self, repo: &str) -> bool {
         self.repos.iter().any(|r| r == repo)
-    }
-
-    pub fn token_matches(&self, token: &str) -> bool {
-        let candidate = hash_token(token);
-        // Constant-time comparison of the hex digests.
-        candidate.len() == self.token_hash.len()
-            && candidate
-                .bytes()
-                .zip(self.token_hash.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
     }
 }
 
@@ -85,18 +48,6 @@ pub struct RepoProfile {
     pub location: Option<String>,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
-}
-
-pub fn new_token() -> String {
-    format!(
-        "mh_{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-pub fn hash_token(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 pub struct Registry {
@@ -132,14 +83,9 @@ impl Registry {
         list_yaml(&self.agents)
     }
 
-    /// Fails with [`AppError::AgentExists`] if the name is taken.
-    pub fn create_agent(&self, profile: &AgentProfile) -> Result<()> {
-        let path = self.agents.join(format!("{}.yaml", profile.name));
-        if write_yaml(&path, profile, true)? {
-            Ok(())
-        } else {
-            Err(AppError::AgentExists(profile.name.clone()))
-        }
+    /// Returns `false` if the agent already existed.
+    pub fn create_agent(&self, profile: &AgentProfile) -> Result<bool> {
+        write_yaml(&self.agents.join(format!("{}.yaml", profile.name)), profile, true)
     }
 
     pub fn save_agent(&self, profile: &AgentProfile) -> Result<()> {

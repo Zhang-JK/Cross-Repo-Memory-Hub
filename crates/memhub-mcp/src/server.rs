@@ -16,9 +16,9 @@ const INSTRUCTIONS: &str = "\
 Cross-Repo Memory Hub: shared long-term memory for agents working across repositories.
 
 Getting started:
-1. First time: call `register_agent` with a unique name and your role (e.g. feature-impl, \
-crash-analysis, perf-opt). Store the returned token; you need it to reconnect.
-   Later sessions: call `connect_agent` with your name and token.
+1. Call `connect_agent` with your agent name. Your name is your identity: every user running \
+the same agent shares its memory. If the agent does not exist yet, also pass your role \
+(e.g. feature-impl, crash-analysis, perf-opt) to create it.
 2. Call `add_repo` for each repository you work on. This registers the repo if it is new and \
 grants you write access to its shared memory.
 3. Before changing a repo, `search_memory` (or `list_memories` with scope=repo, owner=<repo>) \
@@ -44,7 +44,10 @@ impl InitRequest {
             .and_then(|p| p.get("protocolVersion"))
             .and_then(Value::as_str);
         let client = params.and_then(|p| p.get("clientInfo")).map(|info| {
-            let name = info.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let name = info
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             match info.get("version").and_then(Value::as_str) {
                 Some(v) => format!("{name} {v}"),
                 None => name.to_string(),

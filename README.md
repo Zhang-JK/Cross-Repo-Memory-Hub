@@ -23,7 +23,7 @@ memhub-data/
   memories/repo/<repo>/<slug>.md
   memories/agent/<agent>/<slug>.md
   trash/...                          deleted memories
-  registry/agents/<agent>.yaml       role, working repos, token hash
+  registry/agents/<agent>.yaml       role, description, working repos
   registry/repos/<repo>.yaml
   logs/audit-YYYY-MM-DD.jsonl
 ```
@@ -60,22 +60,25 @@ cargo build --release
 memhub --data-dir ./memhub-data serve --bind 127.0.0.1:7878
 
 # stdio (one agent per process; IP logged as "local")
-memhub --data-dir ./memhub-data stdio --agent my-agent --token mh_...
+memhub --data-dir ./memhub-data stdio --agent my-agent --role feature-impl
 ```
 
-Global options: `--data-dir` (`MEMHUB_DATA_DIR`), `--auth token|open` (`MEMHUB_AUTH`).
+Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`.
 
 Admin commands:
 
 ```bash
 memhub agents                         # list agents
-memhub reset-token <agent>            # issue a new token
 memhub logs --tail 100 --diff         # human-readable audit log with body diffs
 memhub logs --agent perf-bot --json   # raw JSON lines
 ```
 
 ## Connecting an agent
+
+Agents are identified by **name only** (no token). Every user who runs the same agent uses
+the same name and therefore shares that agent's memory space; the audit log still tells the
+users apart by IP and session.
 
 HTTP client configuration (e.g. Cursor `mcp.json`):
 
@@ -84,21 +87,24 @@ HTTP client configuration (e.g. Cursor `mcp.json`):
   "mcpServers": {
     "memhub": {
       "url": "http://127.0.0.1:7878/mcp",
-      "headers": { "X-Memhub-Agent": "crash-bot", "X-Memhub-Token": "mh_..." }
+      "headers": { "X-Memhub-Agent": "crash-bot", "X-Memhub-Role": "crash-analysis" }
     }
   }
 }
 ```
 
-The headers are optional. Without them, the agent calls `register_agent` the first time
-(receiving a token) and `connect_agent` afterwards.
+The headers are optional. Without them, the agent calls `connect_agent` with its name.
+If the agent does not exist yet, a `role` (header or tool argument) is required to create it;
+for an existing agent the role is ignored.
+
+Because names are not secret, the "agent memory is read-only for other agents" rule protects
+against honest mistakes, not against an agent deliberately using another agent's name.
 
 ## MCP tools
 
 | Tool | Purpose |
 |---|---|
-| `register_agent` | First-time registration; returns the agent's token |
-| `connect_agent` | Identify as an existing agent |
+| `connect_agent` | Identify by agent name; creates the agent when a role is given and it is new |
 | `whoami`, `list_agents` | Identity and agent directory |
 | `add_repo`, `leave_repo`, `list_repos` | Manage working repos (registers a repo on first use) |
 | `search_memory` | Ranked keyword search with scope/owner/kind/tag/group/author filters |
@@ -111,7 +117,7 @@ The headers are optional. Without them, the agent calls `register_agent` the fir
 
 Every record carries `ts`, `event`, `session_id`, `agent` (once identified), `ip` and `transport`.
 Events: `connect` (with MCP client name), `disconnect` (`client_closed`, `idle_timeout`,
-`stdio_eof`, `server_shutdown`, `auth_failed`, ...), `agent_registered`, `agent_login`,
-`auth_failed`, `token_reset`, `repo_joined`, `repo_left`, and `memory_changed` with
+`stdio_eof`, `server_shutdown`, `connect_failed`, ...), `agent_registered` (first connection
+of a new agent), `agent_login`, `repo_joined`, `repo_left`, and `memory_changed` with
 `action` (`add`/`update`/`delete`/`group_add`/`group_remove`), versions, changed fields and a
 unified diff of the body.

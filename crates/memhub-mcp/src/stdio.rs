@@ -14,11 +14,12 @@ use crate::{
     server::McpConnection,
 };
 
-/// Credentials used to identify the agent right after `initialize`.
+/// Agent identity applied right after `initialize`.
 #[derive(Debug, Clone, Default)]
 pub struct StdioLogin {
     pub agent: Option<String>,
-    pub token: Option<String>,
+    /// Used to create the agent if it does not exist yet.
+    pub role: Option<String>,
 }
 
 pub fn run(hub: Arc<Hub>, login: StdioLogin) -> io::Result<()> {
@@ -85,8 +86,8 @@ fn handle(
             };
             let (mut c, response) = McpConnection::initialize(hub, info, &msg);
             if let Some(agent) = &login.agent {
-                if let Err(e) = c.session_mut().login(agent, login.token.as_deref()) {
-                    tracing::warn!("automatic login as '{agent}' failed: {e}");
+                if let Err(e) = c.session_mut().connect(agent, login.role.as_deref(), None) {
+                    tracing::warn!("automatic connect as '{agent}' failed: {e}");
                 }
             }
             *conn = Some(c);

@@ -62,23 +62,17 @@ enum GroupAction {
 struct NoArgs {}
 
 #[derive(Deserialize, JsonSchema)]
-struct RegisterArgs {
-    /// Unique agent name: ASCII letters, digits, '-', '_' or '.', e.g. "crash-analyzer".
+struct ConnectArgs {
+    /// Agent name, e.g. "crash-analyzer": ASCII letters, digits, '-', '_' or '.'.
+    /// Every user running the same agent should use the same name to share its memory.
     name: String,
     /// The agent's task specialty, e.g. "feature-impl", "crash-analysis", "perf-opt".
-    role: String,
-    /// What this agent is responsible for.
+    /// Required only when the agent does not exist yet.
+    #[serde(default)]
+    role: Option<String>,
+    /// What this agent is responsible for (used when the agent is created).
     #[serde(default)]
     description: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct ConnectArgs {
-    /// Agent name used at registration.
-    name: String,
-    /// Token returned by register_agent (not needed when the hub runs in open auth mode).
-    #[serde(default)]
-    token: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -244,17 +238,9 @@ struct ToolDef {
 
 const TOOLS: &[ToolDef] = &[
     ToolDef {
-        name: "register_agent",
-        title: "Register agent",
-        description: "Register this connection as a new agent (first time only). Returns an access token that must be kept for connect_agent.",
-        schema: schema::<RegisterArgs>,
-        read_only: false,
-        destructive: false,
-    },
-    ToolDef {
         name: "connect_agent",
         title: "Connect agent",
-        description: "Identify this connection as an already registered agent.",
+        description: "Identify this connection by agent name; call this first. If the agent does not exist yet, pass 'role' to create it.",
         schema: schema::<ConnectArgs>,
         read_only: false,
         destructive: false,
@@ -381,7 +367,10 @@ fn schema<T: JsonSchema>() -> Value {
     let mut settings = SchemaSettings::draft07();
     settings.inline_subschemas = true;
     settings.meta_schema = None;
-    let mut value = settings.into_generator().into_root_schema_for::<T>().to_value();
+    let mut value = settings
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value();
     simplify(&mut value);
     if let Some(obj) = value.as_object_mut() {
         obj.remove("title");
@@ -476,9 +465,11 @@ impl From<Value> for ToolOutput {
 /// tool does not exist.
 pub fn call(session: &mut AgentSession, name: &str, args: Value) -> Option<Value> {
     let result = match name {
-        "register_agent" => register_agent(session, args),
         "connect_agent" => connect_agent(session, args),
-        "whoami" => session.whoami().map_err(Into::into).map(|w| json!(w).into()),
+        "whoami" => session
+            .whoami()
+            .map_err(Into::into)
+            .map(|w| json!(w).into()),
         "list_agents" => session
             .list_agents()
             .map_err(Into::into)
@@ -547,21 +538,10 @@ fn summary(meta: &MemoryMeta) -> Value {
     })
 }
 
-fn register_agent(session: &mut AgentSession, args: Value) -> ToolResult {
-    let a: RegisterArgs = parse(args)?;
-    let reg = session.register(&a.name, &a.role, a.description.as_deref().unwrap_or(""))?;
-    Ok(json!({
-        "agent": reg.agent,
-        "token": reg.token,
-        "note": "Registered and connected. Save this token: connect_agent requires it in future sessions and it cannot be shown again.",
-    })
-    .into())
-}
-
 fn connect_agent(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: ConnectArgs = parse(args)?;
-    let agent = session.login(&a.name, a.token.as_deref())?;
-    Ok(json!({ "agent": agent }).into())
+    let connected = session.connect(&a.name, a.role.as_deref(), a.description.as_deref())?;
+    Ok(json!(connected).into())
 }
 
 fn add_repo(session: &mut AgentSession, args: Value) -> ToolResult {
@@ -713,7 +693,10 @@ mod tests {
             .find(|t| t["name"] == "add_memory")
             .unwrap();
         let schema = &add["inputSchema"];
-        assert_eq!(schema["properties"]["scope"]["enum"], json!(["repo", "agent"]));
+        assert_eq!(
+            schema["properties"]["scope"]["enum"],
+            json!(["repo", "agent"])
+        );
         let mut required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -727,6 +710,9 @@ mod tests {
             .into_iter()
             .find(|t| t["name"] == "search_memory")
             .unwrap();
-        assert!(search["inputSchema"]["properties"]["owner"].is_object(), "flattened filter");
+        assert!(
+            search["inputSchema"]["properties"]["owner"].is_object(),
+            "flattened filter"
+        );
     }
 }

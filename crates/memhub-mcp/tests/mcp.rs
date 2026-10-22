@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use memhub_app::{audit::LogQuery, AuthMode, Hub, HubConfig};
+use memhub_app::{audit::LogQuery, Hub, HubConfig};
 use memhub_mcp::{
     http::{router, HttpConfig, HttpState},
     stdio::{serve, StdioLogin},
@@ -63,7 +63,10 @@ impl Client {
             .await;
         if r.0 == StatusCode::OK {
             let (status, _) = self
-                .send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), &[])
+                .send(
+                    json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                    &[],
+                )
                 .await;
             assert_eq!(status, StatusCode::ACCEPTED);
         }
@@ -102,13 +105,9 @@ impl Client {
     }
 }
 
-fn setup(auth: AuthMode, idle: Duration) -> (tempfile::TempDir, Arc<Hub>, Arc<HttpState>) {
+fn setup(idle: Duration) -> (tempfile::TempDir, Arc<Hub>, Arc<HttpState>) {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Hub::open(HubConfig {
-        data_root: dir.path().to_path_buf(),
-        auth,
-    })
-    .unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
     let state = HttpState::new(
         hub.clone(),
         HttpConfig {
@@ -130,33 +129,54 @@ fn client(state: &Arc<HttpState>, ip: &str) -> Client {
 
 #[tokio::test]
 async fn full_http_workflow() {
-    let (_dir, hub, state) = setup(AuthMode::Token, Duration::from_secs(600));
+    let (_dir, hub, state) = setup(Duration::from_secs(600));
 
-    // ---- crash agent registers, joins a repo, writes memory
+    // ---- crash agent is created, joins a repo, writes memory
     let mut crash = client(&state, "10.1.0.5");
     let (status, init) = crash.initialize(&[]).await;
     assert_eq!(status, StatusCode::OK);
     let init = init.unwrap();
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-    assert!(init["result"]["instructions"].as_str().unwrap().contains("register_agent"));
+    assert!(init["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("connect_agent"));
 
     let (_, tools) = crash
-        .send(json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" }), &[])
+        .send(
+            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" }),
+            &[],
+        )
         .await;
-    assert_eq!(tools.unwrap()["result"]["tools"].as_array().unwrap().len(), 14);
+    assert_eq!(
+        tools.unwrap()["result"]["tools"].as_array().unwrap().len(),
+        13
+    );
 
     let (err, msg) = crash.tool("search_memory", json!({ "query": "x" })).await;
     assert!(err);
     assert!(msg.as_str().unwrap().contains("not_identified"));
 
+    let (err, msg) = crash
+        .tool("connect_agent", json!({ "name": "crash-bot" }))
+        .await;
+    assert!(err);
+    assert!(msg.as_str().unwrap().contains("pass 'role'"), "{msg}");
+
     let (err, reg) = crash
-        .tool("register_agent", json!({ "name": "crash-bot", "role": "crash-analysis" }))
+        .tool(
+            "connect_agent",
+            json!({ "name": "crash-bot", "role": "crash-analysis" }),
+        )
         .await;
     assert!(!err, "{reg}");
-    let token = reg["token"].as_str().unwrap().to_string();
+    assert_eq!(reg["created"], true);
 
     let (err, join) = crash
-        .tool("add_repo", json!({ "repo": "engine", "description": "Game engine" }))
+        .tool(
+            "add_repo",
+            json!({ "repo": "engine", "description": "Game engine" }),
+        )
         .await;
     assert!(!err, "{join}");
     assert_eq!(join["created"], true);
@@ -186,27 +206,33 @@ async fn full_http_workflow() {
     let agent_mem = added["created"]["id"].as_str().unwrap().to_string();
     assert_eq!(crash.delete().await, StatusCode::NO_CONTENT);
 
-    // ---- perf agent with pre-auth headers can read but not write others' memory
+    // ---- perf agent (created via headers) can read but not write others' memory
     let mut perf = client(&state, "10.1.0.6");
-    perf.initialize(&[]).await;
-    let (err, perf_reg) = perf
-        .tool("register_agent", json!({ "name": "perf-bot", "role": "perf-opt" }))
+    let (status, _) = perf
+        .initialize(&[("x-memhub-agent", "perf-bot"), ("x-memhub-role", "perf-opt")])
         .await;
-    assert!(!err);
-    let perf_token = perf_reg["token"].as_str().unwrap().to_string();
+    assert_eq!(status, StatusCode::OK);
 
-    let (err, hits) = perf.tool("search_memory", json!({ "query": "thread" })).await;
+    let (err, hits) = perf
+        .tool("search_memory", json!({ "query": "thread" }))
+        .await;
     assert!(!err);
     assert_eq!(hits["count"], 2);
 
     let (err, msg) = perf
-        .tool("update_memory", json!({ "id": agent_mem, "append": "hijack" }))
+        .tool(
+            "update_memory",
+            json!({ "id": agent_mem, "append": "hijack" }),
+        )
         .await;
     assert!(err);
     assert!(msg.as_str().unwrap().contains("forbidden"), "{msg}");
 
     let (err, msg) = perf
-        .tool("update_memory", json!({ "id": repo_mem, "append": "perf note" }))
+        .tool(
+            "update_memory",
+            json!({ "id": repo_mem, "append": "perf note" }),
+        )
         .await;
     assert!(err);
     assert!(msg.as_str().unwrap().contains("add_repo"), "{msg}");
@@ -222,16 +248,24 @@ async fn full_http_workflow() {
     assert_eq!(upd["updated"]["version"], 2);
 
     let (err, msg) = perf
-        .tool("update_memory", json!({ "id": repo_mem, "title": "x", "expected_version": 1 }))
+        .tool(
+            "update_memory",
+            json!({ "id": repo_mem, "title": "x", "expected_version": 1 }),
+        )
         .await;
     assert!(err);
     assert!(msg.as_str().unwrap().contains("version_conflict"));
 
     let (err, grouped) = perf
-        .tool("group_memories", json!({ "group": "rendering", "ids": [repo_mem] }))
+        .tool(
+            "group_memories",
+            json!({ "group": "rendering", "ids": [repo_mem] }),
+        )
         .await;
     assert!(!err, "{grouped}");
-    let (_, groups) = perf.tool("list_memories", json!({ "group_by": "group" })).await;
+    let (_, groups) = perf
+        .tool("list_memories", json!({ "group_by": "group" }))
+        .await;
     assert_eq!(groups["groups"]["rendering"][0]["id"], repo_mem);
 
     // get_memory returns the markdown file as text
@@ -243,18 +277,21 @@ async fn full_http_workflow() {
             &[],
         )
         .await;
-    let text = body.unwrap()["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    let text = body.unwrap()["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(text.starts_with("---\n"));
     assert!(text.contains("Batch draw calls."));
 
-    // ---- reconnect with header-based auth
+    // ---- another user of crash-bot connects by name via header
     let mut crash2 = client(&state, "10.1.0.7");
     let (status, _) = crash2
-        .initialize(&[("x-memhub-agent", "crash-bot"), ("x-memhub-token", "wrong")])
+        .initialize(&[("x-memhub-agent", "ghost-bot")])
         .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown agent without role");
     let (status, _) = crash2
-        .initialize(&[("x-memhub-agent", "crash-bot"), ("x-memhub-token", &token)])
+        .initialize(&[("x-memhub-agent", "crash-bot")])
         .await;
     assert_eq!(status, StatusCode::OK);
     let (err, me) = crash2.tool("whoami", json!({})).await;
@@ -263,23 +300,31 @@ async fn full_http_workflow() {
     assert_eq!(me["ip"], "10.1.0.7");
     assert_eq!(me["agent"]["repos"], json!(["engine"]));
 
-    // ---- tool-based login on another connection
+    // ---- another user of perf-bot connects by name via the tool
     let mut perf2 = client(&state, "10.1.0.8");
     perf2.initialize(&[]).await;
-    let (err, _) = perf2
-        .tool("connect_agent", json!({ "name": "perf-bot", "token": perf_token }))
+    let (err, connected) = perf2
+        .tool("connect_agent", json!({ "name": "perf-bot" }))
         .await;
     assert!(!err);
+    assert_eq!(connected["created"], false);
+    assert_eq!(connected["agent"]["role"], "perf-opt");
 
     // ---- protocol errors
     let (status, _) = client(&state, "10.1.0.9")
-        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), &[])
+        .send(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            &[],
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let mut ghost = client(&state, "10.1.0.9");
     ghost.session = Some("nope".into());
     let (status, _) = ghost
-        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), &[])
+        .send(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            &[],
+        )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, unknown) = perf2
@@ -300,7 +345,10 @@ async fn full_http_workflow() {
         .filter(|r| r["event"] == "connect")
         .map(|r| r["ip"].as_str().unwrap())
         .collect();
-    assert_eq!(connects, vec!["10.1.0.5", "10.1.0.6", "10.1.0.7", "10.1.0.7", "10.1.0.8"]);
+    assert_eq!(
+        connects,
+        vec!["10.1.0.5", "10.1.0.6", "10.1.0.7", "10.1.0.7", "10.1.0.8"]
+    );
     assert!(log
         .iter()
         .filter(|r| r["event"] == "connect")
@@ -318,7 +366,7 @@ async fn full_http_workflow() {
         .collect();
     assert_eq!(disconnects.len(), 5, "every connect has a disconnect");
     assert!(disconnects.contains(&("crash-bot".into(), "client_closed".into())));
-    assert!(disconnects.contains(&("-".into(), "auth_failed".into())));
+    assert!(disconnects.contains(&("-".into(), "connect_failed".into())));
     assert!(disconnects.contains(&("perf-bot".into(), "server_shutdown".into())));
 
     let changes: Vec<(String, String)> = log
@@ -340,21 +388,24 @@ async fn full_http_workflow() {
             ("perf-bot".into(), "group_add".into()),
         ]
     );
-    let update = log
-        .iter()
-        .find(|r| r["action"] == "update")
-        .unwrap();
-    assert!(update["diff"].as_str().unwrap().contains("+Batch draw calls."));
+    let update = log.iter().find(|r| r["action"] == "update").unwrap();
+    assert!(update["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+Batch draw calls."));
     assert_eq!(update["ip"], "10.1.0.6");
 }
 
 #[tokio::test]
 async fn idle_sessions_are_reaped() {
-    let (_dir, hub, state) = setup(AuthMode::Open, Duration::from_millis(50));
+    let (_dir, hub, state) = setup(Duration::from_millis(50));
     let mut c = client(&state, "192.168.0.2");
     c.initialize(&[]).await;
-    c.tool("register_agent", json!({ "name": "sleepy", "role": "feature-impl" }))
-        .await;
+    c.tool(
+        "connect_agent",
+        json!({ "name": "sleepy", "role": "feature-impl" }),
+    )
+    .await;
     assert_eq!(state.session_count(), 1);
 
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -382,18 +433,14 @@ async fn idle_sessions_are_reaped() {
 #[test]
 fn stdio_transport() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Hub::open(HubConfig {
-        data_root: dir.path().to_path_buf(),
-        auth: AuthMode::Open,
-    })
-    .unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
     let input = [
         json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
                 "params": { "protocolVersion": "2024-11-05", "clientInfo": { "name": "cli" } } }),
         json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": { "name": "register_agent", "arguments": { "name": "solo", "role": "feature-impl" } } }),
+                "params": { "name": "connect_agent", "arguments": { "name": "solo", "role": "feature-impl" } } }),
         json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": { "name": "add_memory", "arguments": { "scope": "agent", "title": "Hello", "body": "world" } } }),
     ]
@@ -403,7 +450,13 @@ fn stdio_transport() {
     .join("\n");
 
     let mut out = Vec::new();
-    serve(hub.clone(), StdioLogin::default(), input.as_bytes(), &mut out).unwrap();
+    serve(
+        hub.clone(),
+        StdioLogin::default(),
+        input.as_bytes(),
+        &mut out,
+    )
+    .unwrap();
     let responses: Vec<Value> = String::from_utf8(out)
         .unwrap()
         .lines()
@@ -424,4 +477,24 @@ fn stdio_transport() {
     assert_eq!(log.last().unwrap()["event"], "disconnect");
     assert_eq!(log.last().unwrap()["reason"], "stdio_eof");
     assert_eq!(log.last().unwrap()["agent"], "solo");
+
+    // A second process for the same agent, identified via --agent.
+    let input = [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "cli" } } }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "whoami", "arguments": {} } }),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    let mut out = Vec::new();
+    let login = StdioLogin {
+        agent: Some("solo".into()),
+        role: None,
+    };
+    serve(hub.clone(), login, input.as_bytes(), &mut out).unwrap();
+    let whoami: Value = serde_json::from_str(String::from_utf8(out).unwrap().lines().nth(1).unwrap()).unwrap();
+    assert_eq!(whoami["result"]["structuredContent"]["agent"]["name"], "solo");
 }

@@ -3,16 +3,12 @@ use std::sync::Arc;
 use memhub_app::{
     audit::LogQuery,
     store::{MemoryPatch, Scope, SearchQuery},
-    AddMemory, AgentSession, AppError, AuthMode, ConnInfo, Hub, HubConfig,
+    AddMemory, AgentSession, AppError, ConnInfo, Hub, HubConfig,
 };
 
-fn hub(auth: AuthMode) -> (tempfile::TempDir, Arc<Hub>) {
+fn hub() -> (tempfile::TempDir, Arc<Hub>) {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Hub::open(HubConfig {
-        data_root: dir.path().to_path_buf(),
-        auth,
-    })
-    .unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
     (dir, hub)
 }
 
@@ -35,51 +31,76 @@ fn repo_note(repo: &str, title: &str) -> AddMemory {
 }
 
 #[test]
-fn register_then_reconnect_with_token() {
-    let (_dir, hub) = hub(AuthMode::Token);
+fn connect_by_name_creates_then_reuses_agent() {
+    let (_dir, hub) = hub();
     let mut s = connect(&hub, "10.0.0.1");
     assert!(matches!(s.list_agents(), Err(AppError::NotIdentified)));
+    assert!(matches!(
+        s.connect("crash-bot", None, None),
+        Err(AppError::UnknownAgent(_))
+    ));
+    assert!(s.connect("../evil", Some("x"), None).is_err());
 
-    let reg = s.register("crash-bot", "crash-analysis", "triages crashes").unwrap();
+    let first = s
+        .connect("crash-bot", Some("crash-analysis"), Some("triages crashes"))
+        .unwrap();
+    assert!(first.created);
     assert_eq!(s.agent(), Some("crash-bot"));
-    assert!(reg.token.starts_with("mh_"));
-    s.close("client_closed");
+    assert!(s.connect("crash-bot", None, None).is_ok(), "reconnecting as self is a no-op");
+    assert!(matches!(
+        s.connect("other", Some("x"), None),
+        Err(AppError::AlreadyIdentified(_))
+    ));
 
+    // A different user running the same agent: name alone is enough, and a
+    // differing role does not overwrite the existing profile.
     let mut s2 = connect(&hub, "10.0.0.2");
-    assert!(matches!(
-        s2.register("crash-bot", "x", ""),
-        Err(AppError::AgentExists(_))
-    ));
-    assert!(matches!(
-        s2.login("crash-bot", Some("wrong")),
-        Err(AppError::AuthFailed(_))
-    ));
-    assert!(matches!(s2.login("crash-bot", None), Err(AppError::AuthFailed(_))));
-    assert!(matches!(s2.login("ghost", None), Err(AppError::UnknownAgent(_))));
-    let info = s2.login("crash-bot", Some(&reg.token)).unwrap();
-    assert_eq!(info.role, "crash-analysis");
-    assert!(info.last_seen_at.is_some());
-
-    let token = hub.reset_token("crash-bot").unwrap();
-    let mut s3 = connect(&hub, "10.0.0.3");
-    assert!(s3.login("crash-bot", Some(&reg.token)).is_err());
-    s3.login("crash-bot", Some(&token)).unwrap();
+    let second = s2.connect("crash-bot", Some("something-else"), None).unwrap();
+    assert!(!second.created);
+    assert_eq!(second.agent.role, "crash-analysis");
+    assert_eq!(second.agent.description, "triages crashes");
+    assert!(second.agent.last_seen_at.is_some());
 }
 
 #[test]
-fn open_mode_skips_tokens() {
-    let (_dir, hub) = hub(AuthMode::Open);
-    connect(&hub, "1.1.1.1").register("a", "feature-impl", "").unwrap();
-    connect(&hub, "1.1.1.1").login("a", None).unwrap();
+fn users_of_same_agent_share_its_memory() {
+    let (_dir, hub) = hub();
+    let mut user_a = connect(&hub, "10.0.0.1");
+    user_a.connect("perf-bot", Some("perf-opt"), None).unwrap();
+    let note = user_a
+        .add_memory(AddMemory {
+            scope: Scope::Agent,
+            title: "Profiling setup".into(),
+            body: "use perf record".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut user_b = connect(&hub, "10.0.0.2");
+    user_b.connect("perf-bot", None, None).unwrap();
+    let change = user_b
+        .update_memory(
+            note.id(),
+            MemoryPatch { append: Some("and flamegraph".into()), ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!(change.after.meta.updated_by, "perf-bot");
+
+    let log = hub
+        .audit()
+        .read(&LogQuery { event: Some("memory_changed".into()), ..Default::default() })
+        .unwrap();
+    let ips: Vec<&str> = log.iter().map(|r| r["ip"].as_str().unwrap()).collect();
+    assert_eq!(ips, vec!["10.0.0.1", "10.0.0.2"], "the log still tells users apart");
 }
 
 #[test]
 fn permissions() {
-    let (_dir, hub) = hub(AuthMode::Open);
+    let (_dir, hub) = hub();
     let mut alice = connect(&hub, "1.1.1.1");
-    alice.register("alice", "feature-impl", "").unwrap();
+    alice.connect("alice", Some("feature-impl"), None).unwrap();
     let mut bob = connect(&hub, "2.2.2.2");
-    bob.register("bob", "perf-opt", "").unwrap();
+    bob.connect("bob", Some("perf-opt"), None).unwrap();
 
     // Repo memory requires a registered repo that the agent has joined.
     assert!(matches!(
@@ -145,10 +166,10 @@ fn permissions() {
 
 #[test]
 fn audit_trail() {
-    let (_dir, hub) = hub(AuthMode::Token);
+    let (_dir, hub) = hub();
     {
         let mut s = connect(&hub, "192.168.1.20");
-        s.register("perf-bot", "perf-opt", "").unwrap();
+        s.connect("perf-bot", Some("perf-opt"), None).unwrap();
         s.add_repo("engine", None, None).unwrap();
         let m = s.add_memory(repo_note("engine", "Hot path")).unwrap();
         s.update_memory(
@@ -162,7 +183,7 @@ fn audit_trail() {
     }
     {
         let mut s = connect(&hub, "192.168.1.99");
-        let _ = s.login("perf-bot", Some("bad"));
+        s.connect("perf-bot", None, None).unwrap();
         // dropped without close
     }
 
@@ -191,7 +212,7 @@ fn audit_trail() {
             "memory_changed:delete",
             "disconnect",
             "connect",
-            "auth_failed",
+            "agent_login",
             "disconnect",
         ]
     );
@@ -205,6 +226,7 @@ fn audit_trail() {
     assert_eq!(update["version_before"], 1);
     assert_eq!(update["version_after"], 2);
     assert!(update["diff"].as_str().unwrap().contains("+new body"));
-    assert_eq!(all[9]["claimed_agent"], "perf-bot");
+    assert_eq!(all[9]["agent"], "perf-bot");
+    assert_eq!(all[9]["ip"], "192.168.1.99");
     assert_eq!(all[10]["reason"], "dropped");
 }

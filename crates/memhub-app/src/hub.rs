@@ -1,52 +1,27 @@
 use std::{
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 
 use chrono::Utc;
-use memhub_audit::{Actor, AuditEvent, AuditLog};
-use memhub_store::{validate_name, MemoryStore, Scope};
+use memhub_audit::AuditLog;
+use memhub_store::{MemoryStore, Scope};
 
 use crate::{
     error::{AppError, Result},
-    registry::{hash_token, new_token, Registry},
+    registry::Registry,
     session::{AgentSession, ConnInfo},
 };
-
-/// How agents prove their identity when connecting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AuthMode {
-    /// `register_agent` issues a token that `connect_agent` must present.
-    #[default]
-    Token,
-    /// Agents connect by name only. Suitable for trusted single-user setups.
-    Open,
-}
-
-impl FromStr for AuthMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "token" => Ok(AuthMode::Token),
-            "open" | "none" => Ok(AuthMode::Open),
-            _ => Err(format!("unknown auth mode '{s}', expected 'token' or 'open'")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub data_root: PathBuf,
-    pub auth: AuthMode,
 }
 
 impl HubConfig {
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
         Self {
             data_root: data_root.into(),
-            auth: AuthMode::default(),
         }
     }
 }
@@ -104,28 +79,6 @@ impl Hub {
     /// Starts a new connection and records a `connect` audit event.
     pub fn open_session(self: &Arc<Self>, conn: ConnInfo) -> AgentSession {
         AgentSession::open(self.clone(), conn)
-    }
-
-    /// Admin operation: issues a fresh token for an agent that lost its own.
-    pub fn reset_token(&self, name: &str) -> Result<String> {
-        validate_name("agent name", name)?;
-        let _guard = self.registry.lock();
-        let mut profile = self
-            .registry
-            .agent(name)?
-            .ok_or_else(|| AppError::UnknownAgent(name.to_string()))?;
-        let token = new_token();
-        profile.token_hash = hash_token(&token);
-        self.registry.save_agent(&profile)?;
-        self.audit.record(AuditEvent::TokenReset {
-            actor: Actor {
-                session_id: "admin".into(),
-                agent: Some(name.to_string()),
-                ip: "local".into(),
-                transport: "cli".into(),
-            },
-        });
-        Ok(token)
     }
 
     pub(crate) fn touch_agent(&self, name: &str) -> Result<()> {

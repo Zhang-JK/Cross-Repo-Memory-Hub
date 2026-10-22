@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/memhub-store",
+    "crates/memhub-audit",
+    "crates/memhub-app",
+    "crates/memhub-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+memhub-store = { path = "crates/memhub-store" }
+memhub-audit = { path = "crates/memhub-audit" }
+memhub-app = { path = "crates/memhub-app" }
+
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+similar = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+http-body-util = "0.1"

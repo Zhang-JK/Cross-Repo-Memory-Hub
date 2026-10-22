@@ -1,0 +1,24 @@
+[package]
+name = "memhub-app"
+description = "Application layer (agents, repos, permissions, sessions) for Cross-Repo Memory Hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memhub-store.workspace = true
+memhub-audit.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+similar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true

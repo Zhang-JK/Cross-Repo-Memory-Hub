@@ -1,0 +1,126 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build static binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p memhub-mcp --bin memhub
+
+      - name: Package
+        id: package
+        run: |
+          name="memhub-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/memhub" "dist/$name/"
+          strip "dist/$name/memhub" 2>/dev/null || true
+          cp README.md "dist/$name/"
+          mkdir -p "dist/$name/scripts" && cp scripts/*.sh "dist/$name/scripts/"
+          echo "${GITHUB_SHA}" > "dist/$name/COMMIT"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 30
+
+  # Rolling prerelease with a stable, login-free download URL:
+  # https://github.com/<owner>/<repo>/releases/download/nightly/memhub-<target>.tar.gz
+  nightly:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "main has moved on since this build; leaving nightly to the newer run"
+            exit 0
+          fi
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly
+          title="nightly ($(git rev-parse --short "$GITHUB_SHA"))"
+          notes="Rolling build of main at ${GITHUB_SHA}. Replaced on every push to main."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --prerelease --title "$title" --notes "$notes"
+            gh release upload nightly dist/* --clobber
+          else
+            gh release create nightly dist/* --prerelease --title "$title" --notes "$notes" --verify-tag
+          fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true

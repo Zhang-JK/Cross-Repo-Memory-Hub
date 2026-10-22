@@ -63,6 +63,23 @@ memhub --data-dir ./memhub-data serve --bind 127.0.0.1:7878
 memhub --data-dir ./memhub-data stdio --agent my-agent --role feature-impl
 ```
 
+### Deploying without a Rust toolchain
+
+CI (`.github/workflows/build.yml`) builds fully static Linux binaries (x86_64 and aarch64).
+Every push to `main` refreshes the `nightly` release; `v*` tags create versioned releases.
+On the server:
+
+```bash
+scripts/deploy-prebuilt.sh            # download nightly, restart only if it changed
+MEMHUB_RELEASE=v0.1.0 scripts/deploy-prebuilt.sh
+scripts/deploy-prebuilt.sh rollback   # back to the previously deployed binary
+scripts/deploy-prebuilt.sh status | stop
+```
+
+Downloads honor `https_proxy`; extra curl flags go in `MEMHUB_CURL_OPTS`. If a new binary
+fails to start, the previous one is restored automatically. `scripts/restart.sh` is the
+build-from-source equivalent; both share `.run/`, so either can replace the other's server.
+
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`.
 

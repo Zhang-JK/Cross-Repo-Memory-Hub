@@ -80,6 +80,19 @@ Downloads honor `https_proxy`; extra curl flags go in `MEMHUB_CURL_OPTS`. If a n
 fails to start, the previous one is restored automatically. `scripts/restart.sh` is the
 build-from-source equivalent; both share `.run/`, so either can replace the other's server.
 
+### Testing a running server
+
+```bash
+scripts/test-mcp.sh                            # URL saved in .run/mcp_url by the launch scripts
+scripts/test-mcp.sh http://10.0.0.5:8010/mcp   # or MEMHUB_MCP_URL=...; prompts if neither is set
+scripts/test-mcp.sh -v                         # print every request and response
+```
+
+It runs a full MCP session over HTTP (initialize, every tool, permission and version-conflict
+checks, session close) as agent `memhub-selftest` in repo `memhub-selftest`, deletes the
+memories it created, and exits non-zero on any failure. Proxies are bypassed unless
+`MEMHUB_TEST_PROXY=1`.
+
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`.
 

@@ -18,6 +18,8 @@
 #   MEMHUB_BASE_URL     download assets from "$MEMHUB_BASE_URL/<asset>" instead of GitHub
 #   MEMHUB_CURL_OPTS    extra curl flags, e.g. "--proxy http://proxy:8080"
 #                       (curl also honors https_proxy / HTTPS_PROXY)
+#   MEMHUB_TLS_VERIFY=1 verify TLS certificates. Off by default (curl -k) because
+#                       the company proxy re-signs HTTPS with an untrusted CA.
 #   MEMHUB_PORT         (default 8010)
 #   MEMHUB_HOST         (default 0.0.0.0, i.e. reachable from other machines)
 #   MEMHUB_DATA_DIR     (default <base>/memhub-data)
@@ -38,6 +40,7 @@ EXTRA_ARGS="${MEMHUB_EXTRA_ARGS:-}"
 RELEASE="${MEMHUB_RELEASE:-nightly}"
 GITHUB_REPO="${MEMHUB_GITHUB_REPO:-Zhang-JK/Cross-Repo-Memory-Hub}"
 CURL_OPTS="${MEMHUB_CURL_OPTS:-}"
+[[ "${MEMHUB_TLS_VERIFY:-0}" == "1" ]] || CURL_OPTS="-k $CURL_OPTS"
 
 PID_FILE="$RUN_DIR/memhub.pid"
 LOG_FILE="$RUN_DIR/memhub.log"
@@ -239,6 +242,8 @@ status() {
     lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [[ "$HOST" != "0.0.0.0" && "$HOST" != "::" ]] && url_host="$HOST"
     [[ "$HOST" == "0.0.0.0" && -n "$lan_ip" ]] && url_host="$lan_ip"
+    # Read by scripts/test-mcp.sh.
+    echo "http://$url_host:$PORT/mcp" > "$RUN_DIR/mcp_url"
 
     cat <<EOF
 
@@ -256,6 +261,7 @@ memhub is running
 
   Follow log : tail -f $LOG_FILE
   Activity   : $BIN --data-dir $DATA_DIR logs --tail 50
+  Self-test  : $(dirname "$0")/test-mcp.sh
   Stop       : $0 stop
   Rollback   : $0 rollback
 

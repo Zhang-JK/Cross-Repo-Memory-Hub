@@ -141,6 +141,8 @@ status() {
     local url_host="127.0.0.1"
     [[ "$HOST" != "0.0.0.0" && "$HOST" != "::" ]] && url_host="$HOST"
     [[ "$HOST" == "0.0.0.0" && -n "$lan_ip" ]] && url_host="$lan_ip"
+    # Read by scripts/test-mcp.sh.
+    echo "http://$url_host:$PORT/mcp" > "$RUN_DIR/mcp_url"
 
     cat <<EOF
 
@@ -157,6 +159,7 @@ memhub is running
 
   Follow log : tail -f $LOG_FILE
   Activity   : $BIN --data-dir $DATA_DIR logs --tail 50
+  Self-test  : $(dirname "$0")/test-mcp.sh
   Stop       : $0 stop
 
 MCP client config:

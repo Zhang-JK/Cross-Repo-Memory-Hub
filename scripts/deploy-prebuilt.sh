@@ -266,10 +266,10 @@ memhub is running
   Stop       : $0 stop
   Rollback   : $0 rollback
 
-MCP client config:
+MCP client config (project .cursor/mcp.json; Cursor fills in the \${...} variables):
   { "mcpServers": { "memhub": { "url": "http://$url_host:$PORT/mcp",
       "headers": { "X-Memhub-Agent": "<agent-name>", "X-Memhub-Role": "<role>",
-                   "X-Memhub-Instance": "<user>-<machine>" } } } }
+                   "X-Memhub-Instance": "\${env:USER}-\${workspaceFolderBasename}" } } } }
 EOF
 }
 

@@ -34,7 +34,13 @@ pub const MAX_INSTANCE_LEN: usize = 128;
 
 /// Normalizes an instance label: control characters are dropped, the label
 /// is trimmed and cut to [`MAX_INSTANCE_LEN`] characters; empty means none.
+/// A label still holding a `${...}` placeholder means the client did not
+/// interpolate its config; every copy would send the same text and collapse
+/// into one instance, so it is treated as no label.
 pub fn clean_instance(raw: &str) -> Option<String> {
+    if raw.contains("${") {
+        return None;
+    }
     let cleaned: String = raw
         .chars()
         .filter(|c| !c.is_control())

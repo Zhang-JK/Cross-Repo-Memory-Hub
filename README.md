@@ -194,7 +194,7 @@ Agents are identified by **name only** (no token). Every user who runs the same 
 the same name and therefore shares that agent's memory space; the audit log still tells the
 users apart by IP and session.
 
-HTTP client configuration (e.g. Cursor `mcp.json`):
+HTTP client configuration, e.g. a project's `.cursor/mcp.json`:
 
 ```json
 {
@@ -204,12 +204,15 @@ HTTP client configuration (e.g. Cursor `mcp.json`):
       "headers": {
         "X-Memhub-Agent": "crash-bot",
         "X-Memhub-Role": "crash-analysis",
-        "X-Memhub-Instance": "alice-laptop"
+        "X-Memhub-Instance": "${env:USER}-${workspaceFolderBasename}"
       }
     }
   }
 }
 ```
+
+The same file can be committed to every repository unchanged; see
+[Counting instances](#counting-instances) for what the `X-Memhub-Instance` value does.
 
 The headers are optional. Without them, the agent calls `connect_agent` with its name.
 If the agent does not exist yet, a `role` (header or tool argument) is required to create it;
@@ -218,10 +221,27 @@ for an existing agent the role is ignored.
 ### Counting instances
 
 `X-Memhub-Instance` (stdio: `--instance` / `MEMHUB_INSTANCE`) labels one running copy of an
-agent, for example `<user>-<machine>`. Give each person or machine its own value and keep it
-stable across restarts. It is free text (at most 128 characters, trimmed), recorded on the
-`connect` audit event, and identifies nothing beyond the label. Memory is still shared by
-agent name.
+agent. It is free text (at most 128 characters, trimmed), recorded on the `connect` audit
+event, and identifies nothing beyond the label. Memory is still shared by agent name.
+
+The label should differ between copies that run at the same time and stay the same across
+restarts. Cursor fills in variables in `mcp.json` header values
+([config interpolation](https://cursor.com/docs/context/mcp)), so the label can be built
+from them rather than typed by each person:
+
+| Value | One instance per | Notes |
+| --- | --- | --- |
+| `${env:USER}-${workspaceFolderBasename}` | user and project | Recommended, in each project's `.cursor/mcp.json`. Two windows on two projects count as two. |
+| `${env:USER}-${env:HOSTNAME}-${workspaceFolderBasename}` | user, machine and project | Only if `HOSTNAME` is exported to GUI apps (often it isn't). |
+| `${env:USERNAME}-${workspaceFolderBasename}` | user and project | Windows, where the user variable is `USERNAME`. |
+| `${env:USER}` | user | Global `~/.cursor/mcp.json`, where `${workspaceFolder*}` is not defined. All of a user's windows count as one. |
+
+Two windows open on the same project by the same user still send the same label and count
+as one. After connecting, check the **Instance** column on the Connections page to confirm
+the label resolved. A label that still contains `${` (a client that doesn't interpolate, or
+a variable left unresolved) is ignored and the connection counts as unlabeled, rather than every
+copy collapsing into one instance under the same literal text. Clients without variable
+support need a fixed value per copy, such as `alice-laptop`.
 
 The Connections page counts **instances** as distinct pairs of agent name and instance
 label. Reconnects (for example after an idle timeout) don't add to the count, and two people

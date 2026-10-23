@@ -669,6 +669,13 @@ fn instance_labels_are_cleaned() {
     );
     assert_eq!(clean_instance("a\u{7}b").as_deref(), Some("ab"));
     assert_eq!(clean_instance(" \t "), None);
+    assert_eq!(
+        clean_instance("${env:USER}-${workspaceFolderBasename}"),
+        None,
+        "uninterpolated placeholders are not a label"
+    );
+    assert_eq!(clean_instance("alice-${workspaceFolderBasename}"), None);
+    assert_eq!(clean_instance("alice-$5").as_deref(), Some("alice-$5"));
     let long = "x".repeat(MAX_INSTANCE_LEN + 50);
     assert_eq!(
         clean_instance(&long).unwrap().chars().count(),

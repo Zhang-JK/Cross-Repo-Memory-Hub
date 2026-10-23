@@ -163,10 +163,10 @@ memhub is running
   Self-test  : $(dirname "$0")/test-mcp.sh
   Stop       : $0 stop
 
-MCP client config:
+MCP client config (project .cursor/mcp.json; Cursor fills in the \${...} variables):
   { "mcpServers": { "memhub": { "url": "http://$url_host:$PORT/mcp",
       "headers": { "X-Memhub-Agent": "<agent-name>", "X-Memhub-Role": "<role>",
-                   "X-Memhub-Instance": "<user>-<machine>" } } } }
+                   "X-Memhub-Instance": "\${env:USER}-\${workspaceFolderBasename}" } } } }
 EOF
 }
 

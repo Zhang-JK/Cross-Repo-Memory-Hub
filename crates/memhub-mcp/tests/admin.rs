@@ -511,28 +511,58 @@ async fn connection_summary_and_year_export() {
         "params": { "protocolVersion": "2025-06-18", "capabilities": {},
                     "clientInfo": { "name": "probe", "version": "1" } }
     });
-    let res = router
-        .clone()
-        .oneshot(
-            Request::post("/mcp")
-                .header("content-type", "application/json")
-                .header("x-memhub-agent", "crash-bot")
-                .header("x-memhub-role", "crash-analysis")
-                .body(Body::from(init.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    // Two copies of crash-bot on one IP, told apart by X-Memhub-Instance.
+    for instance in ["alice-laptop", "bob-desktop"] {
+        let res = router
+            .clone()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("content-type", "application/json")
+                    .header("x-memhub-agent", "crash-bot")
+                    .header("x-memhub-role", "crash-analysis")
+                    .header("x-memhub-instance", instance)
+                    .body(Body::from(init.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
 
     let (_, summary) = call(&router, "GET", "/api/admin/connections/summary", None, &[]).await;
-    assert_eq!(summary["live"], 1);
-    assert_eq!(summary["week"]["connections"], 1);
+    assert_eq!(summary["live"], 2);
+    assert_eq!(summary["live_instances"], 2);
+    assert_eq!(summary["live_unlabeled_instances"], 0);
+    assert_eq!(summary["week"]["connections"], 2);
     assert_eq!(summary["week"]["ips"], 1);
     assert_eq!(summary["week"]["agents"], 1);
-    assert_eq!(summary["month"]["connections"], 2);
+    assert_eq!(summary["week"]["instances"], 2);
+    assert_eq!(summary["week"]["unlabeled_instances"], 0);
+    assert_eq!(summary["month"]["connections"], 3);
     assert_eq!(summary["month"]["ips"], 2);
     assert_eq!(summary["month"]["agents"], 2);
+    assert_eq!(summary["month"]["instances"], 3);
+    assert_eq!(summary["month"]["unlabeled_instances"], 1);
+
+    let (_, live) = call(&router, "GET", "/api/admin/sessions", None, &[]).await;
+    let mut labels: Vec<&str> = live["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["instance"].as_str().unwrap())
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(labels, ["alice-laptop", "bob-desktop"]);
+    let (_, conns) = call(
+        &router,
+        "GET",
+        "/api/admin/connections?agent=crash-bot",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(conns["sessions"].as_array().unwrap().len(), 2);
+    assert!(conns["sessions"][0]["instance"].is_string());
 
     let res = router
         .clone()
@@ -557,6 +587,8 @@ async fn connection_summary_and_year_export() {
     let xml = xlsx_xml(&bytes);
     assert!(xml.contains("Session ID"));
     assert!(xml.contains("Connected (UTC)"));
+    assert!(xml.contains(">Instance<"));
+    assert!(xml.contains("alice-laptop") && xml.contains("bob-desktop"));
     assert!(xml.contains("month-session"));
     assert!(xml.contains("crash-bot"));
     assert!(

@@ -455,7 +455,7 @@ function renderDashboard(st) {
     h('div', { class: 'panel-head' }, h('h2', { text: `Live sessions (${live.length})` }), h('a', { href: '#/connections', text: 'Connection log →' })),
     live.length ? h('ul', { class: 'feed' }, live.slice(0, 8).map((x) => h('li', {},
       h('span', { class: `dot ${x.busy ? '' : 'on'}` }),
-      h('span', { class: 'what' }, h('b', {}, agentLabel(x.agent)), ' ', h('span', { class: 'muted', text: x.ip || '' })),
+      h('span', { class: 'what' }, h('b', {}, agentLabel(x.agent)), ' ', h('span', { class: 'muted', text: [x.instance, x.ip].filter(Boolean).join(' · ') })),
       h('span', { class: 'when', title: fmtTime(x.started_at) }, x.busy ? 'busy' : `idle ${fmtDuration(x.idle_secs)}`))))
       : h('div', { class: 'empty', text: 'No agent is connected right now.' }));
 
@@ -976,7 +976,7 @@ async function viewConnections(view, params) {
   setHead('Connection log', 'MCP connections and disconnections with agent name and client IP', [exportBtn, refreshButton(() => { load(); loadSummary(); })]);
   view.replaceChildren(
     dash,
-    h('p', { class: 'muted conn-note', text: 'Last 7 days and last 30 days are rolling windows. A connection counts when it started, identified itself, or ended in that window. Export Excel downloads sessions from the last 365 days (UTC), using the agent and IP filters, up to 100,000 rows.' }),
+    h('p', { class: 'muted conn-note', text: 'Instances are running agent copies: one per agent name and X-Memhub-Instance label. Connections without the header are grouped by agent and IP, so those are a lower bound (shown as unlabeled). Last 7 days and last 30 days are rolling windows. A connection counts when it started, identified itself, or ended in that window. Export Excel downloads sessions from the last 365 days (UTC), using the agent and IP filters, up to 100,000 rows.' }),
     h('div', { class: 'panel' },
       h('div', { class: 'filters' }, seg,
         filterInput('Agent', st.agent, change('agent'), 'agent-options'), agents,
@@ -985,23 +985,33 @@ async function viewConnections(view, params) {
         h('span', { class: 'muted', id: 'conn-count' })),
       body, foot));
 
-  function metric(n, label) {
-    return h('div', { class: 'metric' }, h('div', { class: 'n', text: Number(n || 0).toLocaleString() }), h('div', { class: 'l', text: label }));
+  function metric(n, label, note) {
+    return h('div', { class: 'metric' }, h('div', { class: 'n', text: Number(n || 0).toLocaleString() }), h('div', { class: 'l', text: label }),
+      note ? h('div', { class: 'l note', text: note }) : null);
   }
+  const unlabeledNote = (n) => (n ? `${Number(n).toLocaleString()} unlabeled` : '');
   function windowCard(title, w) {
     return h('div', { class: 'panel' },
       h('div', { class: 'label', text: title }),
-      h('div', { class: 'metrics' }, metric(w.connections, 'connections'), metric(w.ips, 'active IPs'), metric(w.agents, 'active agents')));
+      h('div', { class: 'metrics' },
+        metric(w.instances, 'instances', unlabeledNote(w.unlabeled_instances)),
+        metric(w.agents, 'agents'), metric(w.ips, 'IPs'), metric(w.connections, 'connections')));
   }
   async function loadSummary() {
     try {
       const s = await api('/connections/summary');
       const live = Number(s.live || 0);
+      const instances = Number(s.live_instances || 0);
+      const unlabeled = Number(s.live_unlabeled_instances || 0);
       dash.replaceChildren(
         h('div', { class: 'panel conn-now' },
           h('div', { class: 'label' }, h('span', { class: 'dot on' }), 'Right now'),
-          h('div', { class: 'n', text: live.toLocaleString() }),
-          h('div', { class: 'hint', text: live === 1 ? 'live connection' : 'live connections' })),
+          h('div', { class: 'n', text: instances.toLocaleString() }),
+          h('div', { class: 'hint', text: [
+            instances === 1 ? 'instance' : 'instances',
+            `${live.toLocaleString()} live ${live === 1 ? 'connection' : 'connections'}`,
+            unlabeledNote(unlabeled),
+          ].filter(Boolean).join(' · ') })),
         windowCard('Last 7 days', s.week || {}),
         windowCard('Last 30 days', s.month || {}));
     } catch (e) {
@@ -1067,7 +1077,7 @@ async function viewConnections(view, params) {
 
   function sessionsTable(rows) {
     return h('table', {},
-      h('thead', {}, h('tr', {}, ['Status', 'Agent', 'IP', 'Client', 'Connected', 'Duration', 'Ended', 'Changes', 'Session'].map((c) => h('th', { text: c })))),
+      h('thead', {}, h('tr', {}, ['Status', 'Agent', 'Instance', 'IP', 'Client', 'Connected', 'Duration', 'Ended', 'Changes', 'Session'].map((c) => h('th', { text: c })))),
       h('tbody', {}, rows.map((r) => {
         const status = r.live ? h('span', { class: 'badge live' }, h('span', { class: 'dot on' }), 'live')
           : r.disconnected_at ? h('span', { class: 'badge', text: 'closed' })
@@ -1076,6 +1086,7 @@ async function viewConnections(view, params) {
         return h('tr', {},
           h('td', {}, status),
           h('td', {}, r.agent ? filterAgent(r.agent) : agentLabel(null), r.registered ? [' ', h('span', { class: 'badge registered', title: 'Agent registered by this connection', text: 'new' })] : null),
+          h('td', { class: 'wrap' }, r.instance ? h('span', { text: r.instance }) : h('span', { class: 'muted', title: 'No X-Memhub-Instance header', text: '—' })),
           h('td', { class: 'mono nowrap', text: r.ip }),
           h('td', { class: 'wrap', text: r.client || '—' }),
           timeCell(r.connected_at),
@@ -1089,7 +1100,7 @@ async function viewConnections(view, params) {
   function eventsTable(rows) {
     const detail = (r) => {
       switch (r.event) {
-        case 'connect': return r.client ? `client ${r.client}` : '';
+        case 'connect': return [r.client && `client ${r.client}`, r.instance && `instance ${r.instance}`].filter(Boolean).join(', ');
         case 'disconnect': return `${r.reason} after ${fmtDuration(r.duration_secs)}`;
         case 'agent_registered': return `registered with role ${r.role}`;
         case 'agent_login': return 'identified';

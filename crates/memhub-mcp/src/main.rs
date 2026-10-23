@@ -37,7 +37,7 @@ enum Command {
         #[arg(long, env = "MEMHUB_BIND", default_value = "127.0.0.1:7878")]
         bind: SocketAddr,
         /// Close sessions without activity for this many seconds.
-        #[arg(long, default_value_t = 1800)]
+        #[arg(long, default_value_t = 3600)]
         idle_timeout_secs: u64,
         /// Trust X-Forwarded-For / X-Real-IP for the client IP (behind a reverse proxy).
         #[arg(long)]
@@ -58,6 +58,10 @@ enum Command {
         /// Role used to create the agent if it does not exist yet.
         #[arg(long, env = "MEMHUB_ROLE")]
         role: Option<String>,
+        /// Label of this running copy (user, host, ...), recorded with the
+        /// connection so instances can be counted.
+        #[arg(long, env = "MEMHUB_INSTANCE")]
+        instance: Option<String>,
     },
     /// List registered agents.
     Agents,
@@ -112,8 +116,19 @@ fn main() -> anyhow::Result<()> {
             };
             tokio::runtime::Runtime::new()?.block_on(serve(hub, bind, config))
         }
-        Command::Stdio { agent, role } => {
-            stdio::run(hub, StdioLogin { agent, role })?;
+        Command::Stdio {
+            agent,
+            role,
+            instance,
+        } => {
+            stdio::run(
+                hub,
+                StdioLogin {
+                    agent,
+                    role,
+                    instance,
+                },
+            )?;
             Ok(())
         }
         Command::Agents => {
@@ -206,8 +221,12 @@ fn print_record(r: &Value, with_diff: bool) {
     let event = s("event");
     let detail = match event {
         "connect" => format!(
-            "client={}",
-            r.get("client").and_then(Value::as_str).unwrap_or("?")
+            "client={}{}",
+            r.get("client").and_then(Value::as_str).unwrap_or("?"),
+            r.get("instance")
+                .and_then(Value::as_str)
+                .map(|i| format!(" instance={i}"))
+                .unwrap_or_default()
         ),
         "disconnect" => format!(
             "reason={} after {:.1}s",

@@ -47,6 +47,9 @@ pub enum AuditEvent {
         /// MCP client implementation (`clientInfo` name/version).
         #[serde(skip_serializing_if = "Option::is_none")]
         client: Option<String>,
+        /// Label of the running agent copy (`X-Memhub-Instance` / `--instance`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<String>,
     },
     Disconnect {
         #[serde(flatten)]
@@ -301,6 +304,7 @@ mod tests {
         log.record(AuditEvent::Connect {
             actor: actor(None),
             client: Some("cursor 1.0".into()),
+            instance: Some("alice-laptop".into()),
         });
         log.record(AuditEvent::MemoryChanged {
             actor: actor(Some("alice")),
@@ -320,6 +324,7 @@ mod tests {
         assert_eq!(all[0]["event"], "connect");
         assert_eq!(all[0]["ip"], "10.0.0.7");
         assert!(all[0].get("agent").is_none());
+        assert_eq!(all[0]["instance"], "alice-laptop");
         assert_eq!(all[1]["event"], "memory_changed");
         assert_eq!(all[1]["action"], "update");
         assert_eq!(all[1]["agent"], "alice");

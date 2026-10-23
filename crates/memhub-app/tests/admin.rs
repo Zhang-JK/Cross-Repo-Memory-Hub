@@ -2,10 +2,11 @@ use std::{io::Write, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use memhub_app::{
-    admin::{AdminNewMemory, LogFilter, WindowCounts},
+    admin::{AdminNewMemory, InstanceCount, LogFilter, WindowCounts},
     audit::LogQuery,
+    clean_instance,
     store::{MemoryId, Scope},
-    AddMemory, AgentSession, ConnInfo, Hub, HubConfig, ADMIN_ACTOR,
+    AddMemory, AgentSession, ConnInfo, Hub, HubConfig, ADMIN_ACTOR, MAX_INSTANCE_LEN,
 };
 
 fn hub() -> (tempfile::TempDir, Arc<Hub>) {
@@ -19,6 +20,7 @@ fn agent(hub: &Arc<Hub>, name: &str, ip: &str) -> AgentSession {
         transport: "http".into(),
         ip: ip.into(),
         client: Some("test-client 1.0".into()),
+        instance: None,
     });
     s.connect(name, Some("feature-impl"), None).unwrap();
     s
@@ -325,6 +327,7 @@ fn connections_are_reconstructed_per_session() {
         transport: "http".into(),
         ip: "10.0.0.9".into(),
         client: None,
+        instance: None,
     });
     anonymous.close("idle_timeout");
 
@@ -499,7 +502,11 @@ fn connection_summary_uses_rolling_windows() {
         WindowCounts {
             connections: 4,
             ips: 3,
-            agents: 2
+            agents: 2,
+            instances: InstanceCount {
+                instances: 2,
+                unlabeled_instances: 2
+            },
         },
         "week counts the shared IP once and skips anonymous and (admin)"
     );
@@ -508,7 +515,11 @@ fn connection_summary_uses_rolling_windows() {
         WindowCounts {
             connections: 5,
             ips: 4,
-            agents: 3
+            agents: 3,
+            instances: InstanceCount {
+                instances: 3,
+                unlabeled_instances: 3
+            },
         }
     );
 
@@ -569,7 +580,11 @@ fn selftest_traffic_is_hidden_from_the_management_logs() {
         WindowCounts {
             connections: 1,
             ips: 1,
-            agents: 1
+            agents: 1,
+            instances: InstanceCount {
+                instances: 1,
+                unlabeled_instances: 1
+            },
         }
     );
 
@@ -582,4 +597,81 @@ fn selftest_traffic_is_hidden_from_the_management_logs() {
         .recent_updates
         .iter()
         .all(|u| u["agent"] != "memhub-selftest"));
+}
+
+fn labeled(hub: &Arc<Hub>, name: &str, ip: &str, instance: Option<&str>) -> AgentSession {
+    let mut s = hub.open_session(ConnInfo {
+        transport: "http".into(),
+        ip: ip.into(),
+        client: Some("test-client 1.0".into()),
+        instance: instance.and_then(clean_instance),
+    });
+    s.connect(name, Some("feature-impl"), None).unwrap();
+    s
+}
+
+#[test]
+fn instances_count_running_copies_of_an_agent() {
+    let (_dir, hub) = hub();
+    // Two people run feature-dev behind the same proxy IP, each reconnecting.
+    for _ in 0..2 {
+        labeled(&hub, "feature-dev", "10.5.0.1", Some("alice-laptop")).close("idle_timeout");
+        labeled(&hub, "feature-dev", "10.5.0.1", Some(" bob-desktop\t")).close("client_closed");
+    }
+    // The same label under another agent name is another instance.
+    labeled(&hub, "crash-bot", "10.5.0.1", Some("alice-laptop")).close("client_closed");
+    // Without the header, copies on one IP collapse into one instance.
+    labeled(&hub, "perf-bot", "10.5.0.2", None).close("client_closed");
+    labeled(&hub, "perf-bot", "10.5.0.2", Some("   ")).close("client_closed");
+    labeled(&hub, "perf-bot", "10.5.0.3", None).close("client_closed");
+    hub.open_session(ConnInfo {
+        transport: "http".into(),
+        ip: "10.5.0.9".into(),
+        client: None,
+        instance: Some("anonymous-box".into()),
+    })
+    .close("client_closed");
+
+    let admin = hub.admin("127.0.0.1");
+    let summary = admin.connection_summary().unwrap();
+    assert_eq!(summary.week.connections, 9);
+    assert_eq!(summary.week.agents, 3);
+    assert_eq!(
+        summary.week.instances,
+        InstanceCount {
+            instances: 5,
+            unlabeled_instances: 2
+        },
+        "alice + bob (feature-dev), alice (crash-bot), perf-bot on two IPs; anonymous skipped"
+    );
+
+    let sessions = admin.connections(&logs(50)).unwrap();
+    let bob = sessions
+        .iter()
+        .find(|s| s.instance.as_deref() == Some("bob-desktop"))
+        .expect("label is trimmed and kept");
+    assert_eq!(bob.agent.as_deref(), Some("feature-dev"));
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|s| s.agent.as_deref() == Some("perf-bot") && s.instance.is_none())
+            .count(),
+        3,
+        "a blank header counts as no label"
+    );
+}
+
+#[test]
+fn instance_labels_are_cleaned() {
+    assert_eq!(
+        clean_instance("  alice@build-07 \n").as_deref(),
+        Some("alice@build-07")
+    );
+    assert_eq!(clean_instance("a\u{7}b").as_deref(), Some("ab"));
+    assert_eq!(clean_instance(" \t "), None);
+    let long = "x".repeat(MAX_INSTANCE_LEN + 50);
+    assert_eq!(
+        clean_instance(&long).unwrap().chars().count(),
+        MAX_INSTANCE_LEN
+    );
 }

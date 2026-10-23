@@ -106,7 +106,7 @@ cargo build --release
 memhub --data-dir ./memhub-data serve --bind 127.0.0.1:7878
 
 # stdio (one agent per process; IP logged as "local")
-memhub --data-dir ./memhub-data stdio --agent my-agent --role feature-impl
+memhub --data-dir ./memhub-data stdio --agent my-agent --role feature-impl --instance alice-laptop
 ```
 
 ### Deploying without a Rust toolchain
@@ -142,7 +142,8 @@ The management page omits this agent from the connection log, the update log, th
 activity counts, and the Excel export.
 
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
-`serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,
+`serve` options: `--idle-timeout-secs` (default 3600: a session with no request for an hour is
+closed; the client's next request gets a 404 and it re-initializes), `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,
 `--admin-token` (`MEMHUB_ADMIN_TOKEN`).
 
 ### Management web UI
@@ -156,9 +157,10 @@ Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
   front-matter properties and content (rendered or raw file). Add memories into any folder
   (typed in or imported from a `.md` file), move or delete memories, and create, describe or
   delete folders.
-- **Connections**: live connection count plus rolling 7-day and 30-day counts
-  (connections, distinct IPs, distinct agents), then one row per MCP session
-  (agent, client IP, client, duration, disconnect reason, live or closed), or the
+- **Connections**: live instances and connections, plus rolling 7-day and 30-day counts
+  (instances, distinct agents, distinct IPs, connections; see
+  [Counting instances](#counting-instances)), then one row per MCP session
+  (agent, instance, client IP, client, duration, disconnect reason, live or closed), or the
   raw connect/identify/disconnect events. **Export Excel** downloads sessions from
   the last 365 days as `.xlsx` (the agent and IP filters apply; at most 100,000
   rows, newest first). A connection counts in a window when it started, identified
@@ -199,7 +201,11 @@ HTTP client configuration (e.g. Cursor `mcp.json`):
   "mcpServers": {
     "memhub": {
       "url": "http://127.0.0.1:7878/mcp",
-      "headers": { "X-Memhub-Agent": "crash-bot", "X-Memhub-Role": "crash-analysis" }
+      "headers": {
+        "X-Memhub-Agent": "crash-bot",
+        "X-Memhub-Role": "crash-analysis",
+        "X-Memhub-Instance": "alice-laptop"
+      }
     }
   }
 }
@@ -208,6 +214,21 @@ HTTP client configuration (e.g. Cursor `mcp.json`):
 The headers are optional. Without them, the agent calls `connect_agent` with its name.
 If the agent does not exist yet, a `role` (header or tool argument) is required to create it;
 for an existing agent the role is ignored.
+
+### Counting instances
+
+`X-Memhub-Instance` (stdio: `--instance` / `MEMHUB_INSTANCE`) labels one running copy of an
+agent, for example `<user>-<machine>`. Give each person or machine its own value and keep it
+stable across restarts. It is free text (at most 128 characters, trimmed), recorded on the
+`connect` audit event, and identifies nothing beyond the label. Memory is still shared by
+agent name.
+
+The Connections page counts **instances** as distinct pairs of agent name and instance
+label. Reconnects (for example after an idle timeout) don't add to the count, and two people
+running the same agent behind one proxy IP count as two. Connections without the header
+can't be told apart, so they are grouped by agent and IP and counted as **unlabeled**
+instances. That part is a lower bound, and the count is exact once every client sends the
+header.
 
 Because names are not secret, the "agent memory is read-only for other agents" rule protects
 against honest mistakes, not against an agent deliberately using another agent's name.
@@ -231,7 +252,7 @@ against honest mistakes, not against an agent deliberately using another agent's
 ## Audit log
 
 Every record carries `ts`, `event`, `session_id`, `agent` (once identified), `ip` and `transport`.
-Events: `connect` (with MCP client name), `disconnect` (`client_closed`, `idle_timeout`,
+Events: `connect` (with MCP client name and `instance` label), `disconnect` (`client_closed`, `idle_timeout`,
 `stdio_eof`, `server_shutdown`, `connect_failed`, ...), `agent_registered` (first connection
 of a new agent), `agent_login`, `repo_joined`, `repo_left`, `memory_changed` with
 `action` (`add`/`update`/`move`/`delete`/`group_add`/`group_remove`), versions, changed fields,

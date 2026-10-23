@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use memhub_app::{ConnInfo, Hub};
+use memhub_app::{clean_instance, ConnInfo, Hub};
 use serde_json::Value;
 
 use crate::{
@@ -20,6 +20,8 @@ pub struct StdioLogin {
     pub agent: Option<String>,
     /// Used to create the agent if it does not exist yet.
     pub role: Option<String>,
+    /// Label of this running copy, recorded with the connection.
+    pub instance: Option<String>,
 }
 
 pub fn run(hub: Arc<Hub>, login: StdioLogin) -> io::Result<()> {
@@ -83,6 +85,7 @@ fn handle(
                 transport: "stdio".into(),
                 ip: "local".into(),
                 client: None,
+                instance: login.instance.as_deref().and_then(clean_instance),
             };
             let (mut c, response) = McpConnection::initialize(hub, info, &msg);
             if let Some(agent) = &login.agent {

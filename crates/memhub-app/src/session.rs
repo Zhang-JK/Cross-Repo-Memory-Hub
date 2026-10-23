@@ -24,6 +24,27 @@ pub struct ConnInfo {
     pub ip: String,
     /// Client implementation name/version, if reported.
     pub client: Option<String>,
+    /// Self-chosen label of the running agent copy (`X-Memhub-Instance`),
+    /// cleaned with [`clean_instance`].
+    pub instance: Option<String>,
+}
+
+/// Longest instance label kept, in characters.
+pub const MAX_INSTANCE_LEN: usize = 128;
+
+/// Normalizes an instance label: control characters are dropped, the label
+/// is trimmed and cut to [`MAX_INSTANCE_LEN`] characters; empty means none.
+pub fn clean_instance(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_INSTANCE_LEN)
+        .collect();
+    let cleaned = cleaned.trim_end().to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +161,7 @@ impl AgentSession {
         session.hub.audit().record(AuditEvent::Connect {
             actor: session.actor(),
             client: session.conn.client.clone(),
+            instance: session.conn.instance.clone(),
         });
         session
     }

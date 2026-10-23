@@ -165,7 +165,8 @@ memhub is running
 
 MCP client config:
   { "mcpServers": { "memhub": { "url": "http://$url_host:$PORT/mcp",
-      "headers": { "X-Memhub-Agent": "<agent-name>", "X-Memhub-Role": "<role>" } } } }
+      "headers": { "X-Memhub-Agent": "<agent-name>", "X-Memhub-Role": "<role>",
+                   "X-Memhub-Instance": "<user>-<machine>" } } } }
 EOF
 }
 

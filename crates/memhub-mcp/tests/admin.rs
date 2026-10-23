@@ -141,6 +141,118 @@ async fn token_protects_the_api() {
 }
 
 #[tokio::test]
+async fn nested_folders_over_http() {
+    let (_dir, app) = app(None);
+    let (status, res) = call(
+        &app,
+        "POST",
+        "/api/admin/folders",
+        Some(
+            json!({ "scope": "repo", "owner": "shop", "folder": "/modules/checkout/",
+                     "description": "Cart and payment" }),
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(res["folder"], "modules/checkout");
+    assert_eq!(res["created"], true);
+
+    let (status, res) = call(
+        &app,
+        "POST",
+        "/api/admin/memories",
+        Some(
+            json!({ "scope": "repo", "owner": "shop", "folder": "modules/checkout",
+                     "title": "Payment retries", "body": "3x" }),
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{res}");
+    let id = "repo/shop/modules/checkout/payment-retries";
+    assert_eq!(res["created"]["id"], id);
+
+    let (status, detail) = call(&app, "GET", &format!("/api/admin/memories/{id}"), None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["path"], format!("memories/{id}.md"));
+
+    let (_, folders) = call(&app, "GET", "/api/admin/folders", None, &[]).await;
+    let shop = &folders["folders"][0];
+    assert_eq!(shop["children"][1]["path"], "modules/checkout");
+    assert_eq!(shop["children"][1]["description"], "Cart and payment");
+    assert_eq!(shop["children"][0]["total_count"], 1);
+
+    let (_, list) = call(
+        &app,
+        "GET",
+        "/api/admin/memories?scope=repo&owner=shop&folder=modules",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(list["count"], 1);
+
+    let (status, moved) = call(
+        &app,
+        "POST",
+        "/api/admin/memories/move",
+        Some(json!({ "id": id, "folder": "pitfalls", "slug": "" })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(moved["moved"]["id"], "repo/shop/pitfalls/payment-retries");
+    assert_eq!(moved["previous_id"], id);
+    let (status, _) = call(&app, "GET", &format!("/api/admin/memories/{id}"), None, &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/api/admin/memories/repo/shop/..%2F..%2Fx/y",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/admin/folders",
+        Some(json!({ "scope": "repo", "owner": "shop", "folder": "a/../../b" })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, res) = call(
+        &app,
+        "DELETE",
+        "/api/admin/folders/repo/shop?folder=pitfalls",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(
+        res["deleted"],
+        json!(["repo/shop/pitfalls/payment-retries"])
+    );
+    let (_, folders) = call(&app, "GET", "/api/admin/folders", None, &[]).await;
+    let paths: Vec<&str> = folders["folders"][0]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["modules", "modules/checkout"]);
+
+    let (_, updates) = call(&app, "GET", "/api/admin/updates?action=move", None, &[]).await;
+    assert_eq!(updates["updates"][0]["previous_id"], id);
+}
+
+#[tokio::test]
 async fn manage_folders_and_memories() {
     let (_dir, app) = app(None);
     let (status, res) = call(

@@ -207,7 +207,7 @@ td.wrap { word-break: break-word; }
 }
 .badge.add, .badge.folder_created, .badge.live { background: var(--green-soft); color: var(--green); }
 .badge.delete, .badge.folder_deleted { background: var(--red-soft); color: var(--red); }
-.badge.update { background: var(--blue-soft); color: var(--blue); }
+.badge.update, .badge.move, .badge.folder_described { background: var(--blue-soft); color: var(--blue); }
 .badge.group_add, .badge.group_remove, .badge.registered { background: var(--amber-soft); color: var(--amber); }
 .badge.repo { background: var(--accent-soft); color: var(--accent); }
 .badge.agent { background: #f3e8ff; color: #7e22ce; }
@@ -222,7 +222,7 @@ td.wrap { word-break: break-word; }
 .filters .grow { flex: 1; }
 
 /* ---- memories ---- */
-.mem-layout { display: grid; grid-template-columns: 250px minmax(280px, 380px) minmax(0, 1fr); gap: 14px; height: calc(100vh - 160px); min-height: 480px; }
+.mem-layout { display: grid; grid-template-columns: 280px minmax(280px, 380px) minmax(0, 1fr); gap: 14px; height: calc(100vh - 160px); min-height: 480px; }
 @media (max-width: 1100px) { .mem-layout { grid-template-columns: 1fr; height: auto; } }
 .mem-layout > .panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .scroll { overflow-y: auto; min-height: 0; flex: 1; }
@@ -237,9 +237,18 @@ td.wrap { word-break: break-word; }
 .folder .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder .count { font-size: 11.5px; color: var(--muted); background: var(--bg); border-radius: 999px; padding: 0 7px; }
 .folder.active .count { background: #fff; }
-.folder .del { visibility: hidden; }
-.folder:hover .del { visibility: visible; }
+.folder .del, .folder .add { visibility: hidden; padding: 0 5px; }
+.folder:hover .del, .folder:hover .add { visibility: visible; }
 .folder .unreg { font-size: 10px; color: var(--amber); }
+.folder .caret { font-size: 10px; color: var(--muted); }
+.folder.sub { font-size: 13px; gap: 6px; padding-top: 4px; padding-bottom: 4px; }
+.folder .fico { display: inline-flex; color: #b88a1b; }
+.folder .fico svg, .folder-chip svg, .folder-link svg { width: 14px; height: 14px; }
+.folder.active .fico { color: var(--accent); }
+.folder .nodesc { font-size: 10px; font-weight: 700; color: var(--amber); background: var(--amber-soft); border-radius: 999px; padding: 0 5px; }
+.folder-desc { padding: 0 16px 10px; font-size: 12.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.folder-chip { display: inline-flex; align-items: center; gap: 3px; color: #8a6514; background: #fdf6e3; border-color: #f1e2b8; }
+.folder-link { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono, ui-monospace, monospace); }
 .mem-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .mem-item:hover { background: #fafbff; }
 .mem-item.active { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }

@@ -40,7 +40,7 @@ function s(tag, attrs, ...children) {
   return el;
 }
 
-/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers. */
+/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers, folder. */
 function icon(name) {
   const pen = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
   const paths = {
@@ -71,6 +71,7 @@ function icon(name) {
       s('path', { d: 'M16 3.13a3 3 0 0 1 0 5.75' }),
     ],
     pulse: [s('path', { d: 'M3 12h4l2.2-6 3.6 12L15 12h6' })],
+    folder: [s('path', { d: 'M3 7.5A1.5 1.5 0 0 1 4.5 6H9l2 2.2h8.5A1.5 1.5 0 0 1 21 9.7v8.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z' })],
     layers: [
       s('path', { d: 'M12 3l9 5-9 5-9-5 9-5z' }),
       s('path', { d: 'M3 12l9 5 9-5' }),
@@ -136,13 +137,28 @@ function actionOf(r) {
 }
 
 const ACTION_LABELS = {
-  add: 'add', update: 'update', delete: 'delete', group_add: 'group +', group_remove: 'group −',
-  folder_created: 'folder +', folder_deleted: 'folder −',
+  add: 'add', update: 'update', move: 'move', delete: 'delete', group_add: 'group +', group_remove: 'group −',
+  folder_created: 'folder +', folder_described: 'folder ✎', folder_deleted: 'folder −',
 };
 
+/** Splits `scope/owner/[folder/…]slug`. */
+function parseId(id) {
+  const parts = (id || '').split('/');
+  return { scope: parts[0] || '', owner: parts[1] || '', folder: parts.slice(2, -1).join('/'), slug: parts.length > 2 ? parts[parts.length - 1] : '' };
+}
+
 function memoryHash(id) {
-  const [scope, owner, slug] = (id || '').split('/');
-  return '#/memories?' + new URLSearchParams({ scope, owner, id: `${scope}/${owner}/${slug}` });
+  const { scope, owner, folder } = parseId(id);
+  return '#/memories?' + new URLSearchParams({ scope, owner, folder, id });
+}
+
+/** `scope/owner[/folder]` of a folder audit record. */
+function folderPath(r) {
+  return `${r.scope}/${r.owner}${r.folder ? `/${r.folder}` : ''}`;
+}
+
+function folderHash(r) {
+  return '#/memories?' + new URLSearchParams({ scope: r.scope, owner: r.owner, folder: r.folder || '' });
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +466,8 @@ function renderDashboard(st) {
       h('span', { class: `badge ${actionOf(r)}`, text: ACTION_LABELS[actionOf(r)] || actionOf(r) }),
       h('span', { class: 'what' }, h('b', {}, agentLabel(r.agent)), ' ',
         r.memory_id ? h('a', { href: memoryHash(r.memory_id), text: r.title || r.memory_id, title: r.memory_id })
-          : h('span', { text: `${r.scope}/${r.owner}` })),
+          : r.event === 'folder_deleted' ? h('span', { class: 'mono', text: folderPath(r) })
+            : h('a', { class: 'mono', href: folderHash(r), text: folderPath(r) })),
       h('span', { class: 'when', title: fmtTime(r.ts), text: ago(r.ts) }))))
       : h('div', { class: 'empty', text: 'No changes in the last 14 days.' }));
 
@@ -509,29 +526,34 @@ async function viewMemories(view, params) {
   const st = {
     scope: params.get('scope') || '',
     owner: params.get('owner') || '',
+    folder: params.get('folder') || '',
     q: params.get('q') || '',
     id: params.get('id') || '',
     folders: [],
     mode: 'preview',
   };
-  const sync = () => setRouteParams('memories', { scope: st.scope, owner: st.owner, q: st.q, id: st.id });
+  const sync = () => setRouteParams('memories', { scope: st.scope, owner: st.owner, folder: st.folder, q: st.q, id: st.id });
 
   const treeBox = h('div', { class: 'scroll' });
   const listBox = h('div', { class: 'scroll' });
   const listCount = h('span', { class: 'muted' });
+  const listDesc = h('div', { class: 'folder-desc hidden' });
   const detailBox = h('div', { class: 'scroll' });
-  const search = h('input', { type: 'search', placeholder: 'Search title, tags, body…', value: st.q });
+  const search = h('input', { type: 'search', placeholder: 'Search title, folder, tags, body…', value: st.q });
 
-  setHead('Memories', 'Every repo and agent memory, stored as Markdown files with front-matter properties', [
+  setHead('Memories', 'Every repo and agent memory, organized in folders and stored as Markdown files with front-matter properties', [
     h('button', { type: 'button', on: { click: () => newFolderModal() } }, '+ New folder'),
     h('button', { class: 'primary', type: 'button', on: { click: () => newMemoryModal() } }, '+ New memory')]);
 
   view.replaceChildren(h('div', { class: 'mem-layout' },
     h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { text: 'Folders' })), treeBox),
-    h('div', { class: 'panel' }, h('div', { class: 'search-row' }, search), h('div', { class: 'panel-head' }, h('h2', { id: 'list-title' }), listCount), listBox),
+    h('div', { class: 'panel' }, h('div', { class: 'search-row' }, search), h('div', { class: 'panel-head' }, h('h2', { id: 'list-title' }), listCount), listDesc, listBox),
     h('div', { class: 'panel' }, detailBox)));
 
   search.addEventListener('input', debounce(() => { st.q = search.value.trim(); sync(); loadList(); }, 250));
+
+  const ownerEntry = (scope, owner) => st.folders.find((f) => f.scope === scope && f.owner === owner);
+  const subfolders = (scope, owner) => (ownerEntry(scope, owner) || {}).children || [];
 
   async function loadTree() {
     const data = await api('/folders');
@@ -541,53 +563,91 @@ async function viewMemories(view, params) {
 
   function renderTree() {
     const total = st.folders.reduce((n, f) => n + f.memory_count, 0);
-    const item = (label, count, active, onClick, extra) => h('div', { class: `folder ${active ? 'active' : ''}`, on: { click: onClick } },
+    const item = (label, count, active, onClick, extra, cls) => h('div', { class: `folder ${cls || ''} ${active ? 'active' : ''}`, on: { click: onClick } },
       h('span', { class: 'name', title: label, text: label }), extra, h('span', { class: 'count', text: count }));
+    const subItem = (f, c) => {
+      const row = h('div', { class: `folder sub ${st.scope === f.scope && st.owner === f.owner && st.folder === c.path ? 'active' : ''}`,
+        title: c.description || `${c.path} (no description)`, on: { click: () => select(f.scope, f.owner, c.path) } },
+      h('span', { class: 'fico' }, icon('folder')),
+      h('span', { class: 'name', text: c.path.split('/').pop() }),
+      c.description ? null : h('span', { class: 'nodesc', title: 'No description: agents and newcomers will not know what belongs here', text: '?' }),
+      h('button', { class: 'icon add', type: 'button', title: `New subfolder in ${f.scope}/${f.owner}/${c.path}`, on: { click: (e) => { e.stopPropagation(); newFolderModal(f.scope, f.owner, `${c.path}/`); } } }, '+'),
+      h('button', { class: 'icon del', type: 'button', title: `Delete folder ${f.scope}/${f.owner}/${c.path}`, on: { click: (e) => { e.stopPropagation(); deleteFolder(f, c); } } }, '🗑'),
+      h('span', { class: 'count', text: c.total_count }));
+      row.style.paddingLeft = `${12 + c.path.split('/').length * 14}px`;
+      return row;
+    };
     const section = (scope, title) => {
       const folders = st.folders.filter((f) => f.scope === scope);
       return h('div', { class: 'tree-section' },
         h('div', { class: 'tree-title' }, h('span', { text: `${title} (${folders.length})` }),
-          h('button', { class: 'icon', type: 'button', title: `New ${scope} folder`, on: { click: () => newFolderModal(scope) } }, '+')),
-        item(`All ${scope} memories`, folders.reduce((n, f) => n + f.memory_count, 0), st.scope === scope && !st.owner, () => select(scope, '')),
-        folders.map((f) => item(f.owner, f.memory_count, st.scope === scope && st.owner === f.owner, () => select(scope, f.owner), [
-          f.registered ? null : h('span', { class: 'unreg', title: scope === 'repo' ? 'No agent has registered this repo with add_repo' : 'No agent with this name has connected', text: 'unregistered' }),
-          h('button', { class: 'icon del', type: 'button', title: `Delete folder ${scope}/${f.owner}`, on: { click: (e) => { e.stopPropagation(); deleteFolder(f); } } }, '🗑'),
-        ])));
+          h('button', { class: 'icon', type: 'button', title: `New ${scope}`, on: { click: () => newFolderModal(scope) } }, '+')),
+        item(`All ${scope} memories`, folders.reduce((n, f) => n + f.memory_count, 0), st.scope === scope && !st.owner, () => select(scope, '', '')),
+        folders.map((f) => {
+          const open = st.scope === scope && st.owner === f.owner;
+          const owner = item(f.owner, f.memory_count, open && !st.folder, () => select(scope, f.owner, ''), [
+            f.children.length ? h('span', { class: 'caret', text: open ? '▾' : '▸', title: `${f.children.length} subfolder${f.children.length === 1 ? '' : 's'}` }) : null,
+            f.registered ? null : h('span', { class: 'unreg', title: scope === 'repo' ? 'No agent has registered this repo with add_repo' : 'No agent with this name has connected', text: 'unregistered' }),
+            h('button', { class: 'icon add', type: 'button', title: `New subfolder in ${scope}/${f.owner}`, on: { click: (e) => { e.stopPropagation(); newFolderModal(scope, f.owner, ''); } } }, '+'),
+            h('button', { class: 'icon del', type: 'button', title: `Delete ${scope}/${f.owner} with all its folders`, on: { click: (e) => { e.stopPropagation(); deleteFolder(f); } } }, '🗑'),
+          ], 'owner');
+          return open ? [owner, f.children.map((c) => subItem(f, c))] : owner;
+        }));
     };
     treeBox.replaceChildren(
-      h('div', { class: 'tree-section' }, item('All memories', total, !st.scope, () => select('', ''))),
+      h('div', { class: 'tree-section' }, item('All memories', total, !st.scope, () => select('', '', ''))),
       section('repo', 'Repos'), section('agent', 'Agents'));
   }
 
-  function select(scope, owner) {
-    st.scope = scope; st.owner = owner;
+  function select(scope, owner, folder) {
+    st.scope = scope; st.owner = owner; st.folder = folder;
     sync(); renderTree(); loadList();
   }
 
-  async function loadList() {
-    const title = st.owner ? `${st.scope}/${st.owner}` : st.scope ? `All ${st.scope} memories` : 'All memories';
+  function renderListHead() {
+    const title = st.owner ? `${st.scope}/${st.owner}${st.folder ? `/${st.folder}` : ''}` : st.scope ? `All ${st.scope} memories` : 'All memories';
     $('#list-title').textContent = st.q ? `Search in ${title}` : title;
+    const entry = st.owner ? ownerEntry(st.scope, st.owner) : null;
+    const sub = entry && st.folder ? entry.children.find((c) => c.path === st.folder) : null;
+    const desc = sub ? sub.description : entry && !st.folder ? entry.description : '';
+    listDesc.replaceChildren();
+    if (sub && !desc) {
+      listDesc.append(h('span', { class: 'muted', text: 'No description. ' }),
+        h('button', { class: 'link', type: 'button', text: 'Describe this folder', on: { click: () => newFolderModal(st.scope, st.owner, st.folder) } }));
+    } else if (desc) {
+      listDesc.append(desc);
+    }
+    listDesc.classList.toggle('hidden', !listDesc.childNodes.length);
+  }
+
+  async function loadList() {
+    renderListHead();
     listBox.replaceChildren(loading());
     try {
-      const data = await api('/memories' + query({ scope: st.scope, owner: st.owner, q: st.q }));
+      const data = await api('/memories' + query({ scope: st.scope, owner: st.owner, folder: st.folder, q: st.q }));
       listCount.textContent = `${data.count}`;
       if (!data.memories.length) {
         listBox.replaceChildren(h('div', { class: 'empty' }, st.q ? 'No memory matches the search.' : 'This folder is empty.',
           h('div', {}, h('button', { class: 'link', type: 'button', text: '+ Add a memory', on: { click: () => newMemoryModal() } }))));
         return;
       }
-      listBox.replaceChildren(...data.memories.map((m) => h('div', {
-        class: `mem-item ${m.id === st.id ? 'active' : ''}`, dataset: { id: m.id },
-        on: { click: () => { st.id = m.id; sync(); markActive(); loadDetail(); } },
-      },
-      h('div', { class: 't', text: m.title, title: m.title }),
-      h('div', { class: 'id mono', text: m.id, title: m.id }),
-      h('div', { class: 'meta' },
-        st.owner ? null : h('span', { class: `badge ${m.id.split('/')[0]}`, text: m.id.split('/')[0] }),
-        h('span', { class: 'chip', text: m.kind }),
-        (m.tags || []).slice(0, 3).map((t) => h('span', { class: 'chip', text: `#${t}` })),
-        h('span', { title: fmtTime(m.updated_at), text: ago(m.updated_at) })),
-      m.snippet ? h('div', { class: 'snip', text: m.snippet }) : null)));
+      listBox.replaceChildren(...data.memories.map((m) => {
+        const { scope, folder } = parseId(m.id);
+        const rel = st.owner && folder.startsWith(st.folder) ? folder.slice(st.folder.length).replace(/^\//, '') : folder;
+        return h('div', {
+          class: `mem-item ${m.id === st.id ? 'active' : ''}`, dataset: { id: m.id },
+          on: { click: () => { st.id = m.id; sync(); markActive(); loadDetail(); } },
+        },
+        h('div', { class: 't', text: m.title, title: m.title }),
+        h('div', { class: 'id mono', text: m.id, title: m.id }),
+        h('div', { class: 'meta' },
+          st.owner ? null : h('span', { class: `badge ${scope}`, text: scope }),
+          rel ? h('span', { class: 'chip folder-chip', title: `in ${folder}/` }, icon('folder'), rel) : null,
+          h('span', { class: 'chip', text: m.kind }),
+          (m.tags || []).slice(0, 3).map((t) => h('span', { class: 'chip', text: `#${t}` })),
+          h('span', { title: fmtTime(m.updated_at), text: ago(m.updated_at) })),
+        m.snippet ? h('div', { class: 'snip', text: m.snippet }) : null);
+      }));
     } catch (e) {
       listBox.replaceChildren(errorBox(e));
     }
@@ -597,6 +657,8 @@ async function viewMemories(view, params) {
     listBox.querySelectorAll('.mem-item').forEach((el) => el.classList.toggle('active', el.dataset.id === st.id));
   }
 
+  const memoryUrl = (id) => '/memories/' + id.split('/').map(encodeURIComponent).join('/');
+
   async function loadDetail() {
     if (!st.id) {
       detailBox.replaceChildren(h('div', { class: 'empty' }, 'Select a memory to see its properties and content.'));
@@ -604,17 +666,17 @@ async function viewMemories(view, params) {
     }
     detailBox.replaceChildren(loading());
     try {
-      const d = await api('/memories/' + st.id.split('/').map(encodeURIComponent).join('/'));
+      const d = await api(memoryUrl(st.id));
       detailBox.replaceChildren(renderDetail(d));
     } catch (e) {
       detailBox.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'form-error', text: e.message }),
-        e.status === 404 ? h('div', { class: 'muted', text: 'It may have been deleted. Check the update log for its history.' }) : null));
+        e.status === 404 ? h('div', { class: 'muted', text: 'It may have been moved or deleted. Check the update log for its history.' }) : null));
     }
   }
 
   function renderDetail(d) {
     const m = d.memory;
-    const [scope, owner] = m.id.split('/');
+    const { scope, owner, folder } = parseId(m.id);
     const chips = (list) => (list && list.length ? list.map((t) => h('span', { class: 'chip', text: t })) : h('span', { class: 'muted', text: '—' }));
     const known = new Set(['id', 'title', 'kind', 'tags', 'groups', 'author', 'updated_by', 'created_at', 'updated_at', 'version', 'body']);
     const extra = Object.entries(m).filter(([k]) => !known.has(k));
@@ -635,6 +697,7 @@ async function viewMemories(view, params) {
       h('div', { class: 'detail-head' }, h('h2', { text: m.title }), h('div', { class: 'sub mono', text: d.path }),
         h('div', { class: 'actions' },
           h('button', { class: 'small', type: 'button', text: 'Copy id', on: { click: () => copy(m.id) } }),
+          h('button', { class: 'small', type: 'button', text: 'Move', on: { click: () => moveModal(m) } }),
           h('a', { class: 'btn small', href: `#/updates${query({ memory: m.id })}`, text: 'History' }),
           h('button', { class: 'small danger', type: 'button', text: 'Delete', on: { click: () => deleteMemory(m) } }))),
       h('div', { class: 'body-box' },
@@ -642,6 +705,9 @@ async function viewMemories(view, params) {
           row('id', h('span', { class: 'mono', text: m.id })),
           row('scope', h('span', { class: `badge ${scope}`, text: scope })),
           row(scope === 'repo' ? 'repo' : 'agent', owner),
+          row('folder', folder
+            ? h('button', { class: 'link folder-link', type: 'button', title: 'Show this folder', on: { click: () => select(scope, owner, folder) } }, icon('folder'), `${folder}/`)
+            : h('span', { class: 'muted', text: '(root)' })),
           row('kind', h('span', { class: 'chip', text: m.kind })),
           row('tags', chips(m.tags)),
           row('groups', chips(m.groups)),
@@ -661,58 +727,109 @@ async function viewMemories(view, params) {
     });
     if (!ok) return;
     try {
-      await api('/memories/' + m.id.split('/').map(encodeURIComponent).join('/'), { method: 'DELETE' });
+      await api(memoryUrl(m.id), { method: 'DELETE' });
       toast(`Deleted ${m.id}`);
       st.id = ''; sync();
       await Promise.all([loadTree(), loadList(), loadDetail()]);
     } catch (e) { toast(e.message, 'error'); }
   }
 
-  async function deleteFolder(f) {
-    const path = `${f.scope}/${f.owner}`;
+  function folderOptions(id, scope, owner) {
+    return h('datalist', { id }, subfolders(scope, owner).map((c) => h('option', { value: c.path, label: c.description || '' })));
+  }
+
+  function moveModal(mem) {
+    const { scope, owner, folder: current, slug: currentSlug } = parseId(mem.id);
+    const folder = h('input', { type: 'text', list: 'move-folder-options', value: current, placeholder: '(root)', autocomplete: 'off' });
+    const slug = h('input', { type: 'text', value: currentSlug, autocomplete: 'off' });
+    const err = h('div', { class: 'form-error' });
+    const submit = async () => {
+      err.textContent = '';
+      try {
+        const res = await api('/memories/move', { method: 'POST', body: { id: mem.id, folder: folder.value, slug: slug.value } });
+        toast(res.moved.id === mem.id ? 'Nothing to move' : `Moved to ${res.moved.id}`);
+        m.close();
+        st.id = res.moved.id; st.folder = parseId(res.moved.id).folder; sync();
+        await loadTree();
+        await Promise.all([loadList(), loadDetail()]);
+      } catch (e) { err.textContent = e.message; }
+    };
+    [folder, slug].forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); }));
+    const m = openModal({
+      title: 'Move memory', narrow: true,
+      body: [h('div', { class: 'note' }, 'Move ', h('b', { text: mem.title }), ' within ', h('code', { text: `${scope}/${owner}` }), '. Its id changes; the move is recorded in the update log.'),
+        h('label', { class: 'field' }, 'Folder (empty for the root)', folder, folderOptions('move-folder-options', scope, owner)),
+        h('label', { class: 'field' }, 'File name (slug)', slug),
+        h('div', { class: 'note', text: 'Missing folders are created. A taken file name gets a numeric suffix only when the name is unchanged.' }), err],
+      footer: [h('button', { type: 'button', text: 'Cancel', on: { click: () => m.close() } }), h('button', { class: 'primary', type: 'button', text: 'Move', on: { click: submit } })],
+    });
+    setTimeout(() => folder.focus(), 0);
+  }
+
+  async function deleteFolder(f, sub) {
+    const path = `${f.scope}/${f.owner}${sub ? `/${sub.path}` : ''}`;
+    const count = sub ? sub.total_count : f.memory_count;
+    const name = sub ? sub.path.split('/').pop() : f.owner;
     const ok = await confirmDialog({
       title: 'Delete folder',
-      message: h('div', {}, 'Move the folder ', h('code', { text: path }), f.memory_count ? [' and its ', h('b', { text: `${f.memory_count} memories` })] : ' (empty)',
-        ' to the trash? The ', f.scope === 'repo' ? 'repo' : 'agent', ' registration is kept, so agents can write here again.'),
-      requireText: f.memory_count ? f.owner : null,
+      message: h('div', {}, 'Move the folder ', h('code', { text: path }), count ? [' and its ', h('b', { text: `${count} memories` })] : ' (empty)',
+        sub ? ' (including subfolders) to the trash?'
+          : [' to the trash? The ', f.scope === 'repo' ? 'repo' : 'agent', ' registration is kept, so agents can write here again.']),
+      requireText: count ? name : null,
       confirmText: 'Delete folder',
     });
     if (!ok) return;
     try {
-      const res = await api(`/folders/${encodeURIComponent(f.scope)}/${encodeURIComponent(f.owner)}`, { method: 'DELETE' });
+      const res = await api(`/folders/${encodeURIComponent(f.scope)}/${encodeURIComponent(f.owner)}${query({ folder: sub ? sub.path : '' })}`, { method: 'DELETE' });
       toast(`Deleted folder ${path} (${res.deleted.length} memories)`);
-      if (st.owner === f.owner && st.scope === f.scope) { st.owner = ''; }
+      if (st.scope === f.scope && st.owner === f.owner) {
+        if (!sub) { st.owner = ''; st.folder = ''; } else if (st.folder === sub.path || st.folder.startsWith(`${sub.path}/`)) st.folder = '';
+      }
       if (st.id.startsWith(path + '/')) st.id = '';
       sync();
-      await Promise.all([loadTree(), loadList(), loadDetail()]);
+      await loadTree();
+      await Promise.all([loadList(), loadDetail()]);
     } catch (e) { toast(e.message, 'error'); }
   }
 
-  function newFolderModal(scope) {
+  function newFolderModal(scope, ownerName, folderPrefix) {
     let current = scope || st.scope || 'repo';
-    const name = h('input', { type: 'text', placeholder: current === 'repo' ? 'payment-service' : 'crash-analyzer', autocomplete: 'off' });
+    const placeholder = () => (current === 'repo' ? 'payment-service' : 'crash-analyzer');
+    const ownerList = h('datalist', { id: 'folder-owner-options' });
+    const owner = h('input', { type: 'text', list: 'folder-owner-options', value: ownerName ?? (st.scope === current ? st.owner : ''), placeholder: placeholder(), autocomplete: 'off' });
+    const fillOwners = () => ownerList.replaceChildren(...st.folders.filter((f) => f.scope === current).map((f) => h('option', { value: f.owner })));
+    fillOwners();
+    const existing = subfolders(current, owner.value).find((c) => c.path === folderPrefix);
+    const folder = h('input', { type: 'text', value: folderPrefix ?? '', placeholder: 'e.g. modules/auth  (empty: only the repo / agent)', autocomplete: 'off' });
+    const description = h('input', { type: 'text', value: existing ? existing.description || '' : '', placeholder: 'What belongs in this folder', autocomplete: 'off' });
     const err = h('div', { class: 'form-error' });
     const seg = h('div', { class: 'seg' }, ['repo', 'agent'].map((sc) => h('button', {
       type: 'button', dataset: { scope: sc }, class: sc === current ? 'on' : '', text: sc === 'repo' ? 'Repo' : 'Agent',
-      on: { click: () => { current = sc; seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.scope === sc)); name.placeholder = sc === 'repo' ? 'payment-service' : 'crash-analyzer'; } },
+      on: { click: () => { current = sc; seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.scope === sc)); owner.placeholder = placeholder(); fillOwners(); } },
     })));
     const submit = async () => {
       err.textContent = '';
+      const path = folder.value.trim().replace(/^\/+|\/+$/g, '');
       try {
-        const res = await api('/folders', { method: 'POST', body: { scope: current, owner: name.value } });
-        toast(res.created ? `Created folder ${current}/${res.owner}` : `Folder ${current}/${res.owner} already exists`);
+        const res = await api('/folders', { method: 'POST', body: { scope: current, owner: owner.value, folder: path, description: path ? description.value : undefined } });
+        const shown = `${current}/${res.owner}${res.folder ? `/${res.folder}` : ''}`;
+        toast(res.created ? `Created folder ${shown}` : res.folder ? `Updated ${shown}` : `Folder ${shown} already exists`);
         m.close();
         await loadTree();
-        select(current, res.owner);
+        select(current, res.owner, res.folder);
       } catch (e) { err.textContent = e.message; }
     };
-    name.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    [owner, folder, description].forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); }));
     const m = openModal({
-      title: 'New memory folder', narrow: true,
-      body: [h('label', { class: 'field' }, 'Type', seg), h('label', { class: 'field' }, 'Name (repo id or agent name)', name),
-        h('div', { class: 'note', text: 'Letters, digits, "-", "_" and "." only. A folder holds the memories of one repo or one agent.' }), err],
-      footer: [h('button', { type: 'button', text: 'Cancel', on: { click: () => m.close() } }), h('button', { class: 'primary', type: 'button', text: 'Create', on: { click: submit } })],
+      title: existing ? 'Edit folder' : 'New folder', narrow: true,
+      body: [h('label', { class: 'field' }, 'Type', seg),
+        h('label', { class: 'field' }, 'Repo id or agent name', owner, ownerList),
+        h('label', { class: 'field' }, 'Subfolder path (optional)', folder),
+        h('label', { class: 'field' }, 'Description', description),
+        h('div', { class: 'note', text: 'Names use letters, digits, "-", "_" and "."; nest with "/". Agents see folder descriptions in browse_memory, so a one-line description helps newcomers find their way.' }), err],
+      footer: [h('button', { type: 'button', text: 'Cancel', on: { click: () => m.close() } }), h('button', { class: 'primary', type: 'button', text: existing ? 'Save' : 'Create', on: { click: submit } })],
     });
+    setTimeout(() => (ownerName ? (folderPrefix && !existing ? folder : existing ? description : folder) : owner).focus(), 0);
   }
 
   function newMemoryModal() {
@@ -720,11 +837,15 @@ async function viewMemories(view, params) {
     scope.value = st.scope || 'repo';
     const ownerList = h('datalist', { id: 'owner-options' });
     const owner = h('input', { type: 'text', list: 'owner-options', value: st.owner, autocomplete: 'off' });
+    const folderList = h('datalist', { id: 'new-folder-options' });
+    const folder = h('input', { type: 'text', list: 'new-folder-options', value: st.folder, placeholder: '(root) e.g. pitfalls', autocomplete: 'off' });
+    const fillFolders = () => folderList.replaceChildren(...subfolders(scope.value, owner.value.trim()).map((c) => h('option', { value: c.path, label: c.description || '' })));
     const fillOwners = () => ownerList.replaceChildren(...st.folders.filter((f) => f.scope === scope.value).map((f) => h('option', { value: f.owner })));
-    scope.addEventListener('change', () => { fillOwners(); if (!st.folders.some((f) => f.scope === scope.value && f.owner === owner.value)) owner.value = ''; });
-    fillOwners();
+    scope.addEventListener('change', () => { fillOwners(); if (!st.folders.some((f) => f.scope === scope.value && f.owner === owner.value)) owner.value = ''; fillFolders(); });
+    owner.addEventListener('input', fillFolders);
+    fillOwners(); fillFolders();
     const title = h('input', { type: 'text', autocomplete: 'off' });
-    const kindList = h('datalist', { id: 'kind-options' }, ['overview', 'architecture', 'implementation', 'pitfall', 'task-log', 'insight', 'todo', 'note'].map((k) => h('option', { value: k })));
+    const kindList = h('datalist', { id: 'kind-options' }, ['overview', 'architecture', 'implementation', 'how-to', 'pitfall', 'decision', 'task-log', 'insight', 'todo', 'note'].map((k) => h('option', { value: k })));
     const kind = h('input', { type: 'text', list: 'kind-options', placeholder: 'note' });
     const tags = h('input', { type: 'text', placeholder: 'comma, separated' });
     const groups = h('input', { type: 'text', placeholder: 'comma, separated' });
@@ -752,10 +873,10 @@ async function viewMemories(view, params) {
     const list = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
     const submit = async () => {
       err.textContent = '';
-      if (!owner.value.trim()) { err.textContent = 'Choose the repo or agent folder.'; return; }
+      if (!owner.value.trim()) { err.textContent = 'Choose the repo or agent.'; return; }
       if (!useFm.checked && !title.value.trim()) { err.textContent = 'A title is required.'; return; }
       const payload = {
-        scope: scope.value, owner: owner.value.trim(), title: title.value, kind: kind.value,
+        scope: scope.value, owner: owner.value.trim(), folder: folder.value.trim(), title: title.value, kind: kind.value,
         tags: list(tags.value), groups: list(groups.value), slug: slug.value,
       };
       if (useFm.checked) payload.markdown = body.value; else payload.body = body.value;
@@ -763,23 +884,24 @@ async function viewMemories(view, params) {
         const res = await api('/memories', { method: 'POST', body: payload });
         toast(`Created ${res.created.id}`);
         m.close();
-        st.scope = scope.value; st.owner = payload.owner; st.id = res.created.id; st.q = ''; search.value = '';
+        st.scope = scope.value; st.owner = payload.owner; st.folder = parseId(res.created.id).folder; st.id = res.created.id; st.q = ''; search.value = '';
         sync();
-        await Promise.all([loadTree(), loadList(), loadDetail()]);
+        await loadTree();
+        await Promise.all([loadList(), loadDetail()]);
       } catch (e) { err.textContent = e.message; }
     };
     const m = openModal({
       title: 'New memory',
       body: [
-        h('div', { class: 'row2' }, h('label', { class: 'field' }, 'Scope', scope), h('label', { class: 'field' }, 'Folder (repo id / agent name)', owner, ownerList)),
-        h('label', { class: 'field' }, 'Title', title),
+        h('div', { class: 'row2' }, h('label', { class: 'field' }, 'Scope', scope), h('label', { class: 'field' }, 'Repo id / agent name', owner, ownerList)),
+        h('div', { class: 'row2' }, h('label', { class: 'field' }, 'Folder', folder, folderList), h('label', { class: 'field' }, 'Title', title)),
         h('div', { class: 'row2' }, h('label', { class: 'field' }, 'Kind', kind, kindList), h('label', { class: 'field' }, 'File name (slug)', slug)),
         h('div', { class: 'row2' }, h('label', { class: 'field' }, 'Tags', tags), h('label', { class: 'field' }, 'Groups', groups)),
         h('div', { class: 'body-tabs' },
           h('label', { class: 'nowrap' }, useFm, ' Content includes front matter'),
           h('button', { class: 'small', type: 'button', text: '⇪ Import .md file', on: { click: () => file.click() } }), file),
         fmNote, body,
-        h('div', { class: 'note', text: 'Created as author "(admin)". The change is recorded in the update log.' }), err],
+        h('div', { class: 'note', text: 'Created as author "(admin)". Missing folders are created. The change is recorded in the update log.' }), err],
       footer: [h('button', { type: 'button', text: 'Cancel', on: { click: () => m.close() } }), h('button', { class: 'primary', type: 'button', text: 'Create memory', on: { click: submit } })],
     });
     if (st.owner) setTimeout(() => title.focus(), 0);
@@ -1009,11 +1131,11 @@ async function viewUpdates(view, params) {
   const foot = h('div');
   const count = h('span', { class: 'muted' });
 
-  setHead('Update log', 'How agents (and admins) changed memory: adds, edits, deletions and grouping, with diffs', [refreshButton(() => load())]);
+  setHead('Update log', 'How agents (and admins) changed memory: adds, edits, moves, deletions, folders and grouping, with diffs', [refreshButton(() => load())]);
   view.replaceChildren(h('div', { class: 'panel' },
     h('div', { class: 'filters' },
       filterInput('Agent', st.agent, change('agent'), 'upd-agent-options'), agents, action,
-      filterInput('Memory id or title', st.memory, change('memory')),
+      filterInput('Memory id, title or folder', st.memory, change('memory')),
       rangeSelect(st.days, change('days')), h('span', { class: 'grow' }), count),
     body, foot));
 
@@ -1056,9 +1178,12 @@ async function viewUpdates(view, params) {
     for (const r of rows) {
       const act = actionOf(r);
       const target = r.memory_id
-        ? h('div', {}, h('div', { text: r.title || '' }), h('a', { class: 'mono', href: memoryHash(r.memory_id), text: r.memory_id }))
-        : h('div', {}, h('span', { class: 'mono', text: `${r.scope}/${r.owner}` }),
-          r.event === 'folder_deleted' ? h('div', { class: 'muted', text: `${r.memory_count} memories moved to trash` }) : null);
+        ? h('div', {}, h('div', { text: r.title || '' }), h('a', { class: 'mono', href: memoryHash(r.memory_id), text: r.memory_id }),
+          r.previous_id ? h('div', { class: 'muted mono', text: `from ${r.previous_id}` }) : null)
+        : h('div', {}, r.event === 'folder_deleted' ? h('span', { class: 'mono', text: folderPath(r) }) : h('a', { class: 'mono', href: folderHash(r), text: folderPath(r) }),
+          r.event === 'folder_deleted' ? h('div', { class: 'muted', text: `${r.memory_count} memories moved to trash` }) : null,
+          r.event === 'folder_described' ? h('div', { class: 'muted', text: r.description ? `“${r.description}”` : 'description removed' }) : null,
+          r.event === 'folder_created' && r.description ? h('div', { class: 'muted', text: `“${r.description}”` }) : null);
       const changed = [
         (r.changed_fields || []).map((f) => h('span', { class: 'chip', text: f })),
         r.group ? h('span', { class: 'chip', text: `group: ${r.group}` }) : null,

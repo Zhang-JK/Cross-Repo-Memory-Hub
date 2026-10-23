@@ -85,19 +85,11 @@ impl Registry {
 
     /// Returns `false` if the agent already existed.
     pub fn create_agent(&self, profile: &AgentProfile) -> Result<bool> {
-        write_yaml(
-            &self.agents.join(format!("{}.yaml", profile.name)),
-            profile,
-            true,
-        )
+        write_yaml(&self.agents.join(format!("{}.yaml", profile.name)), profile, true)
     }
 
     pub fn save_agent(&self, profile: &AgentProfile) -> Result<()> {
-        write_yaml(
-            &self.agents.join(format!("{}.yaml", profile.name)),
-            profile,
-            false,
-        )?;
+        write_yaml(&self.agents.join(format!("{}.yaml", profile.name)), profile, false)?;
         Ok(())
     }
 
@@ -111,19 +103,11 @@ impl Registry {
 
     /// Returns `false` if the repo already existed.
     pub fn create_repo(&self, profile: &RepoProfile) -> Result<bool> {
-        write_yaml(
-            &self.repos.join(format!("{}.yaml", profile.id)),
-            profile,
-            true,
-        )
+        write_yaml(&self.repos.join(format!("{}.yaml", profile.id)), profile, true)
     }
 
     pub fn save_repo(&self, profile: &RepoProfile) -> Result<()> {
-        write_yaml(
-            &self.repos.join(format!("{}.yaml", profile.id)),
-            profile,
-            false,
-        )?;
+        write_yaml(&self.repos.join(format!("{}.yaml", profile.id)), profile, false)?;
         Ok(())
     }
 }
@@ -170,8 +154,7 @@ fn write_yaml<T: Serialize>(path: &Path, value: &T, create_new: bool) -> Result<
         .suffix(".yaml.part")
         .tempfile_in(dir)
         .map_err(|e| io_err(dir, e))?;
-    tmp.write_all(text.as_bytes())
-        .map_err(|e| io_err(path, e))?;
+    tmp.write_all(text.as_bytes()).map_err(|e| io_err(path, e))?;
     let persisted = if create_new {
         tmp.persist_noclobber(path)
     } else {

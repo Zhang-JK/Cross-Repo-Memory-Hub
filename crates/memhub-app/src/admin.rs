@@ -7,7 +7,7 @@
 //! `admin`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -34,6 +34,8 @@ pub const ADMIN_ACTOR: &str = "(admin)";
 const CONNECTION_EVENTS: [&str; 4] = ["connect", "disconnect", "agent_login", "agent_registered"];
 const UPDATE_EVENTS: [&str; 3] = ["memory_changed", "folder_created", "folder_deleted"];
 const ACTIVITY_DAYS: i64 = 14;
+const WEEK_DAYS: i64 = 7;
+const MONTH_DAYS: i64 = 30;
 
 /// A memory folder: `memories/<scope>/<owner>/`.
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +118,26 @@ pub struct ConnectionSession {
     pub duration_secs: Option<f64>,
     /// Memory changes made during the connection.
     pub changes: usize,
+}
+
+/// Distinct connections, client IPs and agents active in one time window.
+///
+/// A connection counts when it connected, identified itself, or disconnected
+/// inside the window. Unidentified connections and the `(admin)` actor are
+/// not counted as agents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WindowCounts {
+    pub connections: usize,
+    pub ips: usize,
+    pub agents: usize,
+}
+
+/// Rolling connection activity. `week` is the last 7 days and `month` the
+/// last 30 days, both ending now (UTC).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ConnectionSummary {
+    pub week: WindowCounts,
+    pub month: WindowCounts,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -401,11 +423,11 @@ impl Admin {
             .map_err(|e| AppError::Internal(format!("cannot read audit log: {e}")))
     }
 
-    /// Connections reconstructed per MCP session, newest first.
-    pub fn connections(&self, filter: &LogFilter) -> Result<Vec<ConnectionSession>> {
+    /// Every MCP session in the window, oldest first, before display filters.
+    fn load_sessions(&self, days: Option<u32>) -> Result<Vec<ConnectionSession>> {
         let mut sessions: Vec<ConnectionSession> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
-        for record in self.read_log(filter.days)? {
+        for record in self.read_log(days)? {
             let event = str_field(&record, "event");
             let Some(sid) = record.get("session_id").and_then(Value::as_str) else {
                 continue;
@@ -456,8 +478,13 @@ impl Admin {
                 _ => {}
             }
         }
+        Ok(sessions)
+    }
 
-        let mut out: Vec<ConnectionSession> = sessions
+    /// Connections reconstructed per MCP session, newest first.
+    pub fn connections(&self, filter: &LogFilter) -> Result<Vec<ConnectionSession>> {
+        let mut out: Vec<ConnectionSession> = self
+            .load_sessions(filter.days)?
             .into_iter()
             .filter(|s| {
                 filter
@@ -473,6 +500,17 @@ impl Admin {
         out.reverse();
         out.truncate(filter.limit);
         Ok(out)
+    }
+
+    /// Live-window counts for the connection page. "Now" is not included:
+    /// only the HTTP server knows which sessions are still open.
+    pub fn connection_summary(&self) -> Result<ConnectionSummary> {
+        let now = Utc::now();
+        let sessions = self.load_sessions(Some(MONTH_DAYS as u32))?;
+        Ok(ConnectionSummary {
+            week: window_counts(&sessions, now - Duration::days(WEEK_DAYS)),
+            month: window_counts(&sessions, now - Duration::days(MONTH_DAYS)),
+        })
     }
 
     /// Raw connection events (connect, identify, disconnect), newest first.
@@ -658,6 +696,45 @@ impl Admin {
 
 fn str_field<'a>(record: &'a Value, key: &str) -> &'a str {
     record.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// True when the session connected, identified, or disconnected at or after `start`.
+fn session_active_since(session: &ConnectionSession, start: DateTime<Utc>) -> bool {
+    [
+        &session.connected_at,
+        &session.identified_at,
+        &session.disconnected_at,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|ts| ts.parse::<DateTime<Utc>>().is_ok_and(|t| t >= start))
+}
+
+fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> WindowCounts {
+    let mut ips = HashSet::new();
+    let mut agents = HashSet::new();
+    let mut connections = 0;
+    for session in sessions {
+        if !session_active_since(session, start) {
+            continue;
+        }
+        connections += 1;
+        if !session.ip.is_empty() {
+            ips.insert(session.ip.clone());
+        }
+        if let Some(agent) = session
+            .agent
+            .as_deref()
+            .filter(|a| !a.is_empty() && *a != ADMIN_ACTOR)
+        {
+            agents.insert(agent.to_string());
+        }
+    }
+    WindowCounts {
+        connections,
+        ips: ips.len(),
+        agents: agents.len(),
+    }
 }
 
 fn sorted_desc(map: BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {

@@ -106,8 +106,13 @@ Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 - **Memories**: folder tree (one folder per repo or agent), keyword search, every memory's
   front-matter properties and content (rendered or raw file). Add memories (typed in or
   imported from a `.md` file), delete memories, and create or delete whole folders.
-- **Connections**: one row per MCP session (agent, client IP, client, duration, disconnect
-  reason, live or closed), or the raw connect/identify/disconnect events.
+- **Connections**: live connection count plus rolling 7-day and 30-day counts
+  (connections, distinct IPs, distinct agents), then one row per MCP session
+  (agent, client IP, client, duration, disconnect reason, live or closed), or the
+  raw connect/identify/disconnect events. **Export Excel** downloads sessions from
+  the last 365 days as `.xlsx` (the agent and IP filters apply; at most 100,000
+  rows, newest first). A connection counts in a window when it started, identified
+  itself, or ended in that window.
 - **Updates**: every memory change with agent, IP, versions and body diff; filter by agent,
   action or memory.
 

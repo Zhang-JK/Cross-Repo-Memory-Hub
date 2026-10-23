@@ -799,20 +799,89 @@ async function viewConnections(view, params) {
   const agents = h('datalist', { id: 'agent-options' });
   const body = h('div', { class: 'table-wrap' });
   const foot = h('div');
+  const dash = h('div', { class: 'conn-dash' });
   const seg = h('div', { class: 'seg' }, [['sessions', 'Sessions'], ['events', 'Raw events']].map(([v, label]) => h('button', {
     type: 'button', dataset: { v }, class: st.view === v ? 'on' : '', text: label,
     on: { click: () => { st.view = v; st.limit = PAGE; seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.v === v)); sync(); load(); } },
   })));
   const change = (k) => (v) => { st[k] = v; st.limit = PAGE; sync(); load(); };
+  const exportBtn = h('button', {
+    type: 'button', title: 'Download sessions from the last 365 days as an Excel file', text: 'Export Excel',
+    on: { click: () => exportConnections(exportBtn) },
+  });
 
-  setHead('Connection log', 'MCP connections and disconnections with agent name and client IP', [refreshButton(() => load())]);
-  view.replaceChildren(h('div', { class: 'panel' },
-    h('div', { class: 'filters' }, seg,
-      filterInput('Agent', st.agent, change('agent'), 'agent-options'), agents,
-      filterInput('IP address', st.ip, change('ip')),
-      rangeSelect(st.days, change('days')), h('span', { class: 'grow' }),
-      h('span', { class: 'muted', id: 'conn-count' })),
-    body, foot));
+  setHead('Connection log', 'MCP connections and disconnections with agent name and client IP', [exportBtn, refreshButton(() => { load(); loadSummary(); })]);
+  view.replaceChildren(
+    dash,
+    h('p', { class: 'muted conn-note', text: 'Last 7 days and last 30 days are rolling windows. A connection counts when it started, identified itself, or ended in that window. Export Excel downloads sessions from the last 365 days (UTC), using the agent and IP filters, up to 100,000 rows.' }),
+    h('div', { class: 'panel' },
+      h('div', { class: 'filters' }, seg,
+        filterInput('Agent', st.agent, change('agent'), 'agent-options'), agents,
+        filterInput('IP address', st.ip, change('ip')),
+        rangeSelect(st.days, change('days')), h('span', { class: 'grow' }),
+        h('span', { class: 'muted', id: 'conn-count' })),
+      body, foot));
+
+  function metric(n, label) {
+    return h('div', { class: 'metric' }, h('div', { class: 'n', text: Number(n || 0).toLocaleString() }), h('div', { class: 'l', text: label }));
+  }
+  function windowCard(title, w) {
+    return h('div', { class: 'panel' },
+      h('div', { class: 'label', text: title }),
+      h('div', { class: 'metrics' }, metric(w.connections, 'connections'), metric(w.ips, 'active IPs'), metric(w.agents, 'active agents')));
+  }
+  async function loadSummary() {
+    try {
+      const s = await api('/connections/summary');
+      const live = Number(s.live || 0);
+      dash.replaceChildren(
+        h('div', { class: 'panel conn-now' },
+          h('div', { class: 'label' }, h('span', { class: 'dot on' }), 'Right now'),
+          h('div', { class: 'n', text: live.toLocaleString() }),
+          h('div', { class: 'hint', text: live === 1 ? 'live connection' : 'live connections' })),
+        windowCard('Last 7 days', s.week || {}),
+        windowCard('Last 30 days', s.month || {}));
+    } catch (e) {
+      if (e.status !== 401) dash.replaceChildren(errorBox(e));
+    }
+  }
+  async function exportConnections(btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = 'Exporting…';
+    try {
+      const headers = {};
+      if (app.token) headers.authorization = `Bearer ${app.token}`;
+      const res = await fetch('/api/admin/connections/export' + query({ agent: st.agent, ip: st.ip }), { headers });
+      if (res.status === 401) { showLogin('The admin token is missing or wrong.'); return; }
+      if (!res.ok) {
+        let message = `${res.status} ${res.statusText}`;
+        try { const data = await res.json(); if (data && data.message) message = data.message; } catch (_) { /* not JSON */ }
+        throw new Error(message);
+      }
+      const blob = await res.blob();
+      const match = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') || '');
+      const name = (match && match[1]) || 'memhub-connections.xlsx';
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: name });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      const who = [st.agent && `agent ${st.agent}`, st.ip && `IP containing ${st.ip}`].filter(Boolean).join(', ');
+      const scope = who ? ` (${who})` : '';
+      toast(res.headers.get('x-export-truncated') === '1'
+        ? `Exported the most recent 100,000 sessions from the last 365 days${scope}.`
+        : `Exported connections from the last 365 days${scope}.`);
+    } catch (e) {
+      toast(e.message || 'Export failed', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+  every(10000, loadSummary);
 
   async function load() {
     body.replaceChildren(loading());
@@ -876,7 +945,7 @@ async function viewConnections(view, params) {
         h('td', { class: 'mono', title: r.session_id, text: shortId(r.session_id) })))));
   }
 
-  await load();
+  await Promise.all([load(), loadSummary()]);
 }
 
 async function viewUpdates(view, params) {

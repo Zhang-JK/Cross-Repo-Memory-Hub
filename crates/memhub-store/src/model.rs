@@ -72,7 +72,9 @@ pub fn validate_name(kind: &'static str, value: &str) -> Result<()> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
-        return Err(err("only ASCII letters, digits, '-', '_' and '.' are allowed"));
+        return Err(err(
+            "only ASCII letters, digits, '-', '_' and '.' are allowed",
+        ));
     }
     if value.contains("..") {
         return Err(err("must not contain '..'"));
@@ -135,19 +137,56 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
-/// Address of a memory: `<scope>/<owner>/<slug>`, mirroring its location on disk.
+/// Deepest folder nesting below an owner (`a/b/c/d/e/f`).
+pub const MAX_FOLDER_DEPTH: usize = 6;
+
+/// Normalizes a folder path such as `/modules/auth/` to `modules/auth`.
+/// The empty string is the owner's root folder.
+pub fn normalize_folder(folder: &str) -> Result<String> {
+    let segments: Vec<&str> = folder
+        .trim()
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.len() > MAX_FOLDER_DEPTH {
+        return Err(StoreError::Invalid(format!(
+            "folder '{folder}' is nested too deeply (at most {MAX_FOLDER_DEPTH} levels)"
+        )));
+    }
+    for segment in &segments {
+        validate_name("folder name", segment)?;
+    }
+    Ok(segments.join("/"))
+}
+
+/// Address of a memory: `<scope>/<owner>/[<folder>/]<slug>`, mirroring its
+/// location on disk. `folder` may itself contain `/` (nested folders) and is
+/// empty for memories in the owner's root folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MemoryId {
     pub scope: Scope,
     pub owner: String,
+    pub folder: String,
     pub slug: String,
 }
 
 impl MemoryId {
+    /// A memory in the owner's root folder.
     pub fn new(scope: Scope, owner: impl Into<String>, slug: impl Into<String>) -> Result<Self> {
+        Self::in_folder(scope, owner, "", slug)
+    }
+
+    pub fn in_folder(
+        scope: Scope,
+        owner: impl Into<String>,
+        folder: &str,
+        slug: impl Into<String>,
+    ) -> Result<Self> {
         let id = MemoryId {
             scope,
             owner: owner.into(),
+            folder: normalize_folder(folder)?,
             slug: slug.into(),
         };
         validate_name(owner_kind(scope), &id.owner)?;
@@ -158,6 +197,19 @@ impl MemoryId {
     pub fn scope(&self) -> Scope {
         self.scope
     }
+
+    /// `true` if the memory lives in `folder` or one of its subfolders.
+    pub fn is_under(&self, folder: &str) -> bool {
+        is_under(&self.folder, folder)
+    }
+}
+
+/// `true` if `path` equals `folder` or is nested inside it. Every path is
+/// under the root folder (`""`).
+pub fn is_under(path: &str, folder: &str) -> bool {
+    folder.is_empty()
+        || path == folder
+        || (path.starts_with(folder) && path.as_bytes().get(folder.len()) == Some(&b'/'))
 }
 
 pub(crate) fn owner_kind(scope: Scope) -> &'static str {
@@ -169,7 +221,11 @@ pub(crate) fn owner_kind(scope: Scope) -> &'static str {
 
 impl fmt::Display for MemoryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}/{}", self.scope(), self.owner, self.slug)
+        write!(f, "{}/{}/", self.scope(), self.owner)?;
+        if !self.folder.is_empty() {
+            write!(f, "{}/", self.folder)?;
+        }
+        f.write_str(&self.slug)
     }
 }
 
@@ -178,16 +234,15 @@ impl FromStr for MemoryId {
 
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim().trim_end_matches(".md");
-        let mut parts = s.split('/');
-        let (Some(scope), Some(owner), Some(slug), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
+        let parts: Vec<&str> = s.split('/').collect();
+        if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
             return Err(StoreError::InvalidId(s.to_string()));
-        };
-        let scope = scope
+        }
+        let scope = parts[0]
             .parse::<Scope>()
             .map_err(|_| StoreError::InvalidId(s.to_string()))?;
-        MemoryId::new(scope, owner, slug)
+        let folder = parts[2..parts.len() - 1].join("/");
+        MemoryId::in_folder(scope, parts[1], &folder, parts[parts.len() - 1])
     }
 }
 
@@ -256,6 +311,10 @@ impl MemoryMeta {
         &self.id.owner
     }
 
+    pub fn folder(&self) -> &str {
+        &self.id.folder
+    }
+
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t.eq_ignore_ascii_case(tag))
     }
@@ -283,6 +342,9 @@ impl Memory {
 pub struct NewMemory {
     pub scope: Scope,
     pub owner: String,
+    /// Folder below the owner (`modules/auth`); empty for the root folder.
+    /// Missing folders are created.
+    pub folder: String,
     pub title: String,
     pub kind: Option<String>,
     pub tags: Vec<String>,
@@ -328,6 +390,8 @@ impl Change {
 pub struct Filter {
     pub scope: Option<Scope>,
     pub owner: Option<String>,
+    /// Normalized folder path; matches the folder and all its subfolders.
+    pub folder: Option<String>,
     pub kind: Option<String>,
     /// All listed tags must be present (case-insensitive).
     pub tags: Vec<String>,
@@ -341,6 +405,9 @@ impl Filter {
             return false;
         }
         if self.owner.as_ref().is_some_and(|o| o != meta.owner()) {
+            return false;
+        }
+        if self.folder.as_ref().is_some_and(|f| !meta.id.is_under(f)) {
             return false;
         }
         if self
@@ -392,6 +459,8 @@ pub enum GroupKey {
     Owner,
     Scope,
     Author,
+    /// `<scope>/<owner>/<folder>`, e.g. `repo/memhub/modules/auth`.
+    Folder,
 }
 
 impl FromStr for GroupKey {
@@ -405,11 +474,44 @@ impl FromStr for GroupKey {
             "owner" => GroupKey::Owner,
             "scope" => GroupKey::Scope,
             "author" => GroupKey::Author,
+            "folder" | "folders" => GroupKey::Folder,
             _ => {
                 return Err(StoreError::Invalid(format!(
-                    "unknown group key '{s}', expected one of group, kind, tag, owner, scope, author"
+                    "unknown group key '{s}', expected one of group, kind, tag, owner, scope, author, folder"
                 )))
             }
         })
+    }
+}
+
+/// One folder of an owner's memory tree, as returned by
+/// [`crate::MemoryStore::folders`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FolderInfo {
+    /// Normalized path below the owner; empty for the root folder.
+    pub path: String,
+    /// Text of the folder's `_index.md`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Memories directly in this folder.
+    pub memory_count: usize,
+    /// Memories in this folder and all subfolders.
+    pub total_count: usize,
+    /// Most recent `updated_at` of any memory in the subtree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl FolderInfo {
+    pub fn depth(&self) -> usize {
+        if self.path.is_empty() {
+            0
+        } else {
+            self.path.split('/').count()
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or("")
     }
 }

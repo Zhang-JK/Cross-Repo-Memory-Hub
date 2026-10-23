@@ -11,7 +11,7 @@ pub enum StoreError {
         reason: &'static str,
     },
 
-    #[error("invalid memory id '{0}': expected '<repo|agent>/<owner>/<slug>'")]
+    #[error("invalid memory id '{0}': expected '<repo|agent>/<owner>/[<folder>/...]<slug>'")]
     InvalidId(String),
 
     #[error("memory '{0}' not found")]
@@ -20,8 +20,14 @@ pub enum StoreError {
     #[error("memory '{0}' already exists")]
     AlreadyExists(String),
 
-    #[error("version conflict on '{id}': expected version {expected}, current version is {current}")]
-    VersionConflict { id: String, expected: u64, current: u64 },
+    #[error(
+        "version conflict on '{id}': expected version {expected}, current version is {current}"
+    )]
+    VersionConflict {
+        id: String,
+        expected: u64,
+        current: u64,
+    },
 
     #[error("malformed memory file {}: {reason}", path.display())]
     Malformed { path: PathBuf, reason: String },

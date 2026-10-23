@@ -24,6 +24,7 @@ pub(crate) fn score(memory: &Memory, terms: &[String]) -> Option<f64> {
     let body = memory.body.to_lowercase();
     let kind = meta.kind.to_lowercase();
     let slug = meta.id.slug.to_lowercase();
+    let folder = meta.id.folder.to_lowercase();
 
     let mut total = 0.0;
     let mut matched = 0usize;
@@ -33,10 +34,21 @@ pub(crate) fn score(memory: &Memory, terms: &[String]) -> Option<f64> {
         if slug.contains(term.as_str()) {
             s += 2.0;
         }
-        if meta.tags.iter().any(|t| t.to_lowercase().contains(term.as_str())) {
+        if folder.contains(term.as_str()) {
+            s += 3.0;
+        }
+        if meta
+            .tags
+            .iter()
+            .any(|t| t.to_lowercase().contains(term.as_str()))
+        {
             s += 4.0;
         }
-        if meta.groups.iter().any(|g| g.to_lowercase().contains(term.as_str())) {
+        if meta
+            .groups
+            .iter()
+            .any(|g| g.to_lowercase().contains(term.as_str()))
+        {
             s += 2.0;
         }
         if kind.contains(term.as_str()) {

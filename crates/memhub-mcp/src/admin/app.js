@@ -329,12 +329,20 @@ async function render() {
 function updateServerInfo(server) {
   if (!server) return;
   app.server = server;
+  renderServerInfo();
+  $('#logout').classList.toggle('hidden', !server.token_required);
+}
+
+function renderServerInfo() {
+  const server = app.server;
+  if (!server) return;
   $('#server-info').replaceChildren(
     h('div', {}, `memhub v${server.version}`),
     h('div', { title: fmtTime(server.started_at) }, `up ${fmtDuration((Date.now() - new Date(server.started_at)) / 1000)}`),
     h('div', { class: 'mono', title: 'Data directory' }, server.data_dir));
-  $('#logout').classList.toggle('hidden', !server.token_required);
 }
+
+setInterval(renderServerInfo, 30000);
 
 function refreshButton(fn) {
   return h('button', { type: 'button', title: 'Refresh', on: { click: fn } }, '↻ Refresh');
@@ -532,8 +540,11 @@ async function viewMemories(view, params) {
         on: { click: () => { st.id = m.id; sync(); markActive(); loadDetail(); } },
       },
       h('div', { class: 't', text: m.title, title: m.title }),
-      h('div', { class: 'meta' }, h('span', { class: `badge ${m.id.split('/')[0]}`, text: m.id.split('/')[0] }),
-        h('span', { class: 'mono', text: m.id.split('/').slice(1).join('/') }), h('span', { class: 'chip', text: m.kind }),
+      h('div', { class: 'id mono', text: m.id, title: m.id }),
+      h('div', { class: 'meta' },
+        st.owner ? null : h('span', { class: `badge ${m.id.split('/')[0]}`, text: m.id.split('/')[0] }),
+        h('span', { class: 'chip', text: m.kind }),
+        (m.tags || []).slice(0, 3).map((t) => h('span', { class: 'chip', text: `#${t}` })),
         h('span', { title: fmtTime(m.updated_at), text: ago(m.updated_at) })),
       m.snippet ? h('div', { class: 'snip', text: m.snippet }) : null)));
     } catch (e) {

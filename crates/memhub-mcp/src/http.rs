@@ -8,6 +8,8 @@
 //!
 //! Sessions idle for longer than the configured timeout are closed and
 //! audited with reason `idle_timeout`.
+//!
+//! The same router serves the management UI ([`crate::admin`]) and `/health`.
 
 use std::{
     collections::HashMap,

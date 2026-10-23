@@ -179,7 +179,7 @@ td.wrap { word-break: break-word; }
 .filters .grow { flex: 1; }
 
 /* ---- memories ---- */
-.mem-layout { display: grid; grid-template-columns: 250px minmax(280px, 380px) minmax(0, 1fr); gap: 14px; height: calc(100vh - 120px); min-height: 480px; }
+.mem-layout { display: grid; grid-template-columns: 250px minmax(280px, 380px) minmax(0, 1fr); gap: 14px; height: calc(100vh - 160px); min-height: 480px; }
 @media (max-width: 1100px) { .mem-layout { grid-template-columns: 1fr; height: auto; } }
 .mem-layout > .panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .scroll { overflow-y: auto; min-height: 0; flex: 1; }
@@ -201,7 +201,9 @@ td.wrap { word-break: break-word; }
 .mem-item:hover { background: #fafbff; }
 .mem-item.active { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
 .mem-item .t { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mem-item .meta { font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 2px; }
+.mem-item .id { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-item .meta { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.mem-item .meta .chip { margin: 0; }
 .mem-item .snip { font-size: 12px; color: var(--muted); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-row { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
 .search-row input { flex: 1; }

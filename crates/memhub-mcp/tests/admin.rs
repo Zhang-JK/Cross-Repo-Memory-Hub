@@ -78,6 +78,19 @@ async fn serves_the_ui_with_security_headers() {
     }
     let res = app
         .clone()
+        .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let page = res.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8(page.to_vec()).unwrap();
+    assert!(
+        page.contains("/admin/app.js?v="),
+        "assets are fingerprinted"
+    );
+    assert!(!page.contains("__ASSET_VERSION__"));
+
+    let res = app
+        .clone()
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await
         .unwrap();

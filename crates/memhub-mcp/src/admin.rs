@@ -5,7 +5,10 @@
 //! State-changing calls must also come from the page's own origin (or from a
 //! non-browser client that sends no `Origin`).
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use axum::{
     extract::{rejection::JsonRejection, ConnectInfo, Path, Query, Request, State},
@@ -58,7 +61,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/", get(|| async { Redirect::temporary("/admin") }))
         .route(
             "/admin",
-            get(|| async { asset(INDEX_HTML, "text/html; charset=utf-8") }),
+            get(|| async { asset(index_html(), "text/html; charset=utf-8") }),
         )
         .route("/admin/", get(|| async { Redirect::permanent("/admin") }))
         .route(
@@ -71,6 +74,22 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/api/admin/auth", get(auth_info))
         .nest("/api/admin", api)
+}
+
+/// The page with asset URLs fingerprinted by content, so browsers fetch the
+/// new script and stylesheet right after an upgrade.
+fn index_html() -> &'static str {
+    static PAGE: OnceLock<String> = OnceLock::new();
+    PAGE.get_or_init(|| {
+        // FNV-1a over both assets.
+        let hash = APP_JS
+            .bytes()
+            .chain(APP_CSS.bytes())
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+        INDEX_HTML.replace("__ASSET_VERSION__", &format!("{hash:016x}"))
+    })
 }
 
 fn asset(body: &'static str, content_type: &'static str) -> Response {
@@ -405,11 +424,7 @@ async fn add_memory(
         markdown: body.markdown,
     };
     let memory = run(&state, ip, move |admin| admin.add_memory(input)).await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "created": memory.meta })),
-    )
-        .into_response())
+    Ok((StatusCode::CREATED, Json(json!({ "created": memory.meta }))).into_response())
 }
 
 #[derive(Deserialize)]

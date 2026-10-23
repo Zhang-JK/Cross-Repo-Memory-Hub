@@ -152,6 +152,7 @@ memhub is running
   Started    : $(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')
   Listen     : $HOST:$PORT
   MCP URL    : http://$url_host:$PORT/mcp
+  Admin UI   : http://$url_host:$PORT/admin$([[ -n "${MEMHUB_ADMIN_TOKEN:-}" ]] && echo "  (token required)")
   Health     : $(health || echo "not responding")
   Data dir   : $DATA_DIR
   Server log : $LOG_FILE

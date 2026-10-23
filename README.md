@@ -13,8 +13,8 @@ Two memory spaces:
 |---|---|
 | `memhub-store` | Memory management: Markdown files with YAML front matter; add, get, update, delete, search, group |
 | `memhub-audit` | JSONL audit log of connections, disconnections and memory changes |
-| `memhub-app` | Agent registration and login, working repos, permission checks, sessions |
-| `memhub-mcp` | MCP tools over Streamable HTTP and stdio; `memhub` CLI |
+| `memhub-app` | Agent registration and login, working repos, permission checks, sessions, admin operations |
+| `memhub-mcp` | MCP tools over Streamable HTTP and stdio, management web UI; `memhub` CLI |
 
 Data directory:
 
@@ -94,7 +94,33 @@ memories it created, and exits non-zero on any failure. Proxies are bypassed unl
 `MEMHUB_TEST_PROXY=1`.
 
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
-`serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`.
+`serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,
+`--admin-token` (`MEMHUB_ADMIN_TOKEN`).
+
+### Management web UI
+
+`serve` also hosts a management page at `http://<host>:<port>/admin` (`/` redirects there):
+
+- **Dashboard**: memory, folder and agent counts, live MCP sessions, 14-day activity chart,
+  recent changes, most active agents and largest folders, with links into the other tabs.
+- **Memories**: folder tree (one folder per repo or agent), keyword search, every memory's
+  front-matter properties and content (rendered or raw file). Add memories (typed in or
+  imported from a `.md` file), delete memories, and create or delete whole folders.
+- **Connections**: one row per MCP session (agent, client IP, client, duration, disconnect
+  reason, live or closed), or the raw connect/identify/disconnect events.
+- **Updates**: every memory change with agent, IP, versions and body diff; filter by agent,
+  action or memory.
+
+Changes made in the UI skip the per-agent write rules and are audited as agent `(admin)`,
+transport `admin`, with the browser's IP. Deleted memories and folders go to `trash/`.
+
+Without a token the page is open to anyone who can reach the server, the same trust model
+as the MCP endpoint. To require a token, export it before starting the server; the launch
+scripts pass the environment through:
+
+```bash
+MEMHUB_ADMIN_TOKEN='long-random-string' scripts/restart.sh   # or deploy-prebuilt.sh
+```
 
 Admin commands:
 

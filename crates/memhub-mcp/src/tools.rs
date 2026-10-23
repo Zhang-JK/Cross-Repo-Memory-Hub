@@ -219,7 +219,9 @@ struct MoveMemoryArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct AddMemoryArgs {
-    /// "repo" for shared repository knowledge, "agent" for your own notebook.
+    /// "repo": general knowledge about the repository that every agent should share
+    /// (architecture, modules, how-to, pitfalls, decisions). "agent": your own work notebook
+    /// for a specific task (work log, progress, to-dos, personal tricks).
     scope: ScopeArg,
     /// Repository id; required when scope is "repo". You must have joined it via add_repo.
     #[serde(default)]
@@ -233,7 +235,8 @@ struct AddMemoryArgs {
     title: String,
     /// Markdown content.
     body: String,
-    /// Category. Repo: overview, architecture, implementation, pitfall. Agent: task-log, insight, todo.
+    /// Category. Repo: overview, architecture, implementation, how-to, pitfall, decision.
+    /// Agent: task-log, insight, todo.
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -386,7 +389,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "add_memory",
         title: "Add memory",
-        description: "Create a memory in a repo you joined (scope=repo) or in your own agent space (scope=agent). Put it in the most specific fitting folder (e.g. folder=\"modules/auth\"); keep the root for the overview only.",
+        description: "Create a memory. scope=repo is for general repo knowledge shared by all agents (architecture, modules, how-to, pitfalls, decisions) in a repo you joined. scope=agent is for your own task-specific notebook (work logs, progress, to-dos, personal tricks). Ask: should another agent on a different task know this? Yes means repo, no means agent. Put it in the most specific fitting folder (e.g. folder=\"modules/auth\"); keep the root for the overview only.",
         schema: schema::<AddMemoryArgs>,
         read_only: false,
         destructive: false,
@@ -394,7 +397,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "update_memory",
         title: "Update memory",
-        description: "Change a memory's title, kind, tags, groups or body (replace or append). Only fields you pass are changed.",
+        description: "Change a memory's title, kind, tags, groups or body (replace or append). Only fields you pass are changed. Fix outdated repo memory here instead of noting the correction in your agent notebook; keep task progress out of repo memory (append it to your agent task log instead).",
         schema: schema::<UpdateMemoryArgs>,
         read_only: false,
         destructive: false,
@@ -882,6 +885,43 @@ fn folder_for_kind(scope: Scope, kind: &str) -> Option<&'static str> {
     })
 }
 
+/// A hint when a memory's kind suggests it belongs in the other scope.
+fn scope_hint(scope: Scope, meta: &MemoryMeta) -> Option<String> {
+    let kind = meta.kind.to_ascii_lowercase();
+    match scope {
+        Scope::Repo
+            if matches!(
+                kind.as_str(),
+                "task-log" | "log" | "worklog" | "todo" | "plan" | "progress" | "status"
+            ) =>
+        {
+            Some(format!(
+                "'{}' memories are task-specific; they belong in your agent notebook \
+                 (scope=agent, folder task-logs/ or todo/), not in shared repo memory. Repo memory \
+                 is for general knowledge every agent should know. Recreate it with scope=agent and \
+                 delete {}; keep any general lesson from it here in repo memory.",
+                meta.kind, meta.id
+            ))
+        }
+        Scope::Agent => folder_for_kind(Scope::Repo, &kind)
+            .or_else(|| (kind == "overview").then_some(""))
+            .map(|folder| {
+                let target = if folder.is_empty() {
+                    "the repo root".to_string()
+                } else {
+                    format!("'{folder}/'")
+                };
+                format!(
+                    "Kind '{}' describes general repo knowledge. If every agent working on the repo \
+                     should know it, put it in repo memory (add_memory scope=repo, {target}) so it is \
+                     shared. Keep only task-specific notes and personal tricks in your agent notebook.",
+                    meta.kind
+                )
+            }),
+        _ => None,
+    }
+}
+
 fn top_level_folders(tree: &Browse) -> Vec<String> {
     tree.folders
         .iter()
@@ -891,7 +931,7 @@ fn top_level_folders(tree: &Browse) -> Vec<String> {
 }
 
 fn add_hints(tree: &Browse, meta: &MemoryMeta, new_folders: &[String]) -> Vec<String> {
-    let mut hints = Vec::new();
+    let mut hints: Vec<String> = scope_hint(tree.scope, meta).into_iter().collect();
     let owner = format!("{}/{}", tree.scope, tree.owner);
     let folder = meta.folder();
     let info = tree.folders.iter().find(|f| f.path == folder);

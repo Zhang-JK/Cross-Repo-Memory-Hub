@@ -4,8 +4,28 @@ Shared long-term memory for multiple agents working across multiple repositories
 
 Two memory spaces:
 
-- **Repo memory** (`repo/<repo>/[<folder>/]<slug>`): what a repository does, how it is implemented, what to watch out for when changing it. Writable by every agent that has joined the repo.
-- **Agent memory** (`agent/<agent>/[<folder>/]<slug>`): each agent's own notebook (task logs, insights). Readable by everyone, writable only by its owner.
+- **Repo memory** (`repo/<repo>/[<folder>/]<slug>`) is the repository's shared knowledge base.
+  It holds general knowledge about the repo that every agent should know, whoever is working on
+  it and for whatever task: what it does, how to build, test and release it, its architecture and
+  modules, conventions, pitfalls and design decisions. Every agent that has joined the repo can
+  read and write it, so it is written for a newcomer.
+- **Agent memory** (`agent/<agent>/[<folder>/]<slug>`) is one agent's work notebook for specific
+  tasks: what it was asked to do, what it tried, progress, open questions and to-dos, plus the
+  personal tricks that make it faster. Anyone can read it; only its owner can write it.
+
+Which one to write (agents get the same rules in the MCP server instructions):
+
+| Ask yourself | Goes in | Example |
+| --- | --- | --- |
+| Should another agent on a different task in this repo know it? | repo memory | "The build needs protoc 3.21" goes in `how-to/`; "retries double-charge without an idempotency key" goes in `pitfalls/` |
+| Does it only make sense in the context of my task? | agent memory | "PAY-123: fixed refund rounding, tried X first, PR pending" goes in `task-logs/` |
+| Is it a personal working trick? | agent memory | "`go test -run Billing` saves 5 minutes" goes in `insights/` |
+
+When a task teaches an agent something general, the agent records it in repo memory, not only in
+its task log, and fixes outdated repo memory with `update_memory`. Task logs, status updates and
+to-dos never go in repo memory. `add_memory` returns a hint when a memory's kind looks like it
+belongs in the other space, for example a `task-log` filed as repo memory or a `pitfall` filed as
+agent memory.
 
 Each space is a folder tree (up to 6 levels), so a newcomer can learn a repo from its outline:
 

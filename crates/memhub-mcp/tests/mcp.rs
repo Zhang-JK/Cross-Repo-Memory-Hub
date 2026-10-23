@@ -161,6 +161,9 @@ async fn folder_hierarchy_workflow() {
         "pitfalls/",
         "move_memory",
         "overview",
+        "Repo memory vs agent memory",
+        "Rule of thumb",
+        "Never put task logs",
     ] {
         assert!(
             instructions.contains(needle),
@@ -328,6 +331,39 @@ async fn folder_hierarchy_workflow() {
         .tool_text("browse_memory", json!({ "scope": "agent" }))
         .await;
     assert!(mine.starts_with("agent/doc-bot: docs (1 memory)"), "{mine}");
+    assert!(!added["hints"].to_string().contains("scope="), "{added}");
+
+    // memories filed in the wrong scope are flagged
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "title": "Sprint 12 progress",
+                    "kind": "task-log", "body": "half done" }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    let hints = added["hints"].to_string();
+    assert!(hints.contains("belong in your agent notebook"), "{hints}");
+    assert!(hints.contains("scope=agent"), "{hints}");
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "agent", "title": "Webhook replay gotcha",
+                    "kind": "pitfall", "body": "replays are not signed" }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    let hints = added["hints"].to_string();
+    assert!(hints.contains("scope=repo, 'pitfalls/'"), "{hints}");
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "agent", "folder": "insights", "title": "Fast test loop",
+                    "kind": "insight", "body": "-run Billing" }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    assert!(!added["hints"].to_string().contains("scope="), "{added}");
 
     let mut b = client(&state, "10.2.0.2");
     b.initialize(&[("x-memhub-agent", "other-bot"), ("x-memhub-role", "qa")])
@@ -393,6 +429,7 @@ async fn folder_hierarchy_workflow() {
             "memory_changed ",
             "folder_created task-logs",
             "folder_created task-logs/2026",
+            "folder_created insights",
             "folder_created archive",
             "folder_created archive/2026",
             "memory_changed ",

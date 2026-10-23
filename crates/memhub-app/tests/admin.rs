@@ -128,9 +128,15 @@ fn folders_create_list_and_delete() {
     .unwrap();
 
     let admin = hub.admin("127.0.0.1");
-    assert!(admin.create_folder(Scope::Repo, "empty-repo").unwrap());
-    assert!(!admin.create_folder(Scope::Repo, "empty-repo").unwrap());
-    assert!(admin.create_folder(Scope::Repo, "bad/name").is_err());
+    assert!(admin
+        .create_folder(Scope::Repo, "empty-repo", "", None)
+        .unwrap());
+    assert!(!admin
+        .create_folder(Scope::Repo, "empty-repo", "", None)
+        .unwrap());
+    assert!(admin
+        .create_folder(Scope::Repo, "bad/name", "", None)
+        .is_err());
 
     let folders = admin.folders().unwrap();
     let engine = folders.iter().find(|f| f.owner == "engine").unwrap();
@@ -141,13 +147,13 @@ fn folders_create_list_and_delete() {
     assert_eq!(empty.memory_count, 0);
     assert!(!empty.registered);
 
-    let removed = admin.delete_folder(Scope::Repo, "engine").unwrap();
+    let removed = admin.delete_folder(Scope::Repo, "engine", "").unwrap();
     assert_eq!(
         removed,
         vec!["repo/engine/hot-loop".parse::<MemoryId>().unwrap()]
     );
     assert!(admin.folders().unwrap().iter().all(|f| f.owner != "engine"));
-    assert!(admin.delete_folder(Scope::Repo, "engine").is_err());
+    assert!(admin.delete_folder(Scope::Repo, "engine", "").is_err());
 
     let updates = admin.updates(&logs(10)).unwrap();
     let events: Vec<String> = updates
@@ -193,6 +199,112 @@ fn folders_create_list_and_delete() {
         })
         .unwrap();
     assert_eq!(by_memory.len(), 2, "matches the title case-insensitively");
+}
+
+#[test]
+fn admin_manages_subfolders_and_moves() {
+    let (_dir, hub) = hub();
+    let admin = hub.admin("127.0.0.1");
+    let m = admin
+        .add_memory(AdminNewMemory {
+            scope: Scope::Repo,
+            owner: "engine".into(),
+            folder: "modules/render".into(),
+            title: Some("Frame pacing".into()),
+            body: Some("vsync".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        m.meta.id.to_string(),
+        "repo/engine/modules/render/frame-pacing"
+    );
+    assert_eq!(
+        admin.get(&m.meta.id).unwrap().path,
+        "memories/repo/engine/modules/render/frame-pacing.md"
+    );
+    assert!(admin
+        .create_folder(
+            Scope::Repo,
+            "engine",
+            "pitfalls",
+            Some("Things that bit us")
+        )
+        .unwrap());
+    assert!(!admin
+        .create_folder(Scope::Repo, "engine", "pitfalls", Some("Known traps"))
+        .unwrap());
+
+    let folders = admin.folders().unwrap();
+    let engine = folders.iter().find(|f| f.owner == "engine").unwrap();
+    assert_eq!((engine.memory_count, engine.root_count), (1, 0));
+    let paths: Vec<&str> = engine.children.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["modules", "modules/render", "pitfalls"]);
+    assert_eq!(
+        engine.children[2].description.as_deref(),
+        Some("Known traps")
+    );
+
+    let in_modules = admin
+        .list(Some(Scope::Repo), Some("engine"), Some("modules"), None)
+        .unwrap();
+    assert_eq!(in_modules.len(), 1);
+    assert!(admin
+        .list(Some(Scope::Repo), Some("engine"), Some("pitfalls"), None)
+        .unwrap()
+        .is_empty());
+
+    let moved = admin
+        .move_memory(&m.meta.id, "pitfalls", Some("pacing"))
+        .unwrap();
+    assert_eq!(moved.meta.id.to_string(), "repo/engine/pitfalls/pacing");
+
+    let removed = admin
+        .delete_folder(Scope::Repo, "engine", "pitfalls")
+        .unwrap();
+    assert_eq!(removed, vec![moved.meta.id.clone()]);
+    let engine_left = admin.folders().unwrap();
+    let engine_left = engine_left.iter().find(|f| f.owner == "engine").unwrap();
+    assert_eq!(engine_left.children.len(), 2);
+
+    let updates = admin.updates(&logs(20)).unwrap();
+    let events: Vec<String> = updates
+        .iter()
+        .rev()
+        .map(|r| {
+            format!(
+                "{}:{}:{}",
+                r["event"].as_str().unwrap(),
+                r["action"].as_str().unwrap_or("-"),
+                r["folder"].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "folder_created:-:modules",
+            "folder_created:-:modules/render",
+            "memory_changed:add:-",
+            "folder_created:-:pitfalls",
+            "folder_described:-:pitfalls",
+            "memory_changed:move:-",
+            "memory_changed:delete:-",
+            "folder_deleted:-:pitfalls",
+        ]
+    );
+    let moved_record = updates.iter().find(|r| r["action"] == "move").unwrap();
+    assert_eq!(
+        moved_record["previous_id"],
+        "repo/engine/modules/render/frame-pacing"
+    );
+    let by_old_id = admin
+        .updates(&LogFilter {
+            memory: Some("modules/render/frame".into()),
+            ..logs(20)
+        })
+        .unwrap();
+    assert_eq!(by_old_id.len(), 2, "add and move match the old id");
 }
 
 #[test]

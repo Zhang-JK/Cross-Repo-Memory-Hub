@@ -15,8 +15,8 @@ use std::{
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use memhub_audit::{Actor, AuditEvent, LogQuery, MemoryAction};
 use memhub_store::{
-    parse_memory, render_memory, slugify, Filter, Memory, MemoryId, MemoryMeta, NewMemory, Scope,
-    SearchQuery,
+    normalize_folder, parse_memory, render_memory, slugify, Filter, FolderInfo, Memory, MemoryId,
+    MemoryMeta, NewMemory, Scope, SearchQuery,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -38,22 +38,32 @@ pub const ADMIN_ACTOR: &str = "(admin)";
 pub const SELFTEST_AGENT: &str = "memhub-selftest";
 
 const CONNECTION_EVENTS: [&str; 4] = ["connect", "disconnect", "agent_login", "agent_registered"];
-const UPDATE_EVENTS: [&str; 3] = ["memory_changed", "folder_created", "folder_deleted"];
+const UPDATE_EVENTS: [&str; 4] = [
+    "memory_changed",
+    "folder_created",
+    "folder_described",
+    "folder_deleted",
+];
 const ACTIVITY_DAYS: i64 = 14;
 const WEEK_DAYS: i64 = 7;
 const MONTH_DAYS: i64 = 30;
 
-/// A memory folder: `memories/<scope>/<owner>/`.
+/// The memory space of one repo or agent: `memories/<scope>/<owner>/`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Folder {
     pub scope: Scope,
     pub owner: String,
+    /// All memories of the owner, including subfolders.
     pub memory_count: usize,
     pub updated_at: Option<DateTime<Utc>>,
     /// The repo / agent is known to the registry.
     pub registered: bool,
     /// Repo description or agent role, if registered.
     pub description: String,
+    /// Memories directly in the owner's root folder.
+    pub root_count: usize,
+    /// Subfolders, parents before children.
+    pub children: Vec<FolderInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +98,8 @@ pub struct AdminNewMemory {
     pub body: Option<String>,
     pub slug: Option<String>,
     pub markdown: Option<String>,
+    /// Folder below the owner; empty for the root folder.
+    pub folder: String,
 }
 
 /// Filter for the connection and update logs.
@@ -203,13 +215,6 @@ impl Admin {
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let store = self.hub.store();
         let registry = self.hub.registry();
-        let mut stats: HashMap<(Scope, String), (usize, DateTime<Utc>)> = HashMap::new();
-        for memory in store.list(&Filter::default())? {
-            let key = (memory.meta.scope(), memory.meta.owner().to_string());
-            let entry = stats.entry(key).or_insert((0, memory.meta.updated_at));
-            entry.0 += 1;
-            entry.1 = entry.1.max(memory.meta.updated_at);
-        }
         let repos: HashMap<String, String> = registry
             .repos()?
             .into_iter()
@@ -228,17 +233,21 @@ impl Admin {
                 Scope::Agent => &agents,
             };
             for owner in store.owners(scope)? {
-                let (count, updated) = stats
-                    .get(&(scope, owner.clone()))
-                    .map(|(c, u)| (*c, Some(*u)))
-                    .unwrap_or((0, None));
+                let mut tree = store.folders(scope, &owner)?;
+                let root = if tree.first().is_some_and(|f| f.path.is_empty()) {
+                    Some(tree.remove(0))
+                } else {
+                    None
+                };
                 out.push(Folder {
                     scope,
                     registered: known.contains_key(&owner),
                     description: known.get(&owner).cloned().unwrap_or_default(),
                     owner,
-                    memory_count: count,
-                    updated_at: updated,
+                    memory_count: root.as_ref().map_or(0, |r| r.total_count),
+                    updated_at: root.as_ref().and_then(|r| r.updated_at),
+                    root_count: root.as_ref().map_or(0, |r| r.memory_count),
+                    children: tree,
                 });
             }
         }
@@ -251,11 +260,14 @@ impl Admin {
         &self,
         scope: Option<Scope>,
         owner: Option<&str>,
+        folder: Option<&str>,
         query: Option<&str>,
     ) -> Result<Vec<MemoryListItem>> {
+        let folder = folder.map(normalize_folder).transpose()?;
         let filter = Filter {
             scope,
             owner: owner.map(str::to_string),
+            folder: folder.filter(|f| !f.is_empty()),
             ..Default::default()
         };
         let store = self.hub.store();
@@ -289,7 +301,7 @@ impl Admin {
         let memory = self.hub.store().get(id)?;
         Ok(MemoryDetail {
             markdown: render_memory(&memory)?,
-            path: format!("memories/{}/{}/{}.md", id.scope, id.owner, id.slug),
+            path: format!("memories/{id}.md"),
             memory,
         })
     }
@@ -304,6 +316,7 @@ impl Admin {
         let mut new = NewMemory {
             scope: input.scope,
             owner: input.owner.trim().to_string(),
+            folder: normalize_folder(&input.folder)?,
             title: title.clone().unwrap_or_default(),
             kind: non_empty(input.kind),
             tags: input.tags,
@@ -336,7 +349,11 @@ impl Admin {
             }
         }
 
+        let new_folders = self.hub.missing_folders(new.scope, &new.owner, &new.folder)?;
         let memory = self.hub.store().add(new)?;
+        for folder in new_folders {
+            self.record_folder_created(memory.meta.scope(), memory.meta.owner(), &folder, None);
+        }
         self.record_change(
             MemoryAction::Add,
             &memory,
@@ -345,6 +362,39 @@ impl Admin {
             unified_diff("", &memory.body),
         );
         Ok(memory)
+    }
+
+    /// Moves a memory to another folder of the same owner, optionally
+    /// renaming it.
+    pub fn move_memory(&self, id: &MemoryId, folder: &str, slug: Option<&str>) -> Result<Memory> {
+        let slug = slug.map(str::trim).filter(|s| !s.is_empty());
+        let new_folders = self.hub.missing_folders(id.scope, &id.owner, folder)?;
+        let change = self
+            .hub
+            .store()
+            .move_memory(id, folder, slug, None, ADMIN_ACTOR)?;
+        for path in new_folders {
+            self.record_folder_created(id.scope, &id.owner, &path, None);
+        }
+        if !change.is_noop() {
+            self.hub.audit().record(AuditEvent::MemoryChanged {
+                actor: self.actor.clone(),
+                action: MemoryAction::Move,
+                memory_id: change.after.meta.id.to_string(),
+                title: change.after.meta.title.clone(),
+                version_before: Some(change.before.meta.version),
+                version_after: Some(change.after.meta.version),
+                changed_fields: change
+                    .changed_fields
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect(),
+                group: None,
+                diff: None,
+                previous_id: Some(id.to_string()),
+            });
+        }
+        Ok(change.after)
     }
 
     pub fn delete_memory(&self, id: &MemoryId) -> Result<Memory> {
@@ -359,24 +409,71 @@ impl Admin {
         Ok(memory)
     }
 
-    /// Returns `false` if the folder already existed.
-    pub fn create_folder(&self, scope: Scope, owner: &str) -> Result<bool> {
+    /// Creates the root folder of a repo / agent (empty `folder`) or a
+    /// subfolder. For an existing subfolder only the description is updated
+    /// (when given). Returns `false` if the folder already existed.
+    pub fn create_folder(
+        &self,
+        scope: Scope,
+        owner: &str,
+        folder: &str,
+        description: Option<&str>,
+    ) -> Result<bool> {
         let owner = owner.trim();
-        let created = self.hub.store().create_owner(scope, owner)?;
-        if created {
-            self.hub.audit().record(AuditEvent::FolderCreated {
+        let folder = normalize_folder(folder)?;
+        let store = self.hub.store();
+        if folder.is_empty() {
+            let created = store.create_owner(scope, owner)?;
+            if created {
+                self.record_folder_created(scope, owner, "", None);
+            }
+            return Ok(created);
+        }
+        let before = store.folder_description(scope, owner, &folder)?;
+        let missing = self.hub.missing_folders(scope, owner, &folder)?;
+        if !store.owners(scope)?.iter().any(|o| o == owner) {
+            self.record_folder_created(scope, owner, "", None);
+        }
+        let created = store.create_folder(scope, owner, &folder, description)?;
+        let after = store.folder_description(scope, owner, &folder)?;
+        for path in &missing {
+            let description = if *path == folder { after.clone() } else { None };
+            self.record_folder_created(scope, owner, path, description);
+        }
+        if !created && before != after {
+            self.hub.audit().record(AuditEvent::FolderDescribed {
                 actor: self.actor.clone(),
                 scope: scope.to_string(),
                 owner: owner.to_string(),
+                folder: folder.clone(),
+                description: after.unwrap_or_default(),
             });
         }
         Ok(created)
     }
 
-    /// Moves the folder to the trash. Each contained memory is also audited
-    /// as a deletion (with its body), so it can be recovered from the log.
-    pub fn delete_folder(&self, scope: Scope, owner: &str) -> Result<Vec<MemoryId>> {
-        let memories = self.hub.store().delete_owner(scope, owner)?;
+    fn record_folder_created(
+        &self,
+        scope: Scope,
+        owner: &str,
+        folder: &str,
+        description: Option<String>,
+    ) {
+        self.hub.audit().record(AuditEvent::FolderCreated {
+            actor: self.actor.clone(),
+            scope: scope.to_string(),
+            owner: owner.to_string(),
+            folder: folder.to_string(),
+            description,
+        });
+    }
+
+    /// Moves a folder (the whole repo / agent space when `folder` is empty)
+    /// to the trash. Each contained memory is also audited as a deletion
+    /// (with its body), so it can be recovered from the log.
+    pub fn delete_folder(&self, scope: Scope, owner: &str, folder: &str) -> Result<Vec<MemoryId>> {
+        let folder = normalize_folder(folder)?;
+        let memories = self.hub.store().delete_folder(scope, owner, &folder)?;
         for memory in &memories {
             self.record_change(
                 MemoryAction::Delete,
@@ -390,6 +487,7 @@ impl Admin {
             actor: self.actor.clone(),
             scope: scope.to_string(),
             owner: owner.to_string(),
+            folder,
             memory_count: memories.len(),
         });
         Ok(memories.into_iter().map(|m| m.meta.id).collect())
@@ -413,6 +511,7 @@ impl Admin {
             changed_fields: Vec::new(),
             group: None,
             diff,
+            previous_id: None,
         });
     }
 
@@ -579,9 +678,19 @@ impl Admin {
                     event
                 };
                 let target = if event == "memory_changed" {
-                    format!("{} {}", str_field(r, "memory_id"), str_field(r, "title"))
+                    format!(
+                        "{} {} {}",
+                        str_field(r, "memory_id"),
+                        str_field(r, "title"),
+                        str_field(r, "previous_id")
+                    )
                 } else {
-                    format!("{}/{}", str_field(r, "scope"), str_field(r, "owner"))
+                    format!(
+                        "{}/{}/{}",
+                        str_field(r, "scope"),
+                        str_field(r, "owner"),
+                        str_field(r, "folder")
+                    )
                 };
                 filter
                     .agent

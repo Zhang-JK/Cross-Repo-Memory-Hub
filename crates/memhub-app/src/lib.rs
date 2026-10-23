@@ -20,7 +20,10 @@ pub use admin::{Admin, ADMIN_ACTOR};
 pub use error::{AppError, Result};
 pub use hub::{Hub, HubConfig};
 pub use registry::{AgentProfile, RepoProfile};
-pub use session::{AddMemory, AgentSession, ConnInfo, Connected, RepoJoin, RepoSummary, WhoAmI};
+pub use session::{
+    AddMemory, AgentSession, Browse, ConnInfo, Connected, FolderResult, RepoJoin, RepoSummary,
+    WhoAmI,
+};
 
 pub use memhub_audit as audit;
 pub use memhub_store as store;

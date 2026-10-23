@@ -90,6 +90,31 @@ impl Hub {
         Ok(())
     }
 
+    /// Subfolders on the way to `folder` (inclusive) that do not exist yet,
+    /// parents first. Empty for an unknown or invalid owner.
+    pub(crate) fn missing_folders(
+        &self,
+        scope: Scope,
+        owner: &str,
+        folder: &str,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut path = String::new();
+        for segment in memhub_store::normalize_folder(folder)?.split('/') {
+            if segment.is_empty() {
+                continue;
+            }
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(segment);
+            if !self.store.folder_exists(scope, owner, &path).unwrap_or(true) {
+                out.push(path.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn memory_count(&self, scope: Scope, owner: &str) -> usize {
         self.store
             .list(&memhub_store::Filter {

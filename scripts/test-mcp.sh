@@ -150,6 +150,7 @@ SID="$(grep -i '^mcp-session-id:' <<<"$HEADERS" | head -n 1 | cut -d: -f2 | tr -
 check "initialize returns a session id" eval 'code_is 200 && [[ -n "$SID" ]]'
 check "initialize negotiates protocol 2025-06-18" has '"protocolVersion":"2025-06-18"'
 check "initialize includes agent instructions" has 'connect_agent'
+check "instructions explain the folder layout" eval 'has "browse_memory" && has "move_memory"'
 if [[ -z "$SID" ]]; then
     echo "No MCP session; aborting." >&2
     summary
@@ -165,7 +166,7 @@ check "ping" eval 'code_is 200 && has "\"result\":{}"'
 rpc tools/list
 TOOL_COUNT="$(grep -o '"inputSchema"' <<<"$BODY" | wc -l)"
 check "tools/list returns $TOOL_COUNT tools" eval '[[ $TOOL_COUNT -ge 13 ]]'
-for t in connect_agent add_repo search_memory list_memories get_memory add_memory update_memory delete_memory group_memories; do
+for t in connect_agent add_repo browse_memory search_memory list_memories get_memory add_memory create_folder move_memory update_memory delete_memory group_memories; do
     check "tool '$t' is listed" has "\"name\":\"$t\""
 done
 
@@ -225,8 +226,31 @@ check "list_memories with filters" eval 'ok_tool && has "\"id\":\"$REPO_MEM\""'
 tool update_memory '{"id":"agent/some-other-agent/whatever","append":"x"}'
 check "writing another agent's memory is forbidden" err_tool forbidden
 
+section "Folders"
+tool create_folder "{\"scope\":\"repo\",\"repo\":\"$REPO\",\"folder\":\"selftest/nested\",\"description\":\"Scratch space of test-mcp.sh\"}"
+check "create_folder selftest/nested with a description" eval 'ok_tool && has "\"folder\":\"selftest/nested\""'
+
+tool add_memory "{\"scope\":\"repo\",\"repo\":\"$REPO\",\"folder\":\"selftest/nested\",\"title\":\"Nested $STAMP\",\"body\":\"Nested marker $TOKEN\"}"
+NESTED_MEM="$(memory_id "repo/$REPO/selftest/nested")"
+check "add_memory into a nested folder -> ${NESTED_MEM:-<no id>}" eval 'ok_tool && [[ -n "$NESTED_MEM" ]]'
+
+tool browse_memory "{\"scope\":\"repo\",\"owner\":\"$REPO\"}"
+check "browse_memory shows the folder tree with descriptions" eval 'ok_tool && has "nested/  Scratch space of test-mcp.sh"'
+
+tool list_memories "{\"scope\":\"repo\",\"owner\":\"$REPO\",\"folder\":\"selftest\"}"
+check "list_memories with a folder filter includes subfolders" eval 'ok_tool && has "\"id\":\"$NESTED_MEM\""'
+
+tool move_memory "{\"id\":\"$REPO_MEM\",\"folder\":\"selftest\",\"expected_version\":3}"
+MOVED_MEM="$(memory_id "repo/$REPO/selftest")"
+check "move_memory into selftest/ -> ${MOVED_MEM:-<no id>}" eval 'ok_tool && [[ -n "$MOVED_MEM" ]] && has "\"previous_id\":\"$REPO_MEM\""'
+if [[ -n "$MOVED_MEM" ]]; then
+    tool get_memory "{\"id\":\"$REPO_MEM\"}"
+    check "the old id is gone after the move" err_tool not_found
+    REPO_MEM="$MOVED_MEM"
+fi
+
 section "Cleanup"
-for id in "$REPO_MEM" "$AGENT_MEM"; do
+for id in "$REPO_MEM" "$AGENT_MEM" "$NESTED_MEM"; do
     [[ -n "$id" ]] || continue
     tool delete_memory "{\"id\":\"$id\"}"
     check "delete_memory $id" ok_tool

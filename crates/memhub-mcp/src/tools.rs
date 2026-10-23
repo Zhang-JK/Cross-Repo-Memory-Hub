@@ -2,7 +2,7 @@
 
 use memhub_app::{
     store::{self, Filter, GroupKey, MemoryId, MemoryMeta, MemoryPatch, Scope, SearchQuery},
-    AddMemory, AgentSession, AppError,
+    AddMemory, AgentSession, AppError, Browse,
 };
 use schemars::{generate::SchemaSettings, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -35,6 +35,7 @@ enum GroupKeyArg {
     Owner,
     Scope,
     Author,
+    Folder,
 }
 
 impl From<GroupKeyArg> for GroupKey {
@@ -46,6 +47,7 @@ impl From<GroupKeyArg> for GroupKey {
             GroupKeyArg::Owner => GroupKey::Owner,
             GroupKeyArg::Scope => GroupKey::Scope,
             GroupKeyArg::Author => GroupKey::Author,
+            GroupKeyArg::Folder => GroupKey::Folder,
         }
     }
 }
@@ -101,6 +103,10 @@ struct FilterArgs {
     /// Repo id (scope=repo) or agent name (scope=agent).
     #[serde(default)]
     owner: Option<String>,
+    /// Only memories in this folder or its subfolders, e.g. "modules/auth".
+    /// Usually combined with scope and owner.
+    #[serde(default)]
+    folder: Option<String>,
     /// Memory kind, e.g. overview, architecture, pitfall, task-log.
     #[serde(default)]
     kind: Option<String>,
@@ -115,22 +121,31 @@ struct FilterArgs {
     author: Option<String>,
 }
 
-impl From<FilterArgs> for Filter {
-    fn from(f: FilterArgs) -> Self {
-        Filter {
+impl TryFrom<FilterArgs> for Filter {
+    type Error = ToolError;
+
+    fn try_from(f: FilterArgs) -> Result<Self, ToolError> {
+        let folder = f
+            .folder
+            .as_deref()
+            .map(store::normalize_folder)
+            .transpose()?
+            .filter(|f| !f.is_empty());
+        Ok(Filter {
             scope: f.scope.map(Into::into),
             owner: f.owner.filter(|o| !o.trim().is_empty()),
+            folder,
             kind: f.kind.filter(|k| !k.trim().is_empty()),
             tags: f.tags,
             group: f.group.filter(|g| !g.trim().is_empty()),
             author: f.author.filter(|a| !a.trim().is_empty()),
-        }
+        })
     }
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct SearchArgs {
-    /// Keywords; every term is matched case-insensitively against title, tags, kind and body.
+    /// Keywords; every term is matched case-insensitively against title, folder, tags, kind and body.
     /// Omit to list the most recently updated memories matching the filters.
     #[serde(default)]
     query: Option<String>,
@@ -152,22 +167,76 @@ struct ListArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct IdArgs {
-    /// Memory id, e.g. "repo/payment-service/retry-policy".
+    /// Memory id, e.g. "repo/payment-service/pitfalls/retry-policy".
     id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct BrowseArgs {
+    /// "repo" (default) or "agent".
+    #[serde(default)]
+    scope: Option<ScopeArg>,
+    /// Repo id (scope=repo, required) or agent name (scope=agent, defaults to yourself).
+    #[serde(default)]
+    owner: Option<String>,
+    /// Show only this folder and its subfolders, e.g. "modules".
+    #[serde(default)]
+    folder: Option<String>,
+    /// List memory titles under each folder (default true). Set false for a folders-only outline.
+    #[serde(default)]
+    memories: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CreateFolderArgs {
+    /// "repo" for a repository you joined, "agent" for your own space.
+    scope: ScopeArg,
+    /// Repository id; required when scope is "repo".
+    #[serde(default)]
+    repo: Option<String>,
+    /// Folder path below the repo / agent root, e.g. "modules/auth". Missing parents are created.
+    folder: String,
+    /// One line on what belongs in this folder, shown by browse_memory. Replaces the current
+    /// description of an existing folder; "" removes it.
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MoveMemoryArgs {
+    /// Memory id to move.
+    id: String,
+    /// Target folder in the same repo / agent space, e.g. "pitfalls"; "" for the root.
+    /// Missing folders are created.
+    folder: String,
+    /// New slug (file name); keeps the current one if omitted.
+    #[serde(default)]
+    slug: Option<String>,
+    /// Fail if the memory's current version differs.
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct AddMemoryArgs {
-    /// "repo" for shared repository knowledge, "agent" for your own notebook.
+    /// "repo": general knowledge about the repository that every agent should share
+    /// (architecture, modules, how-to, pitfalls, decisions). "agent": your own work notebook
+    /// for a specific task (work log, progress, to-dos, personal tricks).
     scope: ScopeArg,
     /// Repository id; required when scope is "repo". You must have joined it via add_repo.
     #[serde(default)]
     repo: Option<String>,
+    /// Folder for the memory, e.g. "architecture", "modules/auth", "pitfalls". Pick the most
+    /// specific existing folder (see browse_memory); missing folders are created. Leave empty
+    /// only for the repo's top-level overview.
+    #[serde(default)]
+    folder: Option<String>,
     /// Short descriptive title.
     title: String,
     /// Markdown content.
     body: String,
-    /// Category. Repo: overview, architecture, implementation, pitfall. Agent: task-log, insight, todo.
+    /// Category. Repo: overview, architecture, implementation, how-to, pitfall, decision.
+    /// Agent: task-log, insight, todo.
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
@@ -286,6 +355,14 @@ const TOOLS: &[ToolDef] = &[
         destructive: false,
     },
     ToolDef {
+        name: "browse_memory",
+        title: "Browse memory tree",
+        description: "Show the folder tree of a repo's (or agent's) memory with folder descriptions, counts and memory titles. Start here when you begin work on a repo, and before add_memory to pick the right folder.",
+        schema: schema::<BrowseArgs>,
+        read_only: true,
+        destructive: false,
+    },
+    ToolDef {
         name: "search_memory",
         title: "Search memory",
         description: "Keyword search over all memories (repo and agent), ranked by relevance, with optional filters.",
@@ -296,7 +373,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_memories",
         title: "List memories",
-        description: "List memories matching filters, optionally grouped by group, kind, tag, owner, scope or author.",
+        description: "List memories matching filters (including a folder), optionally grouped by group, kind, tag, owner, scope, author or folder.",
         schema: schema::<ListArgs>,
         read_only: true,
         destructive: false,
@@ -312,7 +389,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "add_memory",
         title: "Add memory",
-        description: "Create a memory in a repo you joined (scope=repo) or in your own agent space (scope=agent).",
+        description: "Create a memory. scope=repo is for general repo knowledge shared by all agents (architecture, modules, how-to, pitfalls, decisions) in a repo you joined. scope=agent is for your own task-specific notebook (work logs, progress, to-dos, personal tricks). Ask: should another agent on a different task know this? Yes means repo, no means agent. Put it in the most specific fitting folder (e.g. folder=\"modules/auth\"); keep the root for the overview only.",
         schema: schema::<AddMemoryArgs>,
         read_only: false,
         destructive: false,
@@ -320,8 +397,24 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "update_memory",
         title: "Update memory",
-        description: "Change a memory's title, kind, tags, groups or body (replace or append). Only fields you pass are changed.",
+        description: "Change a memory's title, kind, tags, groups or body (replace or append). Only fields you pass are changed. Fix outdated repo memory here instead of noting the correction in your agent notebook; keep task progress out of repo memory (append it to your agent task log instead).",
         schema: schema::<UpdateMemoryArgs>,
+        read_only: false,
+        destructive: false,
+    },
+    ToolDef {
+        name: "create_folder",
+        title: "Create folder",
+        description: "Create a memory folder (missing parents too) with a one-line description of what belongs in it, or update an existing folder's description.",
+        schema: schema::<CreateFolderArgs>,
+        read_only: false,
+        destructive: false,
+    },
+    ToolDef {
+        name: "move_memory",
+        title: "Move memory",
+        description: "Move a memory to another folder of the same repo / agent space, optionally renaming it. Use it to tidy a crowded root or folder; the memory id changes.",
+        schema: schema::<MoveMemoryArgs>,
         read_only: false,
         destructive: false,
     },
@@ -480,11 +573,14 @@ pub fn call(session: &mut AgentSession, name: &str, args: Value) -> Option<Value
             .list_repos()
             .map_err(Into::into)
             .map(|r| json!({ "repos": r }).into()),
+        "browse_memory" => browse_memory(session, args),
         "search_memory" => search_memory(session, args),
         "list_memories" => list_memories(session, args),
         "get_memory" => get_memory(session, args),
         "add_memory" => add_memory(session, args),
         "update_memory" => update_memory(session, args),
+        "create_folder" => create_folder(session, args),
+        "move_memory" => move_memory(session, args),
         "delete_memory" => delete_memory(session, args),
         "group_memories" => group_memories(session, args),
         _ => return None,
@@ -527,6 +623,7 @@ fn memory_id(id: &str) -> Result<MemoryId, ToolError> {
 fn summary(meta: &MemoryMeta) -> Value {
     json!({
         "id": meta.id,
+        "folder": meta.folder(),
         "title": meta.title,
         "kind": meta.kind,
         "tags": meta.tags,
@@ -547,7 +644,11 @@ fn connect_agent(session: &mut AgentSession, args: Value) -> ToolResult {
 fn add_repo(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: AddRepoArgs = parse(args)?;
     let join = session.add_repo(&a.repo, a.description.as_deref(), a.location.as_deref())?;
-    Ok(json!(join).into())
+    let mut out = json!(join);
+    let tree = session.browse(Scope::Repo, Some(&join.repo.id), "")?;
+    out["memory_count"] = json!(tree.memories.len());
+    out["next_step"] = json!(repo_next_step(&tree));
+    Ok(out.into())
 }
 
 fn leave_repo(session: &mut AgentSession, args: Value) -> ToolResult {
@@ -560,7 +661,7 @@ fn search_memory(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: SearchArgs = parse(args)?;
     let hits = session.search(&SearchQuery {
         text: a.query.filter(|q| !q.trim().is_empty()),
-        filter: a.filter.into(),
+        filter: a.filter.try_into()?,
         limit: a.limit,
     })?;
     let hits: Vec<Value> = hits
@@ -577,7 +678,7 @@ fn search_memory(session: &mut AgentSession, args: Value) -> ToolResult {
 
 fn list_memories(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: ListArgs = parse(args)?;
-    let filter: Filter = a.filter.into();
+    let filter: Filter = a.filter.try_into()?;
     match a.group_by {
         Some(key) => {
             let groups = session.group_by(&filter, key.into())?;
@@ -603,6 +704,7 @@ fn key_name(key: GroupKeyArg) -> &'static str {
         GroupKeyArg::Owner => "owner",
         GroupKeyArg::Scope => "scope",
         GroupKeyArg::Author => "author",
+        GroupKeyArg::Folder => "folder",
     }
 }
 
@@ -617,9 +719,18 @@ fn get_memory(session: &mut AgentSession, args: Value) -> ToolResult {
 
 fn add_memory(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: AddMemoryArgs = parse(args)?;
+    let scope: Scope = a.scope.into();
+    let folder = store::normalize_folder(a.folder.as_deref().unwrap_or(""))?;
+    let new_folders = match (scope, a.repo.as_deref(), session.agent()) {
+        (Scope::Repo, Some(repo), _) | (Scope::Agent, _, Some(repo)) => session
+            .missing_folders(scope, repo.trim(), &folder)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     let memory = session.add_memory(AddMemory {
-        scope: a.scope.into(),
+        scope,
         repo: a.repo,
+        folder,
         title: a.title,
         kind: a.kind,
         tags: a.tags,
@@ -627,7 +738,82 @@ fn add_memory(session: &mut AgentSession, args: Value) -> ToolResult {
         body: a.body,
         slug: a.slug,
     })?;
-    Ok(json!({ "created": summary(&memory.meta) }).into())
+    let mut out = json!({ "created": summary(&memory.meta) });
+    let tree = session.browse(scope, Some(memory.meta.owner()), "")?;
+    let hints = add_hints(&tree, &memory.meta, &new_folders);
+    if !hints.is_empty() {
+        out["hints"] = json!(hints);
+    }
+    Ok(out.into())
+}
+
+fn browse_memory(session: &mut AgentSession, args: Value) -> ToolResult {
+    let a: BrowseArgs = parse(args)?;
+    let scope: Scope = a.scope.map(Into::into).unwrap_or(Scope::Repo);
+    let tree = session.browse(scope, a.owner.as_deref(), a.folder.as_deref().unwrap_or(""))?;
+    let text = render_tree(&tree, a.memories.unwrap_or(true));
+    let folders: Vec<Value> = tree
+        .folders
+        .iter()
+        .map(|f| {
+            json!({
+                "path": f.path,
+                "description": f.description,
+                "memory_count": f.memory_count,
+                "total_count": f.total_count,
+            })
+        })
+        .collect();
+    let memories: Vec<Value> = tree
+        .memories
+        .iter()
+        .map(|m| json!({ "id": m.id, "folder": m.folder(), "title": m.title, "kind": m.kind }))
+        .collect();
+    Ok(ToolOutput {
+        structured: json!({
+            "scope": tree.scope,
+            "owner": tree.owner,
+            "folder": tree.folder,
+            "description": tree.owner_description,
+            "folders": folders,
+            "memories": memories,
+        }),
+        text: Some(text),
+    })
+}
+
+fn create_folder(session: &mut AgentSession, args: Value) -> ToolResult {
+    let a: CreateFolderArgs = parse(args)?;
+    let result = session.create_folder(
+        a.scope.into(),
+        a.repo.as_deref(),
+        &a.folder,
+        a.description.as_deref(),
+    )?;
+    let mut out = json!(result);
+    if result.description.is_none() {
+        out["hints"] = json!([format!(
+            "Folder '{}' has no description. Pass a one-line description so newcomers know what belongs here.",
+            result.folder
+        )]);
+    }
+    Ok(out.into())
+}
+
+fn move_memory(session: &mut AgentSession, args: Value) -> ToolResult {
+    let a: MoveMemoryArgs = parse(args)?;
+    let change = session.move_memory(
+        &memory_id(&a.id)?,
+        &a.folder,
+        a.slug.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        a.expected_version,
+    )?;
+    Ok(json!({
+        "moved": summary(&change.after.meta),
+        "previous_id": change.before.meta.id,
+        "changed_fields": change.changed_fields,
+    })
+    .into())
 }
 
 fn update_memory(session: &mut AgentSession, args: Value) -> ToolResult {
@@ -673,6 +859,212 @@ fn group_memories(session: &mut AgentSession, args: Value) -> ToolResult {
         "changed": changed,
     })
     .into())
+}
+
+// ---- organization guidance -------------------------------------------------------
+
+/// Memories allowed in an owner's root folder before add_memory starts
+/// suggesting folders.
+const ROOT_SOFT_LIMIT: usize = 3;
+/// Memories directly in one subfolder before add_memory suggests splitting it.
+const FOLDER_SOFT_LIMIT: usize = 12;
+
+/// Conventional folder for a memory kind, used in hints.
+fn folder_for_kind(scope: Scope, kind: &str) -> Option<&'static str> {
+    let kind = kind.to_ascii_lowercase();
+    Some(match (scope, kind.as_str()) {
+        (Scope::Repo, "architecture" | "design") => "architecture",
+        (Scope::Repo, "implementation" | "module" | "component") => "modules/<component>",
+        (Scope::Repo, "pitfall" | "gotcha" | "incident" | "bug") => "pitfalls",
+        (Scope::Repo, "how-to" | "howto" | "guide" | "runbook" | "procedure") => "how-to",
+        (Scope::Repo, "decision" | "adr") => "decisions",
+        (Scope::Agent, "task-log" | "log") => "task-logs",
+        (Scope::Agent, "insight" | "lesson") => "insights",
+        (Scope::Agent, "todo" | "plan") => "todo",
+        _ => return None,
+    })
+}
+
+/// A hint when a memory's kind suggests it belongs in the other scope.
+fn scope_hint(scope: Scope, meta: &MemoryMeta) -> Option<String> {
+    let kind = meta.kind.to_ascii_lowercase();
+    match scope {
+        Scope::Repo
+            if matches!(
+                kind.as_str(),
+                "task-log" | "log" | "worklog" | "todo" | "plan" | "progress" | "status"
+            ) =>
+        {
+            Some(format!(
+                "'{}' memories are task-specific; they belong in your agent notebook \
+                 (scope=agent, folder task-logs/ or todo/), not in shared repo memory. Repo memory \
+                 is for general knowledge every agent should know. Recreate it with scope=agent and \
+                 delete {}; keep any general lesson from it here in repo memory.",
+                meta.kind, meta.id
+            ))
+        }
+        Scope::Agent => folder_for_kind(Scope::Repo, &kind)
+            .or_else(|| (kind == "overview").then_some(""))
+            .map(|folder| {
+                let target = if folder.is_empty() {
+                    "the repo root".to_string()
+                } else {
+                    format!("'{folder}/'")
+                };
+                format!(
+                    "Kind '{}' describes general repo knowledge. If every agent working on the repo \
+                     should know it, put it in repo memory (add_memory scope=repo, {target}) so it is \
+                     shared. Keep only task-specific notes and personal tricks in your agent notebook.",
+                    meta.kind
+                )
+            }),
+        _ => None,
+    }
+}
+
+fn top_level_folders(tree: &Browse) -> Vec<String> {
+    tree.folders
+        .iter()
+        .filter(|f| f.depth() == 1)
+        .map(|f| format!("{}/", f.path))
+        .collect()
+}
+
+fn add_hints(tree: &Browse, meta: &MemoryMeta, new_folders: &[String]) -> Vec<String> {
+    let mut hints: Vec<String> = scope_hint(tree.scope, meta).into_iter().collect();
+    let owner = format!("{}/{}", tree.scope, tree.owner);
+    let folder = meta.folder();
+    let info = tree.folders.iter().find(|f| f.path == folder);
+    let count = info.map_or(0, |f| f.memory_count);
+    let is_overview = meta.kind.eq_ignore_ascii_case("overview");
+    if folder.is_empty() && !is_overview && count > ROOT_SOFT_LIMIT {
+        let suggestion = folder_for_kind(tree.scope, &meta.kind)
+            .map(|f| format!(" A memory of kind '{}' usually goes in '{f}/'.", meta.kind))
+            .unwrap_or_default();
+        let existing = top_level_folders(tree);
+        let existing = if existing.is_empty() {
+            " There are no folders yet: create a few (see the layout in the server instructions)."
+                .to_string()
+        } else {
+            format!(" Existing folders: {}.", existing.join(", "))
+        };
+        hints.push(format!(
+            "The root of {owner} now holds {count} memories. Keep only the overview there so newcomers can find their way; \
+             move this one into a folder with move_memory(id=\"{}\", folder=...).{suggestion}{existing}",
+            meta.id
+        ));
+    } else if folder.is_empty() && !is_overview && tree.scope == Scope::Repo {
+        if let Some(f) = folder_for_kind(tree.scope, &meta.kind) {
+            hints.push(format!(
+                "Tip: memories of kind '{}' are easier to find in '{f}/'. Pass folder=... next time, or move_memory this one.",
+                meta.kind
+            ));
+        }
+    }
+    if !folder.is_empty() && count > FOLDER_SOFT_LIMIT {
+        hints.push(format!(
+            "Folder '{folder}' holds {count} memories directly. Consider grouping them into subfolders \
+             (create_folder + move_memory)."
+        ));
+    }
+    for f in new_folders {
+        hints.push(format!(
+            "Created folder '{f}'. Describe it with create_folder(folder=\"{f}\", description=...) so browse_memory explains what belongs here."
+        ));
+    }
+    let has_overview = tree
+        .memories
+        .iter()
+        .any(|m| m.folder().is_empty() && m.kind.eq_ignore_ascii_case("overview"));
+    if tree.scope == Scope::Repo && !has_overview {
+        hints.push(format!(
+            "{owner} has no root overview yet. Add one (kind=overview, no folder) that says what the repo does, \
+             how to build and test it, and which folder holds what."
+        ));
+    }
+    hints
+}
+
+fn repo_next_step(tree: &Browse) -> String {
+    if tree.memories.is_empty() {
+        format!(
+            "Repo '{}' has no memories yet. Start with a root overview (add_memory kind=overview, no folder), \
+             then file knowledge into folders such as architecture/, modules/<name>/, how-to/, pitfalls/ and decisions/ \
+             (create_folder with a one-line description).",
+            tree.owner
+        )
+    } else {
+        format!(
+            "Repo '{}' has {} memories. Call browse_memory(scope=\"repo\", owner=\"{}\") to see the folder tree, \
+             read the root overview first, then the folders relevant to your task.",
+            tree.owner,
+            tree.memories.len(),
+            tree.owner
+        )
+    }
+}
+
+/// Indented outline of a memory tree, e.g.
+///
+/// ```text
+/// repo/payment-service: Payment backend (5 memories)
+///   overview  Payment service overview [overview]
+///   architecture/  How requests flow through the service (2)
+///     request-flow  Request flow [architecture]
+/// ```
+fn render_tree(tree: &Browse, with_memories: bool) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let total = tree.root().map_or(0, |f| f.total_count);
+    let _ = write!(out, "{}/{}", tree.scope, tree.owner);
+    if !tree.folder.is_empty() {
+        let _ = write!(out, "/{}", tree.folder);
+    }
+    let description = if tree.folder.is_empty() {
+        Some(tree.owner_description.as_str()).filter(|d| !d.is_empty())
+    } else {
+        tree.root().and_then(|f| f.description.as_deref())
+    };
+    if let Some(d) = description {
+        let _ = write!(out, ": {d}");
+    }
+    let _ = writeln!(
+        out,
+        " ({total} {})",
+        if total == 1 { "memory" } else { "memories" }
+    );
+    let base = tree.root().map_or(0, |f| f.depth());
+    let write_memories = |out: &mut String, path: &str, indent: usize| {
+        for m in tree.memories.iter().filter(|m| m.folder() == path) {
+            let _ = writeln!(
+                out,
+                "{:indent$}{}  {} [{}]",
+                "",
+                m.id.slug,
+                m.title,
+                m.kind,
+                indent = indent
+            );
+        }
+    };
+    if with_memories {
+        write_memories(&mut out, &tree.folder, 2);
+    }
+    for f in tree.folders.iter().filter(|f| f.path != tree.folder) {
+        let indent = (f.depth() - base) * 2;
+        let _ = write!(out, "{:indent$}{}/", "", f.name(), indent = indent);
+        if let Some(d) = &f.description {
+            let _ = write!(out, "  {d}");
+        }
+        let _ = writeln!(out, " ({})", f.total_count);
+        if with_memories {
+            write_memories(&mut out, &f.path, indent + 2);
+        }
+    }
+    if total == 0 {
+        out.push_str("  (empty)\n");
+    }
+    out
 }
 
 #[cfg(test)]

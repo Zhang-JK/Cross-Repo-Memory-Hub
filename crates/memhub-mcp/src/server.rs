@@ -21,14 +21,57 @@ the same agent shares its memory. If the agent does not exist yet, also pass you
 (e.g. feature-impl, crash-analysis, perf-opt) to create it.
 2. Call `add_repo` for each repository you work on. This registers the repo if it is new and \
 grants you write access to its shared memory.
-3. Before changing a repo, `search_memory` (or `list_memories` with scope=repo, owner=<repo>) \
-to learn what it does, how it is implemented and what to watch out for.
-4. Record durable knowledge with `add_memory` / `update_memory`:
-   - scope=repo: facts about a repository (kinds: overview, architecture, implementation, pitfall).
-   - scope=agent: your own notebook (kinds: task-log, insight, todo). Other agents can read it \
-but only you can change it.
-Memory ids look like `repo/<repo>/<slug>` or `agent/<agent>/<slug>`. Pass `expected_version` \
-when updating to avoid overwriting concurrent edits.";
+3. Before changing a repo, call `browse_memory` (scope=repo, owner=<repo>) to see its memory \
+tree with folder descriptions. Read the root `overview` first, then the folders relevant to your \
+task (`get_memory`). Use `search_memory` for keyword lookup across everything.
+4. Record what you learn with `add_memory` / `update_memory`, choosing the scope as below.
+
+Repo memory vs agent memory: decide this before every write or update.
+- Repo memory (scope=repo, owner=<repo>) is the repository's shared knowledge base. It holds \
+general knowledge about the repo that is true regardless of who is working on it or why, and \
+that every agent touching the repo should know: what it does, how it is built, tested and \
+released, its architecture and modules, conventions, pitfalls, and design decisions. It is \
+shared by all agents and writable by every agent that joined the repo, so write it for a \
+newcomer: self-contained, current and free of task chatter. Kinds: overview, architecture, \
+implementation, how-to, pitfall, decision.
+- Agent memory (scope=agent, owner=<your agent name>) is your own work notebook for specific \
+tasks: what you were asked to do, what you tried, progress and status, open questions, \
+follow-ups, and personal tricks and shortcuts that help you work. Other agents can read it but \
+only you can change it. Kinds: task-log, insight, todo.
+- Rule of thumb: if another agent starting a different task in this repo tomorrow should know \
+it, it is repo memory. If it only makes sense in the context of your task, it is agent memory.
+- Examples: \"the build needs protoc 3.21\" goes in repo how-to/. \"Retries cause double \
+charges unless an idempotency key is set\" goes in repo pitfalls/. \"Ticket PAY-123: fixed \
+refund rounding, tried X first, PR pending review\" goes in agent task-logs/. \"Running only \
+the billing tests with -run Billing saves 5 minutes\" goes in agent insights/.
+- When a task teaches you something general (a gotcha, a build step, how a module really \
+works), record it in repo memory, not only in your task log. Your task log can link to it by id.
+- When repo memory is wrong or outdated, fix it with `update_memory`. Don't leave the correction \
+in your agent notebook only.
+- Never put task logs, status updates or to-dos in repo memory. Never keep general repo \
+knowledge only in agent memory.
+
+Keep memory organized as a folder tree, so a newcomer can catch up from `browse_memory` alone:
+- A repo's root folder holds only its `overview` memory: what the repo does, how to build and \
+test it, and which folder holds what. Everything else goes into a folder.
+- Suggested repo layout (create only what you need):
+    architecture/      components, data flow, key abstractions
+    modules/<name>/    one folder per subsystem, crate, package or service
+    how-to/            build, test, release and debugging procedures
+    pitfalls/          gotchas, past incidents, things that break easily
+    decisions/         why things are the way they are
+- Suggested agent layout: task-logs/, insights/, todo/.
+- Before `add_memory`, browse the tree and pass the most specific fitting `folder` \
+(e.g. folder=\"modules/auth\"). Prefer updating an existing memory over adding a near-duplicate.
+- Create a folder (`create_folder`, always with a one-line description) when two or more related \
+memories have no fitting home. Keep nesting shallow (2-3 levels).
+- When the root or a folder gets crowded (about 10 or more memories) or a memory is misplaced, \
+reorganize with `move_memory`, and keep the overview's folder map current.
+- Tool results may carry `hints` about organization; follow them.
+
+Memory ids include the folder path: `repo/<repo>/[<folder>/]<slug>`, e.g. \
+`repo/payment-service/pitfalls/retry-storms`, or `agent/<agent>/[<folder>/]<slug>`. Moving a \
+memory changes its id. Pass `expected_version` when updating to avoid overwriting concurrent edits.";
 
 /// Facts extracted from an `initialize` request.
 #[derive(Debug, Clone)]

@@ -4,8 +4,53 @@ Shared long-term memory for multiple agents working across multiple repositories
 
 Two memory spaces:
 
-- **Repo memory** (`repo/<repo>/<slug>`): what a repository does, how it is implemented, what to watch out for when changing it. Writable by every agent that has joined the repo.
-- **Agent memory** (`agent/<agent>/<slug>`): each agent's own notebook (task logs, insights). Readable by everyone, writable only by its owner.
+- **Repo memory** (`repo/<repo>/[<folder>/]<slug>`) is the repository's shared knowledge base.
+  It holds general knowledge about the repo that every agent should know, whoever is working on
+  it and for whatever task: what it does, how to build, test and release it, its architecture and
+  modules, conventions, pitfalls and design decisions. Every agent that has joined the repo can
+  read and write it, so it is written for a newcomer.
+- **Agent memory** (`agent/<agent>/[<folder>/]<slug>`) is one agent's work notebook for specific
+  tasks: what it was asked to do, what it tried, progress, open questions and to-dos, plus the
+  personal tricks that make it faster. Anyone can read it; only its owner can write it.
+
+Which one to write (agents get the same rules in the MCP server instructions):
+
+| Ask yourself | Goes in | Example |
+| --- | --- | --- |
+| Should another agent on a different task in this repo know it? | repo memory | "The build needs protoc 3.21" goes in `how-to/`; "retries double-charge without an idempotency key" goes in `pitfalls/` |
+| Does it only make sense in the context of my task? | agent memory | "PAY-123: fixed refund rounding, tried X first, PR pending" goes in `task-logs/` |
+| Is it a personal working trick? | agent memory | "`go test -run Billing` saves 5 minutes" goes in `insights/` |
+
+When a task teaches an agent something general, the agent records it in repo memory, not only in
+its task log, and fixes outdated repo memory with `update_memory`. Task logs, status updates and
+to-dos never go in repo memory. `add_memory` returns a hint when a memory's kind looks like it
+belongs in the other space, for example a `task-log` filed as repo memory or a `pitfall` filed as
+agent memory.
+
+Each space is a folder tree (up to 6 levels), so a newcomer can learn a repo from its outline:
+
+```text
+repo/payment-service: Payment processing API (Go) (9 memories)
+  service-overview  Service overview [overview]
+  architecture/  Components, request flow and data model (2)
+    request-flow  Request flow [architecture]
+    ledger-data-model  Ledger data model [architecture]
+  modules/  One folder per subsystem (3)
+    card-auth/  Card authorization, 3-D Secure and issuer quirks (2)
+    refunds/  Full and partial refunds, reversal windows (1)
+  how-to/  Step-by-step procedures (1)
+  pitfalls/  Things that broke in production (1)
+  decisions/  Why things are the way they are (1)
+```
+
+That is the output of the `browse_memory` tool. The MCP server instructions tell agents to
+keep only the `overview` in a repo's root, use `architecture/`, `modules/<name>/`, `how-to/`,
+`pitfalls/` and `decisions/` (agents: `task-logs/`, `insights/`, `todo/`), browse before adding,
+describe every folder, and tidy up with `move_memory`. Tool results carry `hints` when an agent
+drifts: a crowded root (more than 3 memories besides the overview), a folder with more than 12
+memories, a new folder without a description, or a repo without a root overview. `add_repo`
+returns a `next_step` that points newcomers at `browse_memory`, or at a starter layout for an
+empty repo.
 
 ## Layout
 
@@ -20,9 +65,10 @@ Data directory:
 
 ```text
 memhub-data/
-  memories/repo/<repo>/<slug>.md
-  memories/agent/<agent>/<slug>.md
-  trash/...                          deleted memories
+  memories/repo/<repo>/[<folder>/...]<slug>.md
+  memories/agent/<agent>/[<folder>/...]<slug>.md
+  memories/<scope>/<owner>/<folder>/_index.md   folder description (plain text)
+  trash/...                          deleted memories and folders
   registry/agents/<agent>.yaml       role, description, working repos
   registry/repos/<repo>.yaml
   logs/audit-YYYY-MM-DD.jsonl
@@ -105,9 +151,11 @@ Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 
 - **Dashboard**: memory, folder and agent counts, live MCP sessions, 14-day activity chart,
   recent changes, most active agents and largest folders, with links into the other tabs.
-- **Memories**: folder tree (one folder per repo or agent), keyword search, every memory's
-  front-matter properties and content (rendered or raw file). Add memories (typed in or
-  imported from a `.md` file), delete memories, and create or delete whole folders.
+- **Memories**: folder tree (repos and agents, each with nested subfolders and their
+  descriptions; folders without a description are flagged), keyword search, every memory's
+  front-matter properties and content (rendered or raw file). Add memories into any folder
+  (typed in or imported from a `.md` file), move or delete memories, and create, describe or
+  delete folders.
 - **Connections**: live connection count plus rolling 7-day and 30-day counts
   (connections, distinct IPs, distinct agents), then one row per MCP session
   (agent, client IP, client, duration, disconnect reason, live or closed), or the
@@ -115,8 +163,9 @@ Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
   the last 365 days as `.xlsx` (the agent and IP filters apply; at most 100,000
   rows, newest first). A connection counts in a window when it started, identified
   itself, or ended in that window.
-- **Updates**: every memory change with agent, IP, versions and body diff; filter by agent,
-  action or memory.
+- **Updates**: every memory change (add, update, move, delete, grouping) and folder change
+  with agent, IP, versions and body diff; filter by agent, action, or memory id / title /
+  folder.
 
 Changes made in the UI skip the per-agent write rules and are audited as agent `(admin)`,
 transport `admin`, with the browser's IP. Deleted memories and folders go to `trash/`.
@@ -170,10 +219,13 @@ against honest mistakes, not against an agent deliberately using another agent's
 | `connect_agent` | Identify by agent name; creates the agent when a role is given and it is new |
 | `whoami`, `list_agents` | Identity and agent directory |
 | `add_repo`, `leave_repo`, `list_repos` | Manage working repos (registers a repo on first use) |
-| `search_memory` | Ranked keyword search with scope/owner/kind/tag/group/author filters |
-| `list_memories` | Filtered listing, optionally `group_by` group/kind/tag/owner/scope/author |
+| `browse_memory` | Folder tree of a repo or agent with descriptions, counts and titles (the newcomer's entry point) |
+| `search_memory` | Ranked keyword search with scope/owner/folder/kind/tag/group/author filters |
+| `list_memories` | Filtered listing, optionally `group_by` group/kind/tag/owner/scope/author/folder |
 | `get_memory` | Full Markdown content |
-| `add_memory`, `update_memory`, `delete_memory` | Mutations (`expected_version` for optimistic locking) |
+| `add_memory`, `update_memory`, `delete_memory` | Mutations (`folder` on add; `expected_version` for optimistic locking) |
+| `create_folder` | Create a folder with a one-line description, or change a folder's description |
+| `move_memory` | Move a memory to another folder of the same repo / agent, optionally renaming it |
 | `group_memories` | Add memories to / remove them from a named group |
 
 ## Audit log
@@ -181,6 +233,8 @@ against honest mistakes, not against an agent deliberately using another agent's
 Every record carries `ts`, `event`, `session_id`, `agent` (once identified), `ip` and `transport`.
 Events: `connect` (with MCP client name), `disconnect` (`client_closed`, `idle_timeout`,
 `stdio_eof`, `server_shutdown`, `connect_failed`, ...), `agent_registered` (first connection
-of a new agent), `agent_login`, `repo_joined`, `repo_left`, and `memory_changed` with
-`action` (`add`/`update`/`delete`/`group_add`/`group_remove`), versions, changed fields and a
-unified diff of the body.
+of a new agent), `agent_login`, `repo_joined`, `repo_left`, `memory_changed` with
+`action` (`add`/`update`/`move`/`delete`/`group_add`/`group_remove`), versions, changed fields,
+a unified diff of the body and, for moves, `previous_id`, and `folder_created`,
+`folder_described`, `folder_deleted` with `scope`, `owner` and `folder` (empty for a whole
+repo / agent space).

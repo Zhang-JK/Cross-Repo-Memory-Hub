@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{io::Write, net::SocketAddr};
 
 use axum::{
     body::Body,
@@ -6,6 +6,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use memhub_app::{Hub, HubConfig};
 use memhub_mcp::http::{router, HttpConfig, HttpState};
@@ -333,4 +334,195 @@ async fn connection_log_marks_live_sessions() {
         .collect();
     assert_eq!(names, vec!["disconnect", "agent_registered", "connect"]);
     assert_eq!(events["events"][2]["agent"], "crash-bot");
+}
+
+fn append_log(dir: &std::path::Path, days_ago: i64, event: &str, rest: &str) {
+    let ts = Utc::now() - Duration::days(days_ago);
+    let path = dir
+        .join("logs")
+        .join(format!("audit-{}.jsonl", ts.format("%Y-%m-%d")));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(
+        file,
+        r#"{{"ts":"{}","event":"{event}",{rest}}}"#,
+        ts.to_rfc3339()
+    )
+    .unwrap();
+}
+
+fn xlsx_xml(bytes: &[u8]) -> String {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut out = String::new();
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).unwrap();
+        if !file.name().ends_with(".xml") {
+            continue;
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text).unwrap();
+        out.push_str(&text);
+    }
+    out
+}
+
+#[tokio::test]
+async fn connection_summary_and_year_export() {
+    let (dir, router) = app(None);
+    let rest = |id: &str, ip: &str, agent: &str, client: &str| {
+        format!(
+            r#""session_id":"{id}","ip":"{ip}","transport":"http","agent":"{agent}","client":"{client}""#
+        )
+    };
+    let month = rest("month-session", "10.9.1.1", "month-bot", "a<b>&c");
+    append_log(dir.path(), 20, "connect", &month);
+    append_log(
+        dir.path(),
+        20,
+        "disconnect",
+        &format!(r#"{month},"reason":"client_closed","duration_secs":2.0"#),
+    );
+    let ancient = rest("ancient-session", "10.8.8.8", "ancient-bot", "old");
+    append_log(dir.path(), 400, "connect", &ancient);
+    append_log(
+        dir.path(),
+        400,
+        "disconnect",
+        &format!(r#"{ancient},"reason":"client_closed","duration_secs":1.0"#),
+    );
+
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": { "name": "probe", "version": "1" } }
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("x-memhub-agent", "crash-bot")
+                .header("x-memhub-role", "crash-analysis")
+                .body(Body::from(init.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (_, summary) = call(&router, "GET", "/api/admin/connections/summary", None, &[]).await;
+    assert_eq!(summary["live"], 1);
+    assert_eq!(summary["week"]["connections"], 1);
+    assert_eq!(summary["week"]["ips"], 1);
+    assert_eq!(summary["week"]["agents"], 1);
+    assert_eq!(summary["month"]["connections"], 2);
+    assert_eq!(summary["month"]["ips"], 2);
+    assert_eq!(summary["month"]["agents"], 2);
+
+    let res = router
+        .clone()
+        .oneshot(
+            Request::get("/api/admin/connections/export")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()["content-type"],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    let disposition = res.headers()["content-disposition"].to_str().unwrap();
+    assert!(disposition.contains("memhub-connections-"));
+    assert!(disposition.ends_with(".xlsx\""));
+    assert!(res.headers().get("x-export-truncated").is_none());
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"PK\x03\x04"));
+    let xml = xlsx_xml(&bytes);
+    assert!(xml.contains("Session ID"));
+    assert!(xml.contains("Connected (UTC)"));
+    assert!(xml.contains("month-session"));
+    assert!(xml.contains("crash-bot"));
+    assert!(
+        xml.contains("a&lt;b&gt;&amp;c"),
+        "cell text must be escaped"
+    );
+    assert!(!xml.contains("ancient-session"));
+
+    let filtered = router
+        .clone()
+        .oneshot(
+            Request::get("/api/admin/connections/export?agent=month-bot&days=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let bytes = filtered.into_body().collect().await.unwrap().to_bytes();
+    let xml = xlsx_xml(&bytes);
+    assert!(xml.contains("month-session"));
+    assert!(
+        !xml.contains("crash-bot"),
+        "agent filter applies; days=1 is ignored"
+    );
+
+    let (_dir, locked) = app(Some("s3cret"));
+    let denied = locked
+        .clone()
+        .oneshot(
+            Request::get("/api/admin/connections/export")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let (status, summary) = call(
+        &locked,
+        "GET",
+        "/api/admin/connections/summary",
+        None,
+        &[("authorization", "Bearer s3cret")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(summary["live"], 0);
+    assert_eq!(summary["month"]["connections"], 0);
+}
+
+#[tokio::test]
+async fn selftest_agent_is_omitted_from_the_admin_api() {
+    let (_dir, router) = app(None);
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": { "name": "probe", "version": "1" } }
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("x-memhub-agent", "memhub-selftest")
+                .header("x-memhub-role", "selftest")
+                .body(Body::from(init.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (_, summary) = call(&router, "GET", "/api/admin/connections/summary", None, &[]).await;
+    assert_eq!(summary["live"], 0);
+    assert_eq!(summary["week"]["connections"], 0);
+    let (_, conns) = call(&router, "GET", "/api/admin/connections", None, &[]).await;
+    assert_eq!(conns["sessions"].as_array().unwrap().len(), 0);
+    let (_, stats) = call(&router, "GET", "/api/admin/stats", None, &[]).await;
+    assert_eq!(stats["live_sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(stats["connections_today"], 0);
 }

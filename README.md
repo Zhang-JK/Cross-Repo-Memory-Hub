@@ -90,8 +90,10 @@ scripts/test-mcp.sh -v                         # print every request and respons
 
 It runs a full MCP session over HTTP (initialize, every tool, permission and version-conflict
 checks, session close) as agent `memhub-selftest` in repo `memhub-selftest`, deletes the
-memories it created, and exits non-zero on any failure. Proxies are bypassed unless
-`MEMHUB_TEST_PROXY=1`.
+memories it created, and exits non-zero on any failure. It is not a background watchdog:
+nothing runs it unless you do. Proxies are bypassed unless `MEMHUB_TEST_PROXY=1`.
+The management page omits this agent from the connection log, the update log, the
+activity counts, and the Excel export.
 
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,
@@ -106,8 +108,13 @@ Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 - **Memories**: folder tree (one folder per repo or agent), keyword search, every memory's
   front-matter properties and content (rendered or raw file). Add memories (typed in or
   imported from a `.md` file), delete memories, and create or delete whole folders.
-- **Connections**: one row per MCP session (agent, client IP, client, duration, disconnect
-  reason, live or closed), or the raw connect/identify/disconnect events.
+- **Connections**: live connection count plus rolling 7-day and 30-day counts
+  (connections, distinct IPs, distinct agents), then one row per MCP session
+  (agent, client IP, client, duration, disconnect reason, live or closed), or the
+  raw connect/identify/disconnect events. **Export Excel** downloads sessions from
+  the last 365 days as `.xlsx` (the agent and IP filters apply; at most 100,000
+  rows, newest first). A connection counts in a window when it started, identified
+  itself, or ended in that window.
 - **Updates**: every memory change with agent, IP, versions and body diff; filter by agent,
   action or memory.
 

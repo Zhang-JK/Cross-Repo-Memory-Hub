@@ -6,27 +6,30 @@
 //! non-browser client that sends no `Origin`).
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{Arc, OnceLock},
 };
 
 use axum::{
     extract::{rejection::JsonRejection, ConnectInfo, Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use memhub_app::{
-    admin::{AdminNewMemory, LogFilter},
+    admin::{is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
     store::{MemoryId, Scope},
     Admin, AppError,
 };
+use rust_xlsxwriter::{Color, Format, Workbook, Worksheet, XlsxError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::http::{client_ip, HttpState};
+use crate::http::{client_ip, HttpState, LiveSession};
 
 const INDEX_HTML: &str = include_str!("admin/index.html");
 const APP_JS: &str = include_str!("admin/app.js");
@@ -37,6 +40,10 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-
 
 const DEFAULT_LOG_LIMIT: usize = 200;
 const MAX_LOG_LIMIT: usize = 5000;
+/// Excel export covers at most this many days, and at most this many sessions
+/// (the newest ones, when the year is larger than that).
+const EXPORT_DAYS: u32 = 365;
+const EXPORT_MAX: usize = 100_000;
 
 type AppState = Arc<HttpState>;
 type ApiResult = Result<Response, ApiError>;
@@ -54,6 +61,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
             get(get_memory).delete(delete_memory),
         )
         .route("/connections", get(connections))
+        .route("/connections/summary", get(connection_summary))
+        .route("/connections/export", get(export_connections))
         .route("/updates", get(updates))
         .layer(middleware::from_fn_with_state(state, guard));
 
@@ -252,6 +261,15 @@ fn caller(state: &HttpState, headers: &HeaderMap, peer: SocketAddr) -> String {
     client_ip(state.config(), headers, peer)
 }
 
+/// Live MCP sessions, without the self-test probe.
+fn shown_live(state: &HttpState) -> Vec<LiveSession> {
+    state
+        .live_sessions()
+        .into_iter()
+        .filter(|s| s.agent.as_deref().is_none_or(|a| !is_internal_agent(a)))
+        .collect()
+}
+
 fn parse_json<T: DeserializeOwned>(body: JsonBody) -> Result<T, ApiError> {
     let Json(value) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     serde_json::from_value(value).map_err(|e| ApiError::bad_request(e.to_string()))
@@ -275,7 +293,7 @@ async fn stats(
     let ip = caller(&state, &headers, peer);
     let stats = run(&state, ip, |admin| admin.stats()).await?;
     let mut v = serde_json::to_value(stats).map_err(|_| ApiError::internal())?;
-    v["live_sessions"] = json!(state.live_sessions());
+    v["live_sessions"] = json!(shown_live(&state));
     v["server"] = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "started_at": state.started_at(),
@@ -286,7 +304,7 @@ async fn stats(
 }
 
 async fn sessions(State(state): State<AppState>) -> ApiResult {
-    ok(json!({ "sessions": state.live_sessions() }))
+    ok(json!({ "sessions": shown_live(&state) }))
 }
 
 async fn folders(
@@ -467,8 +485,7 @@ async fn connections(
         let events = run(&state, ip, move |admin| admin.connection_events(&filter)).await?;
         return ok(json!({ "events": events }));
     }
-    let live: Vec<String> = state
-        .live_sessions()
+    let live: Vec<String> = shown_live(&state)
         .into_iter()
         .map(|s| s.session_id)
         .collect();
@@ -482,6 +499,217 @@ async fn connections(
         })
         .collect();
     ok(json!({ "sessions": sessions }))
+}
+
+async fn connection_summary(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let ip = caller(&state, &headers, peer);
+    let summary = run(&state, ip, |admin| admin.connection_summary()).await?;
+    ok(json!({
+        "live": shown_live(&state).len(),
+        "week": summary.week,
+        "month": summary.month,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ExportParams {
+    agent: Option<String>,
+    ip: Option<String>,
+}
+
+/// Sessions from the last [`EXPORT_DAYS`] days, as an `.xlsx` file.
+/// `agent` and `ip` narrow it the same way as the connection table. `days`
+/// is not accepted: the file is always the trailing year, capped at
+/// [`EXPORT_MAX`] rows.
+async fn export_connections(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<ExportParams>,
+) -> ApiResult {
+    let ip = caller(&state, &headers, peer);
+    let filter = LogFilter {
+        agent: non_empty(params.agent),
+        ip: non_empty(params.ip),
+        days: Some(EXPORT_DAYS),
+        limit: EXPORT_MAX + 1,
+        ..Default::default()
+    };
+    let live: HashSet<String> = shown_live(&state)
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    let (bytes, truncated) = run(&state, ip, move |admin| {
+        let mut sessions = admin.connections(&filter)?;
+        let truncated = sessions.len() > EXPORT_MAX;
+        if truncated {
+            sessions.truncate(EXPORT_MAX);
+        }
+        let bytes = connections_xlsx(&sessions, &live)
+            .map_err(|e| AppError::Internal(format!("cannot build workbook: {e}")))?;
+        Ok((bytes, truncated))
+    })
+    .await?;
+    let filename = format!("memhub-connections-{}.xlsx", Utc::now().format("%Y-%m-%d"));
+    Ok(xlsx_response(bytes, &filename, truncated))
+}
+
+fn xlsx_response(bytes: Vec<u8>, filename: &str, truncated: bool) -> Response {
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| {
+            HeaderValue::from_static("attachment; filename=\"memhub-connections.xlsx\"")
+        });
+    let mut res = bytes.into_response();
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    );
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if truncated {
+        headers.insert(
+            HeaderName::from_static("x-export-truncated"),
+            HeaderValue::from_static("1"),
+        );
+    }
+    res
+}
+
+const XLSX_COLUMNS: &[(&str, f64)] = &[
+    ("Session ID", 34.0),
+    ("Agent", 22.0),
+    ("IP", 16.0),
+    ("Transport", 12.0),
+    ("Client", 24.0),
+    ("Connected (UTC)", 21.0),
+    ("Identified (UTC)", 21.0),
+    ("Registered", 12.0),
+    ("Disconnected (UTC)", 21.0),
+    ("End reason", 16.0),
+    ("Duration (seconds)", 18.0),
+    ("Memory changes", 16.0),
+    ("Live", 10.0),
+];
+
+fn connections_xlsx(
+    sessions: &[ConnectionSession],
+    live: &HashSet<String>,
+) -> Result<Vec<u8>, XlsxError> {
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Connections")?;
+    let header = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xEEF0FF));
+    let seconds = Format::new().set_num_format("0.0");
+    for (col, (name, width)) in XLSX_COLUMNS.iter().enumerate() {
+        let col = u16::try_from(col).unwrap_or(0);
+        sheet.write_string_with_format(0, col, *name, &header)?;
+        sheet.set_column_width(col, *width)?;
+    }
+    let now = Utc::now();
+    for (i, session) in sessions.iter().enumerate() {
+        write_session_row(
+            sheet,
+            u32::try_from(i + 1).unwrap_or(u32::MAX),
+            session,
+            live.contains(&session.session_id),
+            now,
+            &seconds,
+        )?;
+    }
+    let last_col = u16::try_from(XLSX_COLUMNS.len() - 1).unwrap_or(0);
+    let last_row = u32::try_from(sessions.len()).unwrap_or(0);
+    sheet.autofilter(0, 0, last_row, last_col)?;
+    sheet.set_freeze_panes(1, 0)?;
+    workbook.save_to_buffer()
+}
+
+fn write_session_row(
+    sheet: &mut Worksheet,
+    row: u32,
+    session: &ConnectionSession,
+    live: bool,
+    now: DateTime<Utc>,
+    seconds: &Format,
+) -> Result<(), XlsxError> {
+    sheet.write_string(row, 0, &session.session_id)?;
+    write_some(sheet, row, 1, session.agent.as_deref())?;
+    sheet.write_string(row, 2, &session.ip)?;
+    sheet.write_string(row, 3, &session.transport)?;
+    write_some(sheet, row, 4, session.client.as_deref())?;
+    write_some(
+        sheet,
+        row,
+        5,
+        excel_time(session.connected_at.as_deref()).as_deref(),
+    )?;
+    write_some(
+        sheet,
+        row,
+        6,
+        excel_time(session.identified_at.as_deref()).as_deref(),
+    )?;
+    sheet.write_string(row, 7, if session.registered { "yes" } else { "no" })?;
+    write_some(
+        sheet,
+        row,
+        8,
+        excel_time(session.disconnected_at.as_deref()).as_deref(),
+    )?;
+    write_some(sheet, row, 9, session.reason.as_deref())?;
+    if let Some(duration) = session_duration(session, live, now) {
+        sheet.write_number_with_format(row, 10, duration, seconds)?;
+    }
+    sheet.write_number(row, 11, session.changes as f64)?;
+    sheet.write_string(row, 12, if live { "yes" } else { "no" })?;
+    Ok(())
+}
+
+fn write_some(
+    sheet: &mut Worksheet,
+    row: u32,
+    col: u16,
+    value: Option<&str>,
+) -> Result<(), XlsxError> {
+    if let Some(value) = value.filter(|v| !v.is_empty()) {
+        sheet.write_string(row, col, value)?;
+    }
+    Ok(())
+}
+
+fn excel_time(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    Some(match raw.parse::<DateTime<Utc>>() {
+        Ok(ts) => ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Err(_) => raw.to_string(),
+    })
+}
+
+fn session_duration(session: &ConnectionSession, live: bool, now: DateTime<Utc>) -> Option<f64> {
+    if let Some(duration) = session.duration_secs {
+        return Some(duration);
+    }
+    if !live {
+        return None;
+    }
+    let start = session
+        .connected_at
+        .as_deref()?
+        .parse::<DateTime<Utc>>()
+        .ok()?;
+    Some(((now.timestamp_millis() - start.timestamp_millis()) as f64 / 1000.0).max(0.0))
 }
 
 async fn updates(

@@ -40,6 +40,46 @@ function s(tag, attrs, ...children) {
   return el;
 }
 
+/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers. */
+function icon(name) {
+  const pen = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+  const paths = {
+    grid: [
+      s('rect', { x: 3, y: 3, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 14, y: 3, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 3, y: 14, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 14, y: 14, width: 7, height: 7, rx: 1.5 }),
+    ],
+    book: [
+      s('path', { d: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5z' }),
+      s('path', { d: 'M4 5.5A2.5 2.5 0 0 1 6.5 8H20' }),
+    ],
+    nodes: [
+      s('circle', { cx: 6, cy: 12, r: 2.2 }),
+      s('circle', { cx: 18, cy: 7, r: 2.2 }),
+      s('circle', { cx: 18, cy: 17, r: 2.2 }),
+      s('path', { d: 'M8 11.2l8-3.2M8 12.8l8 3.2' }),
+    ],
+    pencil: [
+      s('path', { d: 'M12 20h9' }),
+      s('path', { d: 'M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z' }),
+    ],
+    users: [
+      s('path', { d: 'M16 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2' }),
+      s('circle', { cx: 9.5, cy: 7, r: 3 }),
+      s('path', { d: 'M22 21v-2a4 4 0 0 0-3-3.87' }),
+      s('path', { d: 'M16 3.13a3 3 0 0 1 0 5.75' }),
+    ],
+    pulse: [s('path', { d: 'M3 12h4l2.2-6 3.6 12L15 12h6' })],
+    layers: [
+      s('path', { d: 'M12 3l9 5-9 5-9-5 9-5z' }),
+      s('path', { d: 'M3 12l9 5 9-5' }),
+      s('path', { d: 'M3 17l9 5 9-5' }),
+    ],
+  };
+  return s('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true', ...pen }, paths[name] || []);
+}
+
 function esc(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -369,25 +409,26 @@ function renderDashboard(st) {
   const identified = live.filter((x) => x.agent).length;
   const totalChanges = st.activity.reduce((n, d) => n + d.changes, 0);
   const totalConnections = st.activity.reduce((n, d) => n + d.connections, 0);
-  const card = (label, value, hint, href) => h('div', { class: 'panel card', on: { click: () => { location.hash = href; } } },
-    h('div', { class: 'label', text: label }), h('div', { class: 'value', text: value }), h('div', { class: 'hint', text: hint }));
+  const card = (glyph, tone, label, value, hint, href) => h('div', { class: 'panel card', on: { click: () => { location.hash = href; } } },
+    h('div', { class: 'card-top' }, h('div', { class: 'label', text: label }), h('span', { class: `card-ico ${tone}` }, icon(glyph))),
+    h('div', { class: 'value', text: value }), h('div', { class: 'hint', text: hint }));
 
   const cards = h('div', { class: 'cards' },
-    card('Memories', st.memories, `${st.repo_memories} repo · ${st.agent_memories} agent`, '#/memories'),
-    card('Memory folders', st.repo_folders + st.agent_folders, `${st.repo_folders} repos · ${st.agent_folders} agents`, '#/memories'),
-    card('Online now', live.length, `${identified} identified session${identified === 1 ? '' : 's'}`, '#/connections'),
-    card('Connections today', st.connections_today, `${st.active_agents_today} active agent${st.active_agents_today === 1 ? '' : 's'}`, '#/connections?view=events&days=1'),
-    card('Changes today', st.changes_today, `${totalChanges} in the last 14 days`, '#/updates?days=1'),
-    card('Registered', st.registered_agents, `agents · ${st.registered_repos} repos`, '#/memories'));
+    card('book', '', 'Memories', st.memories, `${st.repo_memories} repo · ${st.agent_memories} agent`, '#/memories'),
+    card('layers', 'violet', 'Memory folders', st.repo_folders + st.agent_folders, `${st.repo_folders} repos · ${st.agent_folders} agents`, '#/memories'),
+    card('pulse', 'green', 'Online now', live.length, `${identified} identified session${identified === 1 ? '' : 's'}`, '#/connections'),
+    card('nodes', 'blue', 'Connections today', st.connections_today, `${st.active_agents_today} active agent${st.active_agents_today === 1 ? '' : 's'}`, '#/connections?view=events&days=1'),
+    card('pencil', 'amber', 'Changes today', st.changes_today, `${totalChanges} in the last 14 days`, '#/updates?days=1'),
+    card('users', 'teal', 'Registered', st.registered_agents, `agents · ${st.registered_repos} repos`, '#/memories'));
 
-  const entry = (icon, title, text, extra, href) => h('a', { class: 'panel entry', href },
-    h('div', { class: 'big-ico', text: icon }),
+  const entry = (glyph, tone, title, text, extra, href) => h('a', { class: 'panel entry', href },
+    h('div', { class: `big-ico ${tone}` }, icon(glyph)),
     h('div', {}, h('h3', { text: title }), h('p', { text }), extra, h('span', { class: 'go', text: 'Open →' })));
   const kindChips = h('div', {}, st.kinds.slice(0, 6).map(([k, n]) => h('span', { class: 'chip', text: `${k} ${n}` })));
   const entries = h('div', { class: 'entries' },
-    entry('❒', 'Memories', 'Browse every repo and agent memory with its properties; add or delete memories and folders.', kindChips, '#/memories'),
-    entry('⇄', 'Connection log', `Who connected, from which IP, for how long. ${totalConnections} connections in 14 days.`, null, '#/connections'),
-    entry('✎', 'Update log', `Every memory change with its diff. ${totalChanges} changes in 14 days.`, null, '#/updates'));
+    entry('book', '', 'Memories', 'Browse every repo and agent memory with its properties; add or delete memories and folders.', kindChips, '#/memories'),
+    entry('nodes', 'teal', 'Connection log', `Who connected, from which IP, for how long. ${totalConnections} connections in 14 days.`, null, '#/connections'),
+    entry('pencil', 'amber', 'Update log', `Every memory change with its diff. ${totalChanges} changes in 14 days.`, null, '#/updates'));
 
   const chartPanel = h('div', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { text: 'Activity · last 14 days' }),
@@ -799,20 +840,89 @@ async function viewConnections(view, params) {
   const agents = h('datalist', { id: 'agent-options' });
   const body = h('div', { class: 'table-wrap' });
   const foot = h('div');
+  const dash = h('div', { class: 'conn-dash' });
   const seg = h('div', { class: 'seg' }, [['sessions', 'Sessions'], ['events', 'Raw events']].map(([v, label]) => h('button', {
     type: 'button', dataset: { v }, class: st.view === v ? 'on' : '', text: label,
     on: { click: () => { st.view = v; st.limit = PAGE; seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.v === v)); sync(); load(); } },
   })));
   const change = (k) => (v) => { st[k] = v; st.limit = PAGE; sync(); load(); };
+  const exportBtn = h('button', {
+    type: 'button', title: 'Download sessions from the last 365 days as an Excel file', text: 'Export Excel',
+    on: { click: () => exportConnections(exportBtn) },
+  });
 
-  setHead('Connection log', 'MCP connections and disconnections with agent name and client IP', [refreshButton(() => load())]);
-  view.replaceChildren(h('div', { class: 'panel' },
-    h('div', { class: 'filters' }, seg,
-      filterInput('Agent', st.agent, change('agent'), 'agent-options'), agents,
-      filterInput('IP address', st.ip, change('ip')),
-      rangeSelect(st.days, change('days')), h('span', { class: 'grow' }),
-      h('span', { class: 'muted', id: 'conn-count' })),
-    body, foot));
+  setHead('Connection log', 'MCP connections and disconnections with agent name and client IP', [exportBtn, refreshButton(() => { load(); loadSummary(); })]);
+  view.replaceChildren(
+    dash,
+    h('p', { class: 'muted conn-note', text: 'Last 7 days and last 30 days are rolling windows. A connection counts when it started, identified itself, or ended in that window. Export Excel downloads sessions from the last 365 days (UTC), using the agent and IP filters, up to 100,000 rows.' }),
+    h('div', { class: 'panel' },
+      h('div', { class: 'filters' }, seg,
+        filterInput('Agent', st.agent, change('agent'), 'agent-options'), agents,
+        filterInput('IP address', st.ip, change('ip')),
+        rangeSelect(st.days, change('days')), h('span', { class: 'grow' }),
+        h('span', { class: 'muted', id: 'conn-count' })),
+      body, foot));
+
+  function metric(n, label) {
+    return h('div', { class: 'metric' }, h('div', { class: 'n', text: Number(n || 0).toLocaleString() }), h('div', { class: 'l', text: label }));
+  }
+  function windowCard(title, w) {
+    return h('div', { class: 'panel' },
+      h('div', { class: 'label', text: title }),
+      h('div', { class: 'metrics' }, metric(w.connections, 'connections'), metric(w.ips, 'active IPs'), metric(w.agents, 'active agents')));
+  }
+  async function loadSummary() {
+    try {
+      const s = await api('/connections/summary');
+      const live = Number(s.live || 0);
+      dash.replaceChildren(
+        h('div', { class: 'panel conn-now' },
+          h('div', { class: 'label' }, h('span', { class: 'dot on' }), 'Right now'),
+          h('div', { class: 'n', text: live.toLocaleString() }),
+          h('div', { class: 'hint', text: live === 1 ? 'live connection' : 'live connections' })),
+        windowCard('Last 7 days', s.week || {}),
+        windowCard('Last 30 days', s.month || {}));
+    } catch (e) {
+      if (e.status !== 401) dash.replaceChildren(errorBox(e));
+    }
+  }
+  async function exportConnections(btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const label = btn.textContent;
+    btn.textContent = 'Exporting…';
+    try {
+      const headers = {};
+      if (app.token) headers.authorization = `Bearer ${app.token}`;
+      const res = await fetch('/api/admin/connections/export' + query({ agent: st.agent, ip: st.ip }), { headers });
+      if (res.status === 401) { showLogin('The admin token is missing or wrong.'); return; }
+      if (!res.ok) {
+        let message = `${res.status} ${res.statusText}`;
+        try { const data = await res.json(); if (data && data.message) message = data.message; } catch (_) { /* not JSON */ }
+        throw new Error(message);
+      }
+      const blob = await res.blob();
+      const match = /filename="([^"]+)"/.exec(res.headers.get('content-disposition') || '');
+      const name = (match && match[1]) || 'memhub-connections.xlsx';
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: name });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      const who = [st.agent && `agent ${st.agent}`, st.ip && `IP containing ${st.ip}`].filter(Boolean).join(', ');
+      const scope = who ? ` (${who})` : '';
+      toast(res.headers.get('x-export-truncated') === '1'
+        ? `Exported the most recent 100,000 sessions from the last 365 days${scope}.`
+        : `Exported connections from the last 365 days${scope}.`);
+    } catch (e) {
+      toast(e.message || 'Export failed', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+  every(10000, loadSummary);
 
   async function load() {
     body.replaceChildren(loading());
@@ -876,7 +986,7 @@ async function viewConnections(view, params) {
         h('td', { class: 'mono', title: r.session_id, text: shortId(r.session_id) })))));
   }
 
-  await load();
+  await Promise.all([load(), loadSummary()]);
 }
 
 async function viewUpdates(view, params) {

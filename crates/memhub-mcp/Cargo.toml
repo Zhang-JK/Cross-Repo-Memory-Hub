@@ -25,8 +25,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+rust_xlsxwriter = "0.96.0"
 
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+zip = { version = "7.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
+use chrono::{DateTime, Duration, Utc};
 use memhub_app::{
-    admin::{AdminNewMemory, LogFilter},
+    admin::{AdminNewMemory, LogFilter, WindowCounts},
     audit::LogQuery,
     store::{MemoryId, Scope},
     AddMemory, AgentSession, ConnInfo, Hub, HubConfig, ADMIN_ACTOR,
@@ -296,4 +297,177 @@ fn stats_summarize_memories_and_activity() {
     assert_eq!(stats.active_agents_today, 1);
     assert_eq!(stats.recent_updates.len(), 3);
     assert!(stats.recent_updates[0].get("diff").is_none());
+}
+
+fn append_audit(hub: &Hub, ts: DateTime<Utc>, event: &str, rest: &str) {
+    let path = hub.audit().file_for(ts.date_naive());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(
+        file,
+        r#"{{"ts":"{}","event":"{event}",{rest}}}"#,
+        ts.to_rfc3339()
+    )
+    .unwrap();
+}
+
+fn connect_pair(hub: &Hub, ts: DateTime<Utc>, id: &str, ip: &str, agent: Option<&str>) {
+    let agent_field = agent
+        .map(|a| format!(r#","agent":"{a}""#))
+        .unwrap_or_default();
+    append_audit(
+        hub,
+        ts,
+        "connect",
+        &format!(r#""session_id":"{id}","ip":"{ip}","transport":"http"{agent_field}"#),
+    );
+    append_audit(
+        hub,
+        ts + Duration::seconds(2),
+        "disconnect",
+        &format!(
+            r#""session_id":"{id}","ip":"{ip}","transport":"http"{agent_field},"reason":"client_closed","duration_secs":2.0"#
+        ),
+    );
+}
+
+#[test]
+fn connection_summary_uses_rolling_windows() {
+    let (_dir, hub) = hub();
+    let now = Utc::now();
+    connect_pair(
+        &hub,
+        now - Duration::days(20),
+        "month-only",
+        "10.9.1.1",
+        Some("month-bot"),
+    );
+    connect_pair(
+        &hub,
+        now - Duration::days(3),
+        "week-one",
+        "10.9.2.2",
+        Some("week-bot"),
+    );
+    connect_pair(&hub, now - Duration::days(3), "week-anon", "10.9.2.2", None);
+    connect_pair(
+        &hub,
+        now - Duration::days(3),
+        "week-admin",
+        "10.9.3.3",
+        Some(ADMIN_ACTOR),
+    );
+    connect_pair(
+        &hub,
+        now - Duration::days(400),
+        "ancient",
+        "10.8.8.8",
+        Some("ancient-bot"),
+    );
+    // Connected outside the month window, disconnected inside the week.
+    append_audit(
+        &hub,
+        now - Duration::days(40),
+        "connect",
+        r#""session_id":"spanning","ip":"10.9.4.4","transport":"http","agent":"span-bot""#,
+    );
+    append_audit(
+        &hub,
+        now - Duration::days(2),
+        "disconnect",
+        r#""session_id":"spanning","ip":"10.9.4.4","transport":"http","agent":"span-bot","reason":"client_closed","duration_secs":1.0"#,
+    );
+
+    let summary = hub.admin("127.0.0.1").connection_summary().unwrap();
+    assert_eq!(
+        summary.week,
+        WindowCounts {
+            connections: 4,
+            ips: 3,
+            agents: 2
+        },
+        "week counts the shared IP once and skips anonymous and (admin)"
+    );
+    assert_eq!(
+        summary.month,
+        WindowCounts {
+            connections: 5,
+            ips: 4,
+            agents: 3
+        }
+    );
+
+    let admin = hub.admin("127.0.0.1");
+    let year = admin
+        .connections(&LogFilter {
+            days: Some(365),
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(year.iter().all(|s| s.session_id != "ancient"));
+    assert!(year.iter().any(|s| s.session_id == "month-only"));
+    let all = admin.connections(&logs(100)).unwrap();
+    assert_eq!(all.len(), 6);
+    assert_eq!(all[0].session_id, "week-admin", "newest first");
+}
+
+#[test]
+fn selftest_traffic_is_hidden_from_the_management_logs() {
+    let (_dir, hub) = hub();
+    let probe = agent(&hub, "memhub-selftest", "10.9.9.9");
+    probe
+        .add_memory(AddMemory {
+            scope: Scope::Agent,
+            title: "probe".into(),
+            body: "b".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    probe.close("client_closed");
+    let real = agent(&hub, "feature-builder", "10.1.1.1");
+    real.add_memory(AddMemory {
+        scope: Scope::Agent,
+        title: "real".into(),
+        body: "b".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    real.close("client_closed");
+
+    let admin = hub.admin("127.0.0.1");
+    let sessions = admin.connections(&logs(50)).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].agent.as_deref(), Some("feature-builder"));
+
+    let events = admin.connection_events(&logs(50)).unwrap();
+    assert!(events.iter().all(|e| e["agent"] != "memhub-selftest"));
+    assert!(events.iter().any(|e| e["agent"] == "feature-builder"));
+
+    let updates = admin.updates(&logs(50)).unwrap();
+    assert!(updates.iter().all(|u| u["agent"] != "memhub-selftest"));
+    assert_eq!(updates.len(), 1);
+
+    let summary = admin.connection_summary().unwrap();
+    assert_eq!(
+        summary.week,
+        WindowCounts {
+            connections: 1,
+            ips: 1,
+            agents: 1
+        }
+    );
+
+    let stats = admin.stats().unwrap();
+    assert_eq!(stats.connections_today, 1);
+    assert_eq!(stats.changes_today, 1);
+    assert_eq!(stats.active_agents_today, 1);
+    assert_eq!(stats.top_agents, vec![("feature-builder".to_string(), 1)]);
+    assert!(stats
+        .recent_updates
+        .iter()
+        .all(|u| u["agent"] != "memhub-selftest"));
 }

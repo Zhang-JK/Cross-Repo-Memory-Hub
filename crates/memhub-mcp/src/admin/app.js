@@ -40,6 +40,46 @@ function s(tag, attrs, ...children) {
   return el;
 }
 
+/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers. */
+function icon(name) {
+  const pen = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+  const paths = {
+    grid: [
+      s('rect', { x: 3, y: 3, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 14, y: 3, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 3, y: 14, width: 7, height: 7, rx: 1.5 }),
+      s('rect', { x: 14, y: 14, width: 7, height: 7, rx: 1.5 }),
+    ],
+    book: [
+      s('path', { d: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5z' }),
+      s('path', { d: 'M4 5.5A2.5 2.5 0 0 1 6.5 8H20' }),
+    ],
+    nodes: [
+      s('circle', { cx: 6, cy: 12, r: 2.2 }),
+      s('circle', { cx: 18, cy: 7, r: 2.2 }),
+      s('circle', { cx: 18, cy: 17, r: 2.2 }),
+      s('path', { d: 'M8 11.2l8-3.2M8 12.8l8 3.2' }),
+    ],
+    pencil: [
+      s('path', { d: 'M12 20h9' }),
+      s('path', { d: 'M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z' }),
+    ],
+    users: [
+      s('path', { d: 'M16 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2' }),
+      s('circle', { cx: 9.5, cy: 7, r: 3 }),
+      s('path', { d: 'M22 21v-2a4 4 0 0 0-3-3.87' }),
+      s('path', { d: 'M16 3.13a3 3 0 0 1 0 5.75' }),
+    ],
+    pulse: [s('path', { d: 'M3 12h4l2.2-6 3.6 12L15 12h6' })],
+    layers: [
+      s('path', { d: 'M12 3l9 5-9 5-9-5 9-5z' }),
+      s('path', { d: 'M3 12l9 5 9-5' }),
+      s('path', { d: 'M3 17l9 5 9-5' }),
+    ],
+  };
+  return s('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true', ...pen }, paths[name] || []);
+}
+
 function esc(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -369,25 +409,26 @@ function renderDashboard(st) {
   const identified = live.filter((x) => x.agent).length;
   const totalChanges = st.activity.reduce((n, d) => n + d.changes, 0);
   const totalConnections = st.activity.reduce((n, d) => n + d.connections, 0);
-  const card = (label, value, hint, href) => h('div', { class: 'panel card', on: { click: () => { location.hash = href; } } },
-    h('div', { class: 'label', text: label }), h('div', { class: 'value', text: value }), h('div', { class: 'hint', text: hint }));
+  const card = (glyph, tone, label, value, hint, href) => h('div', { class: 'panel card', on: { click: () => { location.hash = href; } } },
+    h('div', { class: 'card-top' }, h('div', { class: 'label', text: label }), h('span', { class: `card-ico ${tone}` }, icon(glyph))),
+    h('div', { class: 'value', text: value }), h('div', { class: 'hint', text: hint }));
 
   const cards = h('div', { class: 'cards' },
-    card('Memories', st.memories, `${st.repo_memories} repo · ${st.agent_memories} agent`, '#/memories'),
-    card('Memory folders', st.repo_folders + st.agent_folders, `${st.repo_folders} repos · ${st.agent_folders} agents`, '#/memories'),
-    card('Online now', live.length, `${identified} identified session${identified === 1 ? '' : 's'}`, '#/connections'),
-    card('Connections today', st.connections_today, `${st.active_agents_today} active agent${st.active_agents_today === 1 ? '' : 's'}`, '#/connections?view=events&days=1'),
-    card('Changes today', st.changes_today, `${totalChanges} in the last 14 days`, '#/updates?days=1'),
-    card('Registered', st.registered_agents, `agents · ${st.registered_repos} repos`, '#/memories'));
+    card('book', '', 'Memories', st.memories, `${st.repo_memories} repo · ${st.agent_memories} agent`, '#/memories'),
+    card('layers', 'violet', 'Memory folders', st.repo_folders + st.agent_folders, `${st.repo_folders} repos · ${st.agent_folders} agents`, '#/memories'),
+    card('pulse', 'green', 'Online now', live.length, `${identified} identified session${identified === 1 ? '' : 's'}`, '#/connections'),
+    card('nodes', 'blue', 'Connections today', st.connections_today, `${st.active_agents_today} active agent${st.active_agents_today === 1 ? '' : 's'}`, '#/connections?view=events&days=1'),
+    card('pencil', 'amber', 'Changes today', st.changes_today, `${totalChanges} in the last 14 days`, '#/updates?days=1'),
+    card('users', 'teal', 'Registered', st.registered_agents, `agents · ${st.registered_repos} repos`, '#/memories'));
 
-  const entry = (icon, title, text, extra, href) => h('a', { class: 'panel entry', href },
-    h('div', { class: 'big-ico', text: icon }),
+  const entry = (glyph, tone, title, text, extra, href) => h('a', { class: 'panel entry', href },
+    h('div', { class: `big-ico ${tone}` }, icon(glyph)),
     h('div', {}, h('h3', { text: title }), h('p', { text }), extra, h('span', { class: 'go', text: 'Open →' })));
   const kindChips = h('div', {}, st.kinds.slice(0, 6).map(([k, n]) => h('span', { class: 'chip', text: `${k} ${n}` })));
   const entries = h('div', { class: 'entries' },
-    entry('❒', 'Memories', 'Browse every repo and agent memory with its properties; add or delete memories and folders.', kindChips, '#/memories'),
-    entry('⇄', 'Connection log', `Who connected, from which IP, for how long. ${totalConnections} connections in 14 days.`, null, '#/connections'),
-    entry('✎', 'Update log', `Every memory change with its diff. ${totalChanges} changes in 14 days.`, null, '#/updates'));
+    entry('book', '', 'Memories', 'Browse every repo and agent memory with its properties; add or delete memories and folders.', kindChips, '#/memories'),
+    entry('nodes', 'teal', 'Connection log', `Who connected, from which IP, for how long. ${totalConnections} connections in 14 days.`, null, '#/connections'),
+    entry('pencil', 'amber', 'Update log', `Every memory change with its diff. ${totalChanges} changes in 14 days.`, null, '#/updates'));
 
   const chartPanel = h('div', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('h2', { text: 'Activity · last 14 days' }),

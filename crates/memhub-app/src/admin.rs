@@ -31,6 +31,12 @@ use crate::{
 /// never collide with a real agent.
 pub const ADMIN_ACTOR: &str = "(admin)";
 
+/// Agent name used by `scripts/test-mcp.sh`. The script is an on-demand
+/// probe (there is no background watchdog): it connects, exercises every
+/// tool, then deletes what it wrote. The management logs leave it out so a
+/// demo is not filled with that traffic.
+pub const SELFTEST_AGENT: &str = "memhub-selftest";
+
 const CONNECTION_EVENTS: [&str; 4] = ["connect", "disconnect", "agent_login", "agent_registered"];
 const UPDATE_EVENTS: [&str; 3] = ["memory_changed", "folder_created", "folder_deleted"];
 const ACTIVITY_DAYS: i64 = 14;
@@ -478,6 +484,7 @@ impl Admin {
                 _ => {}
             }
         }
+        sessions.retain(|s| s.agent.as_deref().is_none_or(|a| !is_internal_agent(a)));
         Ok(sessions)
     }
 
@@ -539,10 +546,11 @@ impl Admin {
                 r
             })
             .filter(|r| {
-                filter
-                    .agent
-                    .as_ref()
-                    .is_none_or(|a| str_field(r, "agent") == a)
+                !is_internal_agent(str_field(r, "agent"))
+                    && filter
+                        .agent
+                        .as_ref()
+                        .is_none_or(|a| str_field(r, "agent") == a)
                     && filter
                         .ip
                         .as_ref()
@@ -562,7 +570,7 @@ impl Admin {
             .into_iter()
             .filter(|r| {
                 let event = str_field(r, "event");
-                if !UPDATE_EVENTS.contains(&event) {
+                if !UPDATE_EVENTS.contains(&event) || is_internal_agent(str_field(r, "agent")) {
                     return false;
                 }
                 let action = if event == "memory_changed" {
@@ -636,7 +644,19 @@ impl Admin {
         }
         let mut agent_changes: BTreeMap<String, usize> = BTreeMap::new();
         let mut recent = Vec::new();
-        for record in self.read_log(Some(ACTIVITY_DAYS as u32))? {
+        let records = self.read_log(Some(ACTIVITY_DAYS as u32))?;
+        // `connect` is written before the agent identifies itself, so the name
+        // is taken from a later record of the same session.
+        let session_agents: HashMap<String, String> = records
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get("session_id")?.as_str()?.to_string(),
+                    r.get("agent")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        for record in records {
             let Some(day) = record
                 .get("ts")
                 .and_then(Value::as_str)
@@ -649,7 +669,19 @@ impl Admin {
                 continue;
             };
             let event = str_field(&record, "event");
-            let agent = record.get("agent").and_then(Value::as_str);
+            let named = record
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    session_agents
+                        .get(str_field(&record, "session_id"))
+                        .cloned()
+                });
+            if named.as_deref().is_some_and(is_internal_agent) {
+                continue;
+            }
+            let agent = named.as_deref();
             match event {
                 "connect" => activity.connections += 1,
                 "memory_changed" => {
@@ -696,6 +728,10 @@ impl Admin {
 
 fn str_field<'a>(record: &'a Value, key: &str) -> &'a str {
     record.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+pub fn is_internal_agent(name: &str) -> bool {
+    name == SELFTEST_AGENT
 }
 
 /// True when the session connected, identified, or disconnected at or after `start`.

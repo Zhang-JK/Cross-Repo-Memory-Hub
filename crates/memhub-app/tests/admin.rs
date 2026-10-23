@@ -414,3 +414,60 @@ fn connection_summary_uses_rolling_windows() {
     assert_eq!(all.len(), 6);
     assert_eq!(all[0].session_id, "week-admin", "newest first");
 }
+
+#[test]
+fn selftest_traffic_is_hidden_from_the_management_logs() {
+    let (_dir, hub) = hub();
+    let probe = agent(&hub, "memhub-selftest", "10.9.9.9");
+    probe
+        .add_memory(AddMemory {
+            scope: Scope::Agent,
+            title: "probe".into(),
+            body: "b".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    probe.close("client_closed");
+    let real = agent(&hub, "feature-builder", "10.1.1.1");
+    real.add_memory(AddMemory {
+        scope: Scope::Agent,
+        title: "real".into(),
+        body: "b".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    real.close("client_closed");
+
+    let admin = hub.admin("127.0.0.1");
+    let sessions = admin.connections(&logs(50)).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].agent.as_deref(), Some("feature-builder"));
+
+    let events = admin.connection_events(&logs(50)).unwrap();
+    assert!(events.iter().all(|e| e["agent"] != "memhub-selftest"));
+    assert!(events.iter().any(|e| e["agent"] == "feature-builder"));
+
+    let updates = admin.updates(&logs(50)).unwrap();
+    assert!(updates.iter().all(|u| u["agent"] != "memhub-selftest"));
+    assert_eq!(updates.len(), 1);
+
+    let summary = admin.connection_summary().unwrap();
+    assert_eq!(
+        summary.week,
+        WindowCounts {
+            connections: 1,
+            ips: 1,
+            agents: 1
+        }
+    );
+
+    let stats = admin.stats().unwrap();
+    assert_eq!(stats.connections_today, 1);
+    assert_eq!(stats.changes_today, 1);
+    assert_eq!(stats.active_agents_today, 1);
+    assert_eq!(stats.top_agents, vec![("feature-builder".to_string(), 1)]);
+    assert!(stats
+        .recent_updates
+        .iter()
+        .all(|u| u["agent"] != "memhub-selftest"));
+}

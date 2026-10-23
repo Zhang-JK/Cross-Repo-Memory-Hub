@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use chrono::{DateTime, Utc};
 use memhub_audit::{Actor, AuditEvent, MemoryAction};
 use memhub_store::{
-    validate_label, validate_name, Change, Filter, GroupKey, Memory, MemoryId, MemoryMeta,
-    MemoryPatch, NewMemory, Scope, SearchHit, SearchQuery,
+    normalize_folder, validate_label, validate_name, Change, Filter, FolderInfo, GroupKey, Memory,
+    MemoryId, MemoryMeta, MemoryPatch, NewMemory, Scope, SearchHit, SearchQuery, StoreError,
 };
 use serde::Serialize;
 
@@ -64,12 +64,49 @@ pub struct AddMemory {
     /// Required for `Scope::Repo`; ignored for `Scope::Agent` (the caller's
     /// own space is always used).
     pub repo: Option<String>,
+    /// Folder below the repo / agent space, e.g. `modules/auth`. Empty for
+    /// the root folder; missing folders are created.
+    pub folder: String,
     pub title: String,
     pub kind: Option<String>,
     pub tags: Vec<String>,
     pub groups: Vec<String>,
     pub body: String,
     pub slug: Option<String>,
+}
+
+/// One owner's memory tree (or a subtree of it), as returned by
+/// [`AgentSession::browse`].
+#[derive(Debug, Clone, Serialize)]
+pub struct Browse {
+    pub scope: Scope,
+    pub owner: String,
+    /// Root of the returned subtree; empty for the whole tree.
+    pub folder: String,
+    /// Repo description or agent role from the registry.
+    pub owner_description: String,
+    /// Folders of the subtree, parents before children, starting with
+    /// `folder` itself.
+    pub folders: Vec<FolderInfo>,
+    /// Memories of the subtree, ordered by folder, overviews first, then slug.
+    pub memories: Vec<MemoryMeta>,
+}
+
+impl Browse {
+    pub fn root(&self) -> Option<&FolderInfo> {
+        self.folders.iter().find(|f| f.path == self.folder)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderResult {
+    pub scope: Scope,
+    pub owner: String,
+    pub folder: String,
+    /// The folder did not exist before.
+    pub created: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// One agent connection. Identity is established with [`connect`]; every
@@ -260,7 +297,9 @@ impl AgentSession {
         let candidate = RepoProfile {
             id: repo.to_string(),
             description: description.unwrap_or_default().trim().to_string(),
-            location: location.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()),
+            location: location
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty()),
             created_by: agent.clone(),
             created_at: Utc::now(),
         };
@@ -374,25 +413,183 @@ impl AgentSession {
         Ok(self.hub.store().group_by(filter, key)?)
     }
 
+    /// The folder tree of a repo or agent space with folder descriptions,
+    /// counts and the memories in it. `owner` defaults to the caller's own
+    /// agent space for `Scope::Agent`.
+    pub fn browse(&self, scope: Scope, owner: Option<&str>, folder: &str) -> Result<Browse> {
+        let me = self.require_agent()?.to_string();
+        let owner = self.resolve_owner(scope, owner, &me, false)?;
+        let folder = normalize_folder(folder)?;
+        let registry = self.hub.registry();
+        let owner_description = match scope {
+            Scope::Repo => registry.repo(&owner)?.map(|r| r.description),
+            Scope::Agent => registry.agent(&owner)?.map(|a| a.role),
+        };
+        let store = self.hub.store();
+        let mut folders = store.folders(scope, &owner)?;
+        if owner_description.is_none() && folders.is_empty() {
+            return Err(match scope {
+                Scope::Repo => AppError::UnknownRepo(owner),
+                Scope::Agent => AppError::UnknownAgent(owner),
+            });
+        }
+        if folders.is_empty() {
+            folders.push(FolderInfo {
+                path: String::new(),
+                description: None,
+                memory_count: 0,
+                total_count: 0,
+                updated_at: None,
+            });
+        }
+        folders.retain(|f| memhub_store::is_under(&f.path, &folder));
+        if folders.is_empty() {
+            return Err(StoreError::NotFound(format!("folder {scope}/{owner}/{folder}")).into());
+        }
+        let mut memories: Vec<MemoryMeta> = store
+            .list(&Filter {
+                scope: Some(scope),
+                owner: Some(owner.clone()),
+                folder: Some(folder.clone()),
+                ..Default::default()
+            })?
+            .into_iter()
+            .map(|m| m.meta)
+            .collect();
+        memories.sort_by(|a, b| {
+            a.folder()
+                .split('/')
+                .cmp(b.folder().split('/'))
+                .then_with(|| {
+                    let not_overview = |m: &MemoryMeta| !m.kind.eq_ignore_ascii_case("overview");
+                    not_overview(a).cmp(&not_overview(b))
+                })
+                .then_with(|| a.id.slug.cmp(&b.id.slug))
+        });
+        Ok(Browse {
+            scope,
+            owner,
+            folder,
+            owner_description: owner_description.unwrap_or_default(),
+            folders,
+            memories,
+        })
+    }
+
     // ---- memory: writes ---------------------------------------------------
+
+    /// Owner of a write or browse target: the caller for agent scope (unless
+    /// another agent is named and `own_only` is false), the named repo for
+    /// repo scope.
+    fn resolve_owner(
+        &self,
+        scope: Scope,
+        owner: Option<&str>,
+        me: &str,
+        own_only: bool,
+    ) -> Result<String> {
+        let owner = owner.map(str::trim).filter(|o| !o.is_empty());
+        Ok(match scope {
+            Scope::Agent if own_only => me.to_string(),
+            Scope::Agent => owner.unwrap_or(me).to_string(),
+            Scope::Repo => owner
+                .ok_or_else(|| {
+                    AppError::Invalid("'repo' is required for repo-scoped memory".into())
+                })?
+                .to_string(),
+        })
+    }
+
+    /// Creates a folder in a repo or the caller's agent space, or updates
+    /// the description of an existing one.
+    pub fn create_folder(
+        &self,
+        scope: Scope,
+        repo: Option<&str>,
+        folder: &str,
+        description: Option<&str>,
+    ) -> Result<FolderResult> {
+        let me = self.require_agent()?.to_string();
+        let owner = self.resolve_owner(scope, repo, &me, true)?;
+        self.check_write(scope, &owner)?;
+        let folder = normalize_folder(folder)?;
+        let store = self.hub.store();
+        let before = store.folder_description(scope, &owner, &folder)?;
+        let missing = self.missing_folders(scope, &owner, &folder)?;
+        let created = store.create_folder(scope, &owner, &folder, description)?;
+        let after = store.folder_description(scope, &owner, &folder)?;
+        for path in missing {
+            self.hub.audit().record(AuditEvent::FolderCreated {
+                actor: self.actor(),
+                scope: scope.to_string(),
+                owner: owner.clone(),
+                description: if path == folder { after.clone() } else { None },
+                folder: path,
+            });
+        }
+        if !created && before != after {
+            self.hub.audit().record(AuditEvent::FolderDescribed {
+                actor: self.actor(),
+                scope: scope.to_string(),
+                owner: owner.clone(),
+                folder: folder.clone(),
+                description: after.clone().unwrap_or_default(),
+            });
+        }
+        Ok(FolderResult {
+            scope,
+            owner,
+            folder,
+            created,
+            description: after,
+        })
+    }
+
+    /// Moves a memory to another folder of the same repo / agent space,
+    /// optionally renaming its slug.
+    pub fn move_memory(
+        &self,
+        id: &MemoryId,
+        folder: &str,
+        slug: Option<&str>,
+        expected_version: Option<u64>,
+    ) -> Result<Change> {
+        let me = self.require_agent()?.to_string();
+        self.check_write(id.scope, &id.owner)?;
+        let change = self
+            .hub
+            .store()
+            .move_memory(id, folder, slug, expected_version, &me)?;
+        if !change.is_noop() {
+            self.audit_change(
+                MemoryAction::Move,
+                &change.after,
+                Some(change.before.meta.version),
+                Some(change.after.meta.version),
+                change
+                    .changed_fields
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect(),
+                None,
+                None,
+                Some(change.before.meta.id.to_string()),
+            );
+        }
+        Ok(change)
+    }
 
     pub fn add_memory(&self, input: AddMemory) -> Result<Memory> {
         let me = self.require_agent()?.to_string();
-        let owner = match input.scope {
-            Scope::Agent => me.clone(),
-            Scope::Repo => input
-                .repo
-                .as_deref()
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-                .ok_or_else(|| AppError::Invalid("'repo' is required for repo-scoped memory".into()))?
-                .to_string(),
-        };
+        let owner = self.resolve_owner(input.scope, input.repo.as_deref(), &me, true)?;
         self.check_write(input.scope, &owner)?;
+        let folder = normalize_folder(&input.folder)?;
+        let new_folders = self.missing_folders(input.scope, &owner, &folder)?;
 
         let memory = self.hub.store().add(NewMemory {
             scope: input.scope,
-            owner,
+            owner: owner.clone(),
+            folder,
             title: input.title,
             kind: input.kind,
             tags: input.tags,
@@ -401,6 +598,15 @@ impl AgentSession {
             author: me,
             slug: input.slug,
         })?;
+        for folder in new_folders {
+            self.hub.audit().record(AuditEvent::FolderCreated {
+                actor: self.actor(),
+                scope: input.scope.to_string(),
+                owner: owner.clone(),
+                folder,
+                description: None,
+            });
+        }
         self.audit_change(
             MemoryAction::Add,
             &memory,
@@ -409,6 +615,7 @@ impl AgentSession {
             Vec::new(),
             None,
             unified_diff("", &memory.body),
+            None,
         );
         Ok(memory)
     }
@@ -423,9 +630,14 @@ impl AgentSession {
                 &change.after,
                 Some(change.before.meta.version),
                 Some(change.after.meta.version),
-                change.changed_fields.iter().map(|f| f.to_string()).collect(),
+                change
+                    .changed_fields
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect(),
                 None,
                 unified_diff(&change.before.body, &change.after.body),
+                None,
             );
         }
         Ok(change)
@@ -443,6 +655,7 @@ impl AgentSession {
             Vec::new(),
             None,
             unified_diff(&memory.body, ""),
+            None,
         );
         Ok(memory)
     }
@@ -472,9 +685,28 @@ impl AgentSession {
                 vec!["groups".into()],
                 Some(group.trim().to_string()),
                 None,
+                None,
             );
         }
         Ok(changes.into_iter().map(|c| c.after.meta.id).collect())
+    }
+
+    /// Subfolders on the way to `folder` (inclusive) that do not exist yet,
+    /// parents first.
+    pub fn missing_folders(&self, scope: Scope, owner: &str, folder: &str) -> Result<Vec<String>> {
+        let store = self.hub.store();
+        let mut out = Vec::new();
+        let mut path = String::new();
+        for segment in folder.split('/').filter(|s| !s.is_empty()) {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(segment);
+            if !store.folder_exists(scope, owner, &path)? {
+                out.push(path.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// Agent memory: only its owner may write. Repo memory: any agent that
@@ -512,6 +744,7 @@ impl AgentSession {
         changed_fields: Vec<String>,
         group: Option<String>,
         diff: Option<String>,
+        previous_id: Option<String>,
     ) {
         self.hub.audit().record(AuditEvent::MemoryChanged {
             actor: self.actor(),
@@ -523,6 +756,7 @@ impl AgentSession {
             changed_fields,
             group,
             diff,
+            previous_id,
         });
     }
 }

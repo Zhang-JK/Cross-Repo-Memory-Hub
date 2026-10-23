@@ -34,6 +34,8 @@ pub enum MemoryAction {
     Delete,
     GroupAdd,
     GroupRemove,
+    /// Moved to another folder and/or renamed; `memory_id` is the new id.
+    Move,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,13 +92,30 @@ pub enum AuditEvent {
         /// Unified diff of the body (truncated for very large edits).
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        /// For `move`: the id before the move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_id: Option<String>,
     },
-    /// A memory folder (`<scope>/<owner>`) was created.
+    /// A memory folder was created: the owner's root (`<scope>/<owner>`,
+    /// empty `folder`) or a subfolder (`<scope>/<owner>/<folder>`).
     FolderCreated {
         #[serde(flatten)]
         actor: Actor,
         scope: String,
         owner: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        folder: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// The description of an existing subfolder was set or cleared.
+    FolderDescribed {
+        #[serde(flatten)]
+        actor: Actor,
+        scope: String,
+        owner: String,
+        folder: String,
+        description: String,
     },
     /// A memory folder and every memory in it were moved to the trash.
     FolderDeleted {
@@ -104,6 +123,8 @@ pub enum AuditEvent {
         actor: Actor,
         scope: String,
         owner: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        folder: String,
         memory_count: usize,
     },
 }
@@ -119,6 +140,7 @@ impl AuditEvent {
             AuditEvent::RepoLeft { .. } => "repo_left",
             AuditEvent::MemoryChanged { .. } => "memory_changed",
             AuditEvent::FolderCreated { .. } => "folder_created",
+            AuditEvent::FolderDescribed { .. } => "folder_described",
             AuditEvent::FolderDeleted { .. } => "folder_deleted",
         }
     }
@@ -202,7 +224,8 @@ impl AuditLog {
     }
 
     pub fn file_for(&self, date: NaiveDate) -> PathBuf {
-        self.dir.join(format!("audit-{}.jsonl", date.format("%Y-%m-%d")))
+        self.dir
+            .join(format!("audit-{}.jsonl", date.format("%Y-%m-%d")))
     }
 
     /// Reads matching records, oldest first. Unparseable lines are skipped.
@@ -221,7 +244,9 @@ impl AuditLog {
             files.retain(|f| *f >= since_file);
         }
 
-        let field = |v: &serde_json::Value, key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+        let field = |v: &serde_json::Value, key: &str| {
+            v.get(key).and_then(|x| x.as_str()).map(str::to_owned)
+        };
         let mut out = Vec::new();
         for path in files {
             for line in BufReader::new(File::open(&path)?).lines() {
@@ -229,7 +254,8 @@ impl AuditLog {
                     continue;
                 };
                 let matches = |key: &str, want: &Option<String>| {
-                    want.as_ref().is_none_or(|w| field(&value, key).as_deref() == Some(w))
+                    want.as_ref()
+                        .is_none_or(|w| field(&value, key).as_deref() == Some(w))
                 };
                 if !matches("agent", &query.agent)
                     || !matches("event", &query.event)
@@ -286,6 +312,7 @@ mod tests {
             changed_fields: vec!["body".into()],
             group: None,
             diff: Some("-a\n+b\n".into()),
+            previous_id: None,
         });
 
         let all = log.read(&LogQuery::default()).unwrap();

@@ -127,6 +127,269 @@ fn client(state: &Arc<HttpState>, ip: &str) -> Client {
     }
 }
 
+impl Client {
+    /// Calls a tool and returns its text content.
+    async fn tool_text(&mut self, name: &str, args: Value) -> String {
+        self.next_id += 1;
+        let (_, body) = self
+            .send(
+                json!({ "jsonrpc": "2.0", "id": self.next_id, "method": "tools/call",
+                        "params": { "name": name, "arguments": args } }),
+                &[],
+            )
+            .await;
+        let result = body.unwrap()["result"].clone();
+        assert_eq!(result["isError"], false, "{result}");
+        result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+}
+
+#[tokio::test]
+async fn folder_hierarchy_workflow() {
+    let (_dir, hub, state) = setup(Duration::from_secs(600));
+    let mut a = client(&state, "10.2.0.1");
+    let (_, init) = a
+        .initialize(&[("x-memhub-agent", "doc-bot"), ("x-memhub-role", "docs")])
+        .await;
+    let instructions = init.unwrap()["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for needle in [
+        "browse_memory",
+        "modules/<name>/",
+        "pitfalls/",
+        "move_memory",
+        "overview",
+    ] {
+        assert!(
+            instructions.contains(needle),
+            "instructions mention {needle}"
+        );
+    }
+
+    let (err, join) = a
+        .tool(
+            "add_repo",
+            json!({ "repo": "shop", "description": "Online shop" }),
+        )
+        .await;
+    assert!(!err, "{join}");
+    assert!(join["next_step"].as_str().unwrap().contains("overview"));
+
+    // overview at the root, everything else in folders
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "title": "Shop overview", "kind": "overview",
+                    "body": "Start here." }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    assert!(added.get("hints").is_none(), "{added}");
+
+    let (err, folder) = a
+        .tool(
+            "create_folder",
+            json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
+                    "description": "Cart, payment and order placement" }),
+        )
+        .await;
+    assert!(!err, "{folder}");
+    assert_eq!(folder["created"], true);
+
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
+                    "title": "Payment retries", "kind": "implementation", "body": "Retries 3x." }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    assert_eq!(
+        added["created"]["id"],
+        "repo/shop/modules/checkout/payment-retries"
+    );
+    assert_eq!(added["created"]["folder"], "modules/checkout");
+    assert!(added.get("hints").is_none(), "{added}");
+
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": "pitfalls",
+                    "title": "Double charge", "kind": "pitfall", "body": "Idempotency keys!" }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    let hints = added["hints"].to_string();
+    assert!(hints.contains("Created folder 'pitfalls'"), "{hints}");
+
+    // dumping into the root is flagged once it gets crowded
+    let mut last = Value::Null;
+    for i in 0..4 {
+        let (err, added) = a
+            .tool(
+                "add_memory",
+                json!({ "scope": "repo", "repo": "shop", "title": format!("Loose note {i}"),
+                        "kind": "pitfall", "body": "x" }),
+            )
+            .await;
+        assert!(!err, "{added}");
+        last = added;
+    }
+    let hints = last["hints"].to_string();
+    assert!(hints.contains("Keep only the overview there"), "{hints}");
+    assert!(hints.contains("pitfalls/"), "{hints}");
+    assert!(hints.contains("move_memory"), "{hints}");
+
+    let (err, moved) = a
+        .tool(
+            "move_memory",
+            json!({ "id": "repo/shop/loose-note-0", "folder": "pitfalls", "expected_version": 1 }),
+        )
+        .await;
+    assert!(!err, "{moved}");
+    assert_eq!(moved["moved"]["id"], "repo/shop/pitfalls/loose-note-0");
+    assert_eq!(moved["previous_id"], "repo/shop/loose-note-0");
+    assert_eq!(moved["moved"]["version"], 2);
+
+    // the tree is the newcomer's map
+    let tree = a
+        .tool_text("browse_memory", json!({ "scope": "repo", "owner": "shop" }))
+        .await;
+    assert!(
+        tree.starts_with("repo/shop: Online shop (7 memories)\n"),
+        "{tree}"
+    );
+    assert!(tree.contains("repo/shop: Online shop (7 memories)\n  shop-overview  Shop overview [overview]\n  loose-note-1"), "{tree}");
+    assert!(tree.contains("\n  modules/ (1)\n    checkout/  Cart, payment and order placement (1)\n      payment-retries  Payment retries [implementation]\n"), "{tree}");
+    assert!(tree.contains("\n  pitfalls/ (2)\n"), "{tree}");
+    let outline = a
+        .tool_text(
+            "browse_memory",
+            json!({ "owner": "shop", "folder": "modules", "memories": false }),
+        )
+        .await;
+    assert_eq!(
+        outline,
+        "repo/shop/modules (1 memory)\n  checkout/  Cart, payment and order placement (1)\n"
+    );
+    let (err, msg) = a
+        .tool(
+            "browse_memory",
+            json!({ "owner": "shop", "folder": "nope" }),
+        )
+        .await;
+    assert!(err && msg.as_str().unwrap().contains("not_found"), "{msg}");
+
+    // folder filters and grouping
+    let (_, listed) = a
+        .tool(
+            "list_memories",
+            json!({ "scope": "repo", "owner": "shop", "folder": "pitfalls" }),
+        )
+        .await;
+    assert_eq!(listed["count"], 2);
+    let (_, hits) = a
+        .tool("search_memory", json!({ "query": "checkout" }))
+        .await;
+    assert_eq!(
+        hits["hits"][0]["id"],
+        "repo/shop/modules/checkout/payment-retries"
+    );
+    let (_, grouped) = a
+        .tool(
+            "list_memories",
+            json!({ "owner": "shop", "group_by": "folder" }),
+        )
+        .await;
+    assert_eq!(
+        grouped["groups"]["repo/shop/pitfalls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // agent space folders; other agents' spaces are read-only
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "agent", "folder": "task-logs/2026", "title": "Docs pass",
+                    "kind": "task-log", "body": "done" }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    assert_eq!(
+        added["created"]["id"],
+        "agent/doc-bot/task-logs/2026/docs-pass"
+    );
+    let mine = a
+        .tool_text("browse_memory", json!({ "scope": "agent" }))
+        .await;
+    assert!(mine.starts_with("agent/doc-bot: docs (1 memory)"), "{mine}");
+
+    let mut b = client(&state, "10.2.0.2");
+    b.initialize(&[("x-memhub-agent", "other-bot"), ("x-memhub-role", "qa")])
+        .await;
+    let (err, msg) = b
+        .tool(
+            "move_memory",
+            json!({ "id": "repo/shop/pitfalls/double-charge", "folder": "" }),
+        )
+        .await;
+    assert!(err && msg.as_str().unwrap().contains("add_repo"), "{msg}");
+    let (err, msg) = b
+        .tool(
+            "create_folder",
+            json!({ "scope": "repo", "repo": "shop", "folder": "x" }),
+        )
+        .await;
+    assert!(err && msg.as_str().unwrap().contains("forbidden"), "{msg}");
+    let (err, msg) = b
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": "../escape", "title": "t", "body": "b" }),
+        )
+        .await;
+    assert!(err && msg.as_str().unwrap().contains("invalid"), "{msg}");
+    let (err, join) = b.tool("add_repo", json!({ "repo": "shop" })).await;
+    assert!(!err);
+    assert!(
+        join["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("browse_memory"),
+        "{join}"
+    );
+
+    let events: Vec<String> = hub
+        .audit()
+        .read(&LogQuery::default())
+        .unwrap()
+        .iter()
+        .filter(|r| r["event"].as_str().unwrap().starts_with("folder_") || r["action"] == "move")
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["event"].as_str().unwrap(),
+                r["folder"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "folder_created modules",
+            "folder_created modules/checkout",
+            "folder_created pitfalls",
+            "memory_changed ",
+            "folder_created task-logs",
+            "folder_created task-logs/2026",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn full_http_workflow() {
     let (_dir, hub, state) = setup(Duration::from_secs(600));
@@ -150,7 +413,7 @@ async fn full_http_workflow() {
         .await;
     assert_eq!(
         tools.unwrap()["result"]["tools"].as_array().unwrap().len(),
-        13
+        16
     );
 
     let (err, msg) = crash.tool("search_memory", json!({ "query": "x" })).await;
@@ -209,7 +472,10 @@ async fn full_http_workflow() {
     // ---- perf agent (created via headers) can read but not write others' memory
     let mut perf = client(&state, "10.1.0.6");
     let (status, _) = perf
-        .initialize(&[("x-memhub-agent", "perf-bot"), ("x-memhub-role", "perf-opt")])
+        .initialize(&[
+            ("x-memhub-agent", "perf-bot"),
+            ("x-memhub-role", "perf-opt"),
+        ])
         .await;
     assert_eq!(status, StatusCode::OK);
 
@@ -286,13 +552,13 @@ async fn full_http_workflow() {
 
     // ---- another user of crash-bot connects by name via header
     let mut crash2 = client(&state, "10.1.0.7");
-    let (status, _) = crash2
-        .initialize(&[("x-memhub-agent", "ghost-bot")])
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown agent without role");
-    let (status, _) = crash2
-        .initialize(&[("x-memhub-agent", "crash-bot")])
-        .await;
+    let (status, _) = crash2.initialize(&[("x-memhub-agent", "ghost-bot")]).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown agent without role"
+    );
+    let (status, _) = crash2.initialize(&[("x-memhub-agent", "crash-bot")]).await;
     assert_eq!(status, StatusCode::OK);
     let (err, me) = crash2.tool("whoami", json!({})).await;
     assert!(!err);
@@ -495,6 +761,10 @@ fn stdio_transport() {
         role: None,
     };
     serve(hub.clone(), login, input.as_bytes(), &mut out).unwrap();
-    let whoami: Value = serde_json::from_str(String::from_utf8(out).unwrap().lines().nth(1).unwrap()).unwrap();
-    assert_eq!(whoami["result"]["structuredContent"]["agent"]["name"], "solo");
+    let whoami: Value =
+        serde_json::from_str(String::from_utf8(out).unwrap().lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        whoami["result"]["structuredContent"]["agent"]["name"],
+        "solo"
+    );
 }

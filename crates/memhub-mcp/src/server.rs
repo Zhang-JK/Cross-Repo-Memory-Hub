@@ -21,14 +21,36 @@ the same agent shares its memory. If the agent does not exist yet, also pass you
 (e.g. feature-impl, crash-analysis, perf-opt) to create it.
 2. Call `add_repo` for each repository you work on. This registers the repo if it is new and \
 grants you write access to its shared memory.
-3. Before changing a repo, `search_memory` (or `list_memories` with scope=repo, owner=<repo>) \
-to learn what it does, how it is implemented and what to watch out for.
+3. Before changing a repo, call `browse_memory` (scope=repo, owner=<repo>) to see its memory \
+tree with folder descriptions. Read the root `overview` first, then the folders relevant to your \
+task (`get_memory`). Use `search_memory` for keyword lookup across everything.
 4. Record durable knowledge with `add_memory` / `update_memory`:
-   - scope=repo: facts about a repository (kinds: overview, architecture, implementation, pitfall).
+   - scope=repo: facts about a repository (kinds: overview, architecture, implementation, \
+how-to, pitfall, decision).
    - scope=agent: your own notebook (kinds: task-log, insight, todo). Other agents can read it \
 but only you can change it.
-Memory ids look like `repo/<repo>/<slug>` or `agent/<agent>/<slug>`. Pass `expected_version` \
-when updating to avoid overwriting concurrent edits.";
+
+Keep memory organized as a folder tree, so a newcomer can catch up from `browse_memory` alone:
+- A repo's root folder holds only its `overview` memory: what the repo does, how to build and \
+test it, and which folder holds what. Everything else goes into a folder.
+- Suggested repo layout (create only what you need):
+    architecture/      components, data flow, key abstractions
+    modules/<name>/    one folder per subsystem, crate, package or service
+    how-to/            build, test, release and debugging procedures
+    pitfalls/          gotchas, past incidents, things that break easily
+    decisions/         why things are the way they are
+- Suggested agent layout: task-logs/, insights/, todo/.
+- Before `add_memory`, browse the tree and pass the most specific fitting `folder` \
+(e.g. folder=\"modules/auth\"). Prefer updating an existing memory over adding a near-duplicate.
+- Create a folder (`create_folder`, always with a one-line description) when two or more related \
+memories have no fitting home. Keep nesting shallow (2-3 levels).
+- When the root or a folder gets crowded (about 10 or more memories) or a memory is misplaced, \
+reorganize with `move_memory`, and keep the overview's folder map current.
+- Tool results may carry `hints` about organization; follow them.
+
+Memory ids include the folder path: `repo/<repo>/[<folder>/]<slug>`, e.g. \
+`repo/payment-service/pitfalls/retry-storms`, or `agent/<agent>/[<folder>/]<slug>`. Moving a \
+memory changes its id. Pass `expected_version` when updating to avoid overwriting concurrent edits.";
 
 /// Facts extracted from an `initialize` request.
 #[derive(Debug, Clone)]

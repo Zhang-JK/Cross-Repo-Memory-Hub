@@ -16,13 +16,13 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use memhub_app::{
     admin::{is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
-    store::{MemoryId, Scope},
+    store::{normalize_folder, MemoryId, Scope},
     Admin, AppError,
 };
 use rust_xlsxwriter::{Color, Format, Workbook, Worksheet, XlsxError};
@@ -56,10 +56,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/folders", get(folders).post(create_folder))
         .route("/folders/{scope}/{owner}", delete(delete_folder))
         .route("/memories", get(list_memories).post(add_memory))
-        .route(
-            "/memories/{scope}/{owner}/{slug}",
-            get(get_memory).delete(delete_memory),
-        )
+        .route("/memories/move", post(move_memory))
+        .route("/memories/{*id}", get(get_memory).delete(delete_memory))
         .route("/connections", get(connections))
         .route("/connections/summary", get(connection_summary))
         .route("/connections/export", get(export_connections))
@@ -279,8 +277,8 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn memory_id(scope: &str, owner: &str, slug: &str) -> Result<MemoryId, ApiError> {
-    Ok(format!("{scope}/{owner}/{slug}").parse::<MemoryId>()?)
+fn memory_id(id: &str) -> Result<MemoryId, ApiError> {
+    Ok(id.parse::<MemoryId>()?)
 }
 
 // ---- handlers -------------------------------------------------------------------
@@ -321,6 +319,10 @@ async fn folders(
 struct FolderBody {
     scope: String,
     owner: String,
+    /// Subfolder below the owner; empty or absent for the owner's root.
+    #[serde(default)]
+    folder: String,
+    description: Option<String>,
 }
 
 async fn create_folder(
@@ -333,9 +335,20 @@ async fn create_folder(
     let body: FolderBody = parse_json(body)?;
     let scope: Scope = body.scope.parse()?;
     let owner = body.owner.trim().to_string();
-    let name = owner.clone();
-    let created = run(&state, ip, move |admin| admin.create_folder(scope, &name)).await?;
-    ok(json!({ "scope": scope, "owner": owner, "created": created }))
+    let folder = normalize_folder(&body.folder)?;
+    let (name, path) = (owner.clone(), folder.clone());
+    let description = body.description;
+    let created = run(&state, ip, move |admin| {
+        admin.create_folder(scope, &name, &path, description.as_deref())
+    })
+    .await?;
+    ok(json!({ "scope": scope, "owner": owner, "folder": folder, "created": created }))
+}
+
+#[derive(Deserialize)]
+struct FolderQuery {
+    #[serde(default)]
+    folder: String,
 }
 
 async fn delete_folder(
@@ -343,18 +356,24 @@ async fn delete_folder(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((scope, owner)): Path<(String, String)>,
+    Query(query): Query<FolderQuery>,
 ) -> ApiResult {
     let ip = caller(&state, &headers, peer);
     let scope: Scope = scope.parse()?;
-    let name = owner.clone();
-    let deleted = run(&state, ip, move |admin| admin.delete_folder(scope, &name)).await?;
-    ok(json!({ "scope": scope, "owner": owner, "deleted": deleted }))
+    let folder = normalize_folder(&query.folder)?;
+    let (name, path) = (owner.clone(), folder.clone());
+    let deleted = run(&state, ip, move |admin| {
+        admin.delete_folder(scope, &name, &path)
+    })
+    .await?;
+    ok(json!({ "scope": scope, "owner": owner, "folder": folder, "deleted": deleted }))
 }
 
 #[derive(Deserialize)]
 struct ListQuery {
     scope: Option<String>,
     owner: Option<String>,
+    folder: Option<String>,
     q: Option<String>,
 }
 
@@ -370,9 +389,10 @@ async fn list_memories(
         None => None,
     };
     let owner = non_empty(query.owner);
+    let folder = non_empty(query.folder);
     let q = non_empty(query.q);
     let memories = run(&state, ip, move |admin| {
-        admin.list(scope, owner.as_deref(), q.as_deref())
+        admin.list(scope, owner.as_deref(), folder.as_deref(), q.as_deref())
     })
     .await?;
     ok(json!({ "count": memories.len(), "memories": memories }))
@@ -382,10 +402,10 @@ async fn get_memory(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path((scope, owner, slug)): Path<(String, String, String)>,
+    Path(id): Path<String>,
 ) -> ApiResult {
     let ip = caller(&state, &headers, peer);
-    let id = memory_id(&scope, &owner, &slug)?;
+    let id = memory_id(&id)?;
     ok(run(&state, ip, move |admin| admin.get(&id)).await?)
 }
 
@@ -393,12 +413,37 @@ async fn delete_memory(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path((scope, owner, slug)): Path<(String, String, String)>,
+    Path(id): Path<String>,
 ) -> ApiResult {
     let ip = caller(&state, &headers, peer);
-    let id = memory_id(&scope, &owner, &slug)?;
+    let id = memory_id(&id)?;
     let memory = run(&state, ip, move |admin| admin.delete_memory(&id)).await?;
     ok(json!({ "deleted": memory.meta }))
+}
+
+#[derive(Deserialize)]
+struct MoveBody {
+    id: String,
+    #[serde(default)]
+    folder: String,
+    slug: Option<String>,
+}
+
+async fn move_memory(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: JsonBody,
+) -> ApiResult {
+    let ip = caller(&state, &headers, peer);
+    let body: MoveBody = parse_json(body)?;
+    let id = memory_id(&body.id)?;
+    let previous = id.to_string();
+    let memory = run(&state, ip, move |admin| {
+        admin.move_memory(&id, &body.folder, body.slug.as_deref())
+    })
+    .await?;
+    ok(json!({ "moved": memory.meta, "previous_id": previous }))
 }
 
 #[derive(Deserialize)]
@@ -414,6 +459,8 @@ struct AddBody {
     body: Option<String>,
     slug: Option<String>,
     markdown: Option<String>,
+    #[serde(default)]
+    folder: String,
 }
 
 async fn add_memory(
@@ -440,6 +487,7 @@ async fn add_memory(
         body: body.body,
         slug: body.slug,
         markdown: body.markdown,
+        folder: body.folder,
     };
     let memory = run(&state, ip, move |admin| admin.add_memory(input)).await?;
     Ok((StatusCode::CREATED, Json(json!({ "created": memory.meta }))).into_response())

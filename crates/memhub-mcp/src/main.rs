@@ -256,15 +256,24 @@ fn print_record(r: &Value, with_diff: bool) {
             if let Some(g) = r.get("group").and_then(Value::as_str) {
                 d.push_str(&format!(" group={g}"));
             }
+            if let Some(p) = r.get("previous_id").and_then(Value::as_str) {
+                d.push_str(&format!(" from={p}"));
+            }
             d
         }
-        "folder_created" => format!("{}/{}", s("scope"), s("owner")),
-        "folder_deleted" => format!(
-            "{}/{} ({} memories)",
-            s("scope"),
-            s("owner"),
-            r.get("memory_count").and_then(Value::as_u64).unwrap_or(0)
-        ),
+        "folder_created" | "folder_described" | "folder_deleted" => {
+            let mut d = format!("{}/{}", s("scope"), s("owner"));
+            if !s("folder").is_empty() {
+                d.push_str(&format!("/{}", s("folder")));
+            }
+            if let Some(n) = r.get("memory_count").and_then(Value::as_u64) {
+                d.push_str(&format!(" ({n} memories)"));
+            }
+            if !s("description").is_empty() {
+                d.push_str(&format!(" \"{}\"", s("description")));
+            }
+            d
+        }
         _ => String::new(),
     };
     println!(

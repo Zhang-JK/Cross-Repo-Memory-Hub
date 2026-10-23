@@ -127,6 +127,8 @@ pub struct ConnectionSession {
     pub ip: String,
     pub transport: String,
     pub client: Option<String>,
+    /// `X-Memhub-Instance` label sent by the client, if any.
+    pub instance: Option<String>,
     pub connected_at: Option<String>,
     pub identified_at: Option<String>,
     /// The agent was registered by this connection.
@@ -138,16 +140,60 @@ pub struct ConnectionSession {
     pub changes: usize,
 }
 
-/// Distinct connections, client IPs and agents active in one time window.
+/// Distinct connections, client IPs, agents and agent instances active in one
+/// time window.
 ///
 /// A connection counts when it connected, identified itself, or disconnected
 /// inside the window. Unidentified connections and the `(admin)` actor are
-/// not counted as agents.
+/// not counted as agents or instances.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct WindowCounts {
     pub connections: usize,
     pub ips: usize,
     pub agents: usize,
+    #[serde(flatten)]
+    pub instances: InstanceCount,
+}
+
+/// Distinct running agent copies, see [`instance_key`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct InstanceCount {
+    pub instances: usize,
+    /// Instances without an `X-Memhub-Instance` label, estimated as one per
+    /// agent and IP (so a lower bound).
+    pub unlabeled_instances: usize,
+}
+
+/// Identity of a running agent copy: the agent name plus its
+/// `X-Memhub-Instance` label, or plus its IP when no label was sent.
+/// `None` for unidentified connections and the admin actor.
+pub fn instance_key(agent: Option<&str>, instance: Option<&str>, ip: &str) -> Option<String> {
+    let agent = agent.filter(|a| !a.is_empty() && *a != ADMIN_ACTOR)?;
+    Some(match instance.filter(|i| !i.is_empty()) {
+        Some(label) => format!("{agent}\u{0}label\u{0}{label}"),
+        None => format!("{agent}\u{0}ip\u{0}{ip}"),
+    })
+}
+
+/// Counts distinct instances among `(agent, instance label, ip)` triples.
+pub fn count_instances<'a>(
+    connections: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>, &'a str)>,
+) -> InstanceCount {
+    let mut labeled = HashSet::new();
+    let mut unlabeled = HashSet::new();
+    for (agent, instance, ip) in connections {
+        if let Some(key) = instance_key(agent, instance, ip) {
+            if instance.is_some_and(|i| !i.is_empty()) {
+                labeled.insert(key);
+            } else {
+                unlabeled.insert(key);
+            }
+        }
+    }
+    InstanceCount {
+        instances: labeled.len() + unlabeled.len(),
+        unlabeled_instances: unlabeled.len(),
+    }
 }
 
 /// Rolling connection activity. `week` is the last 7 days and `month` the
@@ -567,6 +613,10 @@ impl Admin {
                         .get("client")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    s.instance = record
+                        .get("instance")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                 }
                 "agent_login" | "agent_registered" => {
                     s.identified_at = s.identified_at.take().or(ts);
@@ -859,10 +909,16 @@ fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> Window
     let mut ips = HashSet::new();
     let mut agents = HashSet::new();
     let mut connections = 0;
-    for session in sessions {
-        if !session_active_since(session, start) {
-            continue;
-        }
+    let active: Vec<&ConnectionSession> = sessions
+        .iter()
+        .filter(|s| session_active_since(s, start))
+        .collect();
+    let instances = count_instances(
+        active
+            .iter()
+            .map(|s| (s.agent.as_deref(), s.instance.as_deref(), s.ip.as_str())),
+    );
+    for session in active {
         connections += 1;
         if !session.ip.is_empty() {
             ips.insert(session.ip.clone());
@@ -879,6 +935,7 @@ fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> Window
         connections,
         ips: ips.len(),
         agents: agents.len(),
+        instances,
     }
 }
 

@@ -27,7 +27,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use memhub_app::{ConnInfo, Hub};
+use memhub_app::{clean_instance, ConnInfo, Hub};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -41,6 +41,9 @@ pub const SESSION_HEADER: &str = "mcp-session-id";
 pub const AGENT_HEADER: &str = "x-memhub-agent";
 /// Role used to create the agent if `x-memhub-agent` names a new one.
 pub const ROLE_HEADER: &str = "x-memhub-role";
+/// Optional label of the running agent copy (e.g. `alice-laptop`), so that
+/// several copies of one agent behind one IP can be told apart and counted.
+pub const INSTANCE_HEADER: &str = "x-memhub-instance";
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
@@ -59,7 +62,7 @@ impl Default for HttpConfig {
         Self {
             trust_proxy: false,
             allowed_origins: Vec::new(),
-            idle_timeout: Duration::from_secs(30 * 60),
+            idle_timeout: Duration::from_secs(60 * 60),
             admin_token: None,
         }
     }
@@ -72,6 +75,7 @@ pub struct LiveSession {
     pub agent: Option<String>,
     pub ip: String,
     pub client: Option<String>,
+    pub instance: Option<String>,
     pub protocol_version: Option<&'static str>,
     pub started_at: Option<DateTime<Utc>>,
     pub idle_secs: Option<u64>,
@@ -121,6 +125,7 @@ impl HttpState {
                     agent: c.session().agent().map(str::to_string),
                     ip: c.session().conn().ip.clone(),
                     client: c.session().conn().client.clone(),
+                    instance: c.session().conn().instance.clone(),
                     protocol_version: Some(c.protocol_version()),
                     started_at: Some(c.session().started_at()),
                     idle_secs: Some(now.duration_since(c.last_seen()).as_secs()),
@@ -131,6 +136,7 @@ impl HttpState {
                     agent: None,
                     ip: String::new(),
                     client: None,
+                    instance: None,
                     protocol_version: None,
                     started_at: None,
                     idle_secs: None,
@@ -368,12 +374,14 @@ async fn initialize(
 ) -> Response {
     let agent = header_str(headers, AGENT_HEADER).map(str::to_owned);
     let role = header_str(headers, ROLE_HEADER).map(str::to_owned);
+    let instance = header_str(headers, INSTANCE_HEADER).and_then(clean_instance);
     let hub = state.hub.clone();
     let opened = tokio::task::spawn_blocking(move || {
         let conn_info = ConnInfo {
             transport: "http".into(),
             ip,
             client: None,
+            instance,
         };
         let (mut conn, response) = McpConnection::initialize(&hub, conn_info, &msg);
         if let Some(agent) = agent {
@@ -410,6 +418,7 @@ async fn initialize(
         session = %session_id,
         ip = %conn.session().conn().ip,
         agent = ?conn.session().agent(),
+        instance = ?conn.session().conn().instance,
         "mcp session opened"
     );
     state

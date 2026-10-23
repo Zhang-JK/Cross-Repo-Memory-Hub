@@ -806,6 +806,7 @@ fn stdio_transport() {
     let login = StdioLogin {
         agent: Some("solo".into()),
         role: None,
+        instance: Some("  ci-runner-7\n".into()),
     };
     serve(hub.clone(), login, input.as_bytes(), &mut out).unwrap();
     let whoami: Value =
@@ -814,4 +815,7 @@ fn stdio_transport() {
         whoami["result"]["structuredContent"]["agent"]["name"],
         "solo"
     );
+    let log = hub.audit().read(&LogQuery::default()).unwrap();
+    let connect = log.iter().rev().find(|r| r["event"] == "connect").unwrap();
+    assert_eq!(connect["instance"], "ci-runner-7");
 }

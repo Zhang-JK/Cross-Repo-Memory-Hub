@@ -17,6 +17,7 @@ fn connect(hub: &Arc<Hub>, ip: &str) -> AgentSession {
         transport: "test".into(),
         ip: ip.into(),
         client: None,
+        instance: None,
     })
 }
 

@@ -21,7 +21,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use memhub_app::{
-    admin::{is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
+    admin::{count_instances, is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
     store::{normalize_folder, MemoryId, Scope},
     Admin, AppError,
 };
@@ -556,8 +556,15 @@ async fn connection_summary(
 ) -> ApiResult {
     let ip = caller(&state, &headers, peer);
     let summary = run(&state, ip, |admin| admin.connection_summary()).await?;
+    let live = shown_live(&state);
+    let live_instances = count_instances(
+        live.iter()
+            .map(|s| (s.agent.as_deref(), s.instance.as_deref(), s.ip.as_str())),
+    );
     ok(json!({
-        "live": shown_live(&state).len(),
+        "live": live.len(),
+        "live_instances": live_instances.instances,
+        "live_unlabeled_instances": live_instances.unlabeled_instances,
         "week": summary.week,
         "month": summary.month,
     }))
@@ -640,6 +647,7 @@ const XLSX_COLUMNS: &[(&str, f64)] = &[
     ("IP", 16.0),
     ("Transport", 12.0),
     ("Client", 24.0),
+    ("Instance", 22.0),
     ("Connected (UTC)", 21.0),
     ("Identified (UTC)", 21.0),
     ("Registered", 12.0),
@@ -697,31 +705,32 @@ fn write_session_row(
     sheet.write_string(row, 2, &session.ip)?;
     sheet.write_string(row, 3, &session.transport)?;
     write_some(sheet, row, 4, session.client.as_deref())?;
+    write_some(sheet, row, 5, session.instance.as_deref())?;
     write_some(
         sheet,
         row,
-        5,
+        6,
         excel_time(session.connected_at.as_deref()).as_deref(),
     )?;
     write_some(
         sheet,
         row,
-        6,
+        7,
         excel_time(session.identified_at.as_deref()).as_deref(),
     )?;
-    sheet.write_string(row, 7, if session.registered { "yes" } else { "no" })?;
+    sheet.write_string(row, 8, if session.registered { "yes" } else { "no" })?;
     write_some(
         sheet,
         row,
-        8,
+        9,
         excel_time(session.disconnected_at.as_deref()).as_deref(),
     )?;
-    write_some(sheet, row, 9, session.reason.as_deref())?;
+    write_some(sheet, row, 10, session.reason.as_deref())?;
     if let Some(duration) = session_duration(session, live, now) {
-        sheet.write_number_with_format(row, 10, duration, seconds)?;
+        sheet.write_number_with_format(row, 11, duration, seconds)?;
     }
-    sheet.write_number(row, 11, session.changes as f64)?;
-    sheet.write_string(row, 12, if live { "yes" } else { "no" })?;
+    sheet.write_number(row, 12, session.changes as f64)?;
+    sheet.write_string(row, 13, if live { "yes" } else { "no" })?;
     Ok(())
 }
 

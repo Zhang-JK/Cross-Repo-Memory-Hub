@@ -21,8 +21,8 @@ pub use error::{AppError, Result};
 pub use hub::{Hub, HubConfig};
 pub use registry::{AgentProfile, RepoProfile};
 pub use session::{
-    AddMemory, AgentSession, Browse, ConnInfo, Connected, FolderResult, RepoJoin, RepoSummary,
-    WhoAmI,
+    clean_instance, AddMemory, AgentSession, Browse, ConnInfo, Connected, FolderResult, RepoJoin,
+    RepoSummary, WhoAmI, MAX_INSTANCE_LEN,
 };
 
 pub use memhub_audit as audit;

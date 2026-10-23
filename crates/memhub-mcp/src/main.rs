@@ -45,6 +45,10 @@ enum Command {
         /// Additional allowed browser Origin (repeatable). Localhost is always allowed.
         #[arg(long = "allowed-origin")]
         allowed_origins: Vec<String>,
+        /// Token required by the management web UI (/admin). Without it the UI
+        /// is open to anyone who can reach the server.
+        #[arg(long, env = "MEMHUB_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: Option<String>,
     },
     /// Run the MCP server over stdio (one agent per process).
     Stdio {
@@ -98,11 +102,13 @@ fn main() -> anyhow::Result<()> {
             idle_timeout_secs,
             trust_proxy,
             allowed_origins,
+            admin_token,
         } => {
             let config = HttpConfig {
                 trust_proxy,
                 allowed_origins,
                 idle_timeout: Duration::from_secs(idle_timeout_secs.max(1)),
+                admin_token: admin_token.filter(|t| !t.trim().is_empty()),
             };
             tokio::runtime::Runtime::new()?.block_on(serve(hub, bind, config))
         }
@@ -170,6 +176,14 @@ async fn serve(
         "memhub listening on http://{bind}/mcp (data dir {})",
         hub.data_root().display()
     );
+    if state.config().admin_token.is_some() {
+        tracing::info!("management UI at http://{bind}/admin (admin token required)");
+    } else {
+        tracing::warn!(
+            "management UI at http://{bind}/admin is open to anyone who can reach this \
+             server; set --admin-token / MEMHUB_ADMIN_TOKEN to protect it"
+        );
+    }
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -244,6 +258,13 @@ fn print_record(r: &Value, with_diff: bool) {
             }
             d
         }
+        "folder_created" => format!("{}/{}", s("scope"), s("owner")),
+        "folder_deleted" => format!(
+            "{}/{} ({} memories)",
+            s("scope"),
+            s("owner"),
+            r.get("memory_count").and_then(Value::as_u64).unwrap_or(0)
+        ),
         _ => String::new(),
     };
     println!(

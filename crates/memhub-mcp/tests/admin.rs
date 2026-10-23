@@ -1,0 +1,336 @@
+use std::net::SocketAddr;
+
+use axum::{
+    body::Body,
+    extract::connect_info::MockConnectInfo,
+    http::{Request, StatusCode},
+    Router,
+};
+use http_body_util::BodyExt;
+use memhub_app::{Hub, HubConfig};
+use memhub_mcp::http::{router, HttpConfig, HttpState};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+fn app(token: Option<&str>) -> (tempfile::TempDir, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    let state = HttpState::new(
+        hub,
+        HttpConfig {
+            admin_token: token.map(str::to_string),
+            ..Default::default()
+        },
+    );
+    let addr: SocketAddr = "10.1.2.3:5000".parse().unwrap();
+    (dir, router(state).layer(MockConnectInfo(addr)))
+}
+
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let body = match body {
+        Some(b) => {
+            req = req.header("content-type", "application/json");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+#[tokio::test]
+async fn serves_the_ui_with_security_headers() {
+    let (_dir, app) = app(None);
+    for (path, ty) in [
+        ("/admin", "text/html"),
+        ("/admin/app.js", "text/javascript"),
+        ("/admin/app.css", "text/css"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let h = res.headers();
+        assert!(
+            h["content-type"].to_str().unwrap().starts_with(ty),
+            "{path}"
+        );
+        assert!(h["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'"));
+        assert_eq!(h["x-frame-options"], "DENY");
+    }
+    let res = app
+        .clone()
+        .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let page = res.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8(page.to_vec()).unwrap();
+    assert!(
+        page.contains("/admin/app.js?v="),
+        "assets are fingerprinted"
+    );
+    assert!(!page.contains("__ASSET_VERSION__"));
+
+    let res = app
+        .clone()
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers()["location"], "/admin");
+}
+
+#[tokio::test]
+async fn token_protects_the_api() {
+    let (_dir, app) = app(Some("s3cret"));
+    let (status, info) = call(&app, "GET", "/api/admin/auth", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info, json!({ "token_required": true, "authorized": false }));
+
+    let (status, _) = call(&app, "GET", "/api/admin/stats", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/api/admin/stats",
+        None,
+        &[("authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let auth = [("authorization", "Bearer s3cret")];
+    let (_, info) = call(&app, "GET", "/api/admin/auth", None, &auth).await;
+    assert_eq!(info["authorized"], true);
+    let (status, stats) = call(&app, "GET", "/api/admin/stats", None, &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stats["server"]["token_required"], true);
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/admin/folders",
+        Some(json!({ "scope": "repo", "owner": "x" })),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "writes need the token too"
+    );
+}
+
+#[tokio::test]
+async fn manage_folders_and_memories() {
+    let (_dir, app) = app(None);
+    let (status, res) = call(
+        &app,
+        "POST",
+        "/api/admin/folders",
+        Some(json!({ "scope": "repo", "owner": "engine" })),
+        &[
+            ("origin", "http://hub.local:8010"),
+            ("host", "hub.local:8010"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["created"], true);
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/admin/folders",
+        Some(json!({ "scope": "repo", "owner": "evil" })),
+        &[
+            ("origin", "http://evil.example"),
+            ("host", "hub.local:8010"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, res) = call(
+        &app,
+        "POST",
+        "/api/admin/memories",
+        Some(json!({
+            "scope": "repo", "owner": "engine", "title": "Build notes",
+            "kind": "architecture", "tags": ["cmake", " "], "body": "Use ninja."
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(res["created"]["id"], "repo/engine/build-notes");
+    assert_eq!(res["created"]["tags"], json!(["cmake"]));
+
+    let (status, res) = call(
+        &app,
+        "POST",
+        "/api/admin/memories",
+        Some(json!({ "scope": "repo", "owner": "engine", "title": "x", "slug": "build-notes" })),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{res}");
+
+    let (_, list) = call(
+        &app,
+        "GET",
+        "/api/admin/memories?scope=repo&owner=engine",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(list["count"], 1);
+    let (_, found) = call(&app, "GET", "/api/admin/memories?q=ninja", None, &[]).await;
+    assert_eq!(found["memories"][0]["id"], "repo/engine/build-notes");
+    assert!(found["memories"][0]["snippet"].is_string());
+
+    let (status, detail) = call(
+        &app,
+        "GET",
+        "/api/admin/memories/repo/engine/build-notes",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["memory"]["body"], "Use ninja.\n");
+    assert!(detail["markdown"]
+        .as_str()
+        .unwrap()
+        .contains("kind: architecture"));
+
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/api/admin/memories/repo/..%2Fetc/passwd",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, folders) = call(&app, "GET", "/api/admin/folders", None, &[]).await;
+    assert_eq!(folders["folders"][0]["owner"], "engine");
+    assert_eq!(folders["folders"][0]["memory_count"], 1);
+
+    let (status, res) = call(&app, "DELETE", "/api/admin/folders/repo/engine", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["deleted"], json!(["repo/engine/build-notes"]));
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/api/admin/memories/repo/engine/build-notes",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, updates) = call(&app, "GET", "/api/admin/updates", None, &[]).await;
+    let events: Vec<&str> = updates["updates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "folder_deleted",
+            "memory_changed",
+            "memory_changed",
+            "folder_created"
+        ]
+    );
+    let first = &updates["updates"][0];
+    assert_eq!(first["agent"], "(admin)");
+    assert_eq!(first["ip"], "10.1.2.3");
+}
+
+#[tokio::test]
+async fn connection_log_marks_live_sessions() {
+    let (_dir, app) = app(None);
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": { "name": "probe", "version": "1" } }
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("x-memhub-agent", "crash-bot")
+                .header("x-memhub-role", "crash-analysis")
+                .body(Body::from(init.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sid = res.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (_, conns) = call(&app, "GET", "/api/admin/connections", None, &[]).await;
+    let s = &conns["sessions"][0];
+    assert_eq!(s["session_id"], sid.as_str());
+    assert_eq!(s["agent"], "crash-bot");
+    assert_eq!(s["client"], "probe 1");
+    assert_eq!(s["ip"], "10.1.2.3");
+    assert_eq!(s["live"], true);
+    assert_eq!(s["registered"], true);
+
+    let (_, stats) = call(&app, "GET", "/api/admin/stats", None, &[]).await;
+    assert_eq!(stats["live_sessions"][0]["agent"], "crash-bot");
+    assert_eq!(stats["connections_today"], 1);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::delete("/mcp")
+                .header("mcp-session-id", &sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let (_, conns) = call(&app, "GET", "/api/admin/connections", None, &[]).await;
+    assert_eq!(conns["sessions"][0]["live"], false);
+    assert_eq!(conns["sessions"][0]["reason"], "client_closed");
+
+    let (_, events) = call(&app, "GET", "/api/admin/connections?view=events", None, &[]).await;
+    let names: Vec<&str> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["disconnect", "agent_registered", "connect"]);
+    assert_eq!(events["events"][2]["agent"], "crash-bot");
+}

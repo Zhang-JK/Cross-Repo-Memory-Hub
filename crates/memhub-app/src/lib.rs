@@ -9,12 +9,14 @@
 //! - agent memory is writable only by the agent that owns it;
 //! - repo memory is writable by agents that added the repo to their working set.
 
+pub mod admin;
 mod diff;
 mod error;
 mod hub;
 mod registry;
 mod session;
 
+pub use admin::{Admin, ADMIN_ACTOR};
 pub use error::{AppError, Result};
 pub use hub::{Hub, HubConfig};
 pub use registry::{AgentProfile, RepoProfile};

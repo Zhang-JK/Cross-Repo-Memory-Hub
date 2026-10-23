@@ -91,6 +91,21 @@ pub enum AuditEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
     },
+    /// A memory folder (`<scope>/<owner>`) was created.
+    FolderCreated {
+        #[serde(flatten)]
+        actor: Actor,
+        scope: String,
+        owner: String,
+    },
+    /// A memory folder and every memory in it were moved to the trash.
+    FolderDeleted {
+        #[serde(flatten)]
+        actor: Actor,
+        scope: String,
+        owner: String,
+        memory_count: usize,
+    },
 }
 
 impl AuditEvent {
@@ -103,6 +118,8 @@ impl AuditEvent {
             AuditEvent::RepoJoined { .. } => "repo_joined",
             AuditEvent::RepoLeft { .. } => "repo_left",
             AuditEvent::MemoryChanged { .. } => "memory_changed",
+            AuditEvent::FolderCreated { .. } => "folder_created",
+            AuditEvent::FolderDeleted { .. } => "folder_deleted",
         }
     }
 }

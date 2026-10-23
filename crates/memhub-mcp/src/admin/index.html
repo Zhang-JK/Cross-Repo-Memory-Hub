@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Memory Hub · Admin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M9 22V10l7 7 7-7v12' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/admin/app.css?v=__ASSET_VERSION__">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <a class="brand" href="#/dashboard">
+        <span class="brand-mark">M</span>
+        <span class="brand-text">Memory Hub<small>admin</small></span>
+      </a>
+      <nav class="nav">
+        <a href="#/dashboard" data-tab="dashboard"><span class="ico">▦</span>Dashboard</a>
+        <a href="#/memories" data-tab="memories"><span class="ico">❒</span>Memories</a>
+        <a href="#/connections" data-tab="connections"><span class="ico">⇄</span>Connections</a>
+        <a href="#/updates" data-tab="updates"><span class="ico">✎</span>Updates</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="server-info" class="muted"></div>
+        <button id="logout" class="link hidden" type="button">Forget admin token</button>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="page-head">
+        <div>
+          <h1 id="page-title">Dashboard</h1>
+          <p id="page-sub" class="muted"></p>
+        </div>
+        <div id="page-actions" class="actions"></div>
+      </header>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="/admin/app.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

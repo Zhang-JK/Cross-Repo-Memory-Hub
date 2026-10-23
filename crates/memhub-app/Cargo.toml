@@ -11,6 +11,7 @@ memhub-store.workspace = true
 memhub-audit.workspace = true
 chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 similar.workspace = true
 tempfile.workspace = true
@@ -20,4 +21,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-serde_json.workspace = true

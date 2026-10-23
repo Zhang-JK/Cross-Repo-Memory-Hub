@@ -24,7 +24,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use memhub_app::{ConnInfo, Hub};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
@@ -46,6 +48,8 @@ pub struct HttpConfig {
     /// `Origin` header (non-browser clients) are always allowed.
     pub allowed_origins: Vec<String>,
     pub idle_timeout: Duration,
+    /// Required (as `Authorization: Bearer <token>`) by the admin API when set.
+    pub admin_token: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -54,8 +58,23 @@ impl Default for HttpConfig {
             trust_proxy: false,
             allowed_origins: Vec::new(),
             idle_timeout: Duration::from_secs(30 * 60),
+            admin_token: None,
         }
     }
+}
+
+/// A currently open MCP session, as shown in the admin UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSession {
+    pub session_id: String,
+    pub agent: Option<String>,
+    pub ip: String,
+    pub client: Option<String>,
+    pub protocol_version: Option<&'static str>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub idle_secs: Option<u64>,
+    /// A request is being processed; details are unavailable until it ends.
+    pub busy: bool,
 }
 
 type SharedConnection = Arc<tokio::sync::Mutex<McpConnection>>;
@@ -64,6 +83,7 @@ pub struct HttpState {
     hub: Arc<Hub>,
     config: HttpConfig,
     sessions: Mutex<HashMap<String, SharedConnection>>,
+    started_at: DateTime<Utc>,
 }
 
 impl HttpState {
@@ -72,7 +92,52 @@ impl HttpState {
             hub,
             config,
             sessions: Mutex::new(HashMap::new()),
+            started_at: Utc::now(),
         })
+    }
+
+    pub fn hub(&self) -> &Arc<Hub> {
+        &self.hub
+    }
+
+    pub fn config(&self) -> &HttpConfig {
+        &self.config
+    }
+
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+
+    pub fn live_sessions(&self) -> Vec<LiveSession> {
+        let now = Instant::now();
+        let mut out: Vec<LiveSession> = self
+            .sessions()
+            .iter()
+            .map(|(id, conn)| match conn.try_lock() {
+                Ok(c) => LiveSession {
+                    session_id: id.clone(),
+                    agent: c.session().agent().map(str::to_string),
+                    ip: c.session().conn().ip.clone(),
+                    client: c.session().conn().client.clone(),
+                    protocol_version: Some(c.protocol_version()),
+                    started_at: Some(c.session().started_at()),
+                    idle_secs: Some(now.duration_since(c.last_seen()).as_secs()),
+                    busy: false,
+                },
+                Err(_) => LiveSession {
+                    session_id: id.clone(),
+                    agent: None,
+                    ip: String::new(),
+                    client: None,
+                    protocol_version: None,
+                    started_at: None,
+                    idle_secs: None,
+                    busy: true,
+                },
+            })
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        out
     }
 
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, SharedConnection>> {
@@ -128,6 +193,7 @@ pub fn router(state: Arc<HttpState>) -> Router {
             post(handle_post).get(handle_get).delete(handle_delete),
         )
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
+        .merge(crate::admin::routes(state.clone()))
         .with_state(state)
 }
 
@@ -144,7 +210,7 @@ pub fn spawn_reaper(state: Arc<HttpState>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-fn client_ip(config: &HttpConfig, headers: &HeaderMap, peer: SocketAddr) -> String {
+pub(crate) fn client_ip(config: &HttpConfig, headers: &HeaderMap, peer: SocketAddr) -> String {
     if config.trust_proxy {
         let forwarded = headers
             .get("x-forwarded-for")

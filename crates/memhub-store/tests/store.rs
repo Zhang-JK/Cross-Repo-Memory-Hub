@@ -190,6 +190,39 @@ fn rejects_path_traversal() {
 }
 
 #[test]
+fn create_and_delete_owner_folders() {
+    let (dir, store) = store();
+    assert!(store.create_owner(Scope::Repo, "engine").unwrap());
+    assert!(!store.create_owner(Scope::Repo, "engine").unwrap(), "second create is a no-op");
+    assert_eq!(store.owners(Scope::Repo).unwrap(), vec!["engine"]);
+    assert!(store.create_owner(Scope::Agent, "../x").is_err());
+
+    store.add(new(Scope::Repo, "engine", "One", "1")).unwrap();
+    store.add(new(Scope::Repo, "engine", "Two", "2")).unwrap();
+    store.add(new(Scope::Repo, "other", "Kept", "3")).unwrap();
+
+    let removed = store.delete_owner(Scope::Repo, "engine").unwrap();
+    let mut ids: Vec<String> = removed.iter().map(|m| m.meta.id.to_string()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["repo/engine/one", "repo/engine/two"]);
+    assert_eq!(store.owners(Scope::Repo).unwrap(), vec!["other"]);
+    assert_eq!(store.list(&Filter::default()).unwrap().len(), 1);
+
+    let trashed: Vec<_> = std::fs::read_dir(dir.path().join("trash/repo/engine"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(trashed.len(), 1);
+    assert!(trashed[0].join("one.md").is_file(), "folder is kept in the trash");
+
+    assert!(matches!(
+        store.delete_owner(Scope::Repo, "engine"),
+        Err(StoreError::NotFound(_))
+    ));
+    store.add(new(Scope::Repo, "engine", "Again", "")).unwrap();
+}
+
+#[test]
 fn hand_written_files_are_picked_up() {
     let (dir, store) = store();
     let path = dir.path().join("memories/repo/engine");

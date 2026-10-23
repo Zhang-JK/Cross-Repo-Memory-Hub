@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use memhub_audit::{Actor, AuditEvent, MemoryAction};
 use memhub_store::{
     validate_label, validate_name, Change, Filter, GroupKey, Memory, MemoryId, MemoryMeta,
@@ -85,6 +85,7 @@ pub struct AgentSession {
     conn: ConnInfo,
     agent: Option<String>,
     opened: Instant,
+    started_at: DateTime<Utc>,
     closed: bool,
 }
 
@@ -96,6 +97,7 @@ impl AgentSession {
             conn,
             agent: None,
             opened: Instant::now(),
+            started_at: Utc::now(),
             closed: false,
         };
         session.hub.audit().record(AuditEvent::Connect {
@@ -115,6 +117,10 @@ impl AgentSession {
 
     pub fn conn(&self) -> &ConnInfo {
         &self.conn
+    }
+
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
     }
 
     pub fn hub(&self) -> &Arc<Hub> {

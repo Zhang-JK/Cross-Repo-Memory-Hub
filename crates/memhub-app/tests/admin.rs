@@ -1,0 +1,299 @@
+use std::sync::Arc;
+
+use memhub_app::{
+    admin::{AdminNewMemory, LogFilter},
+    audit::LogQuery,
+    store::{MemoryId, Scope},
+    AddMemory, AgentSession, ConnInfo, Hub, HubConfig, ADMIN_ACTOR,
+};
+
+fn hub() -> (tempfile::TempDir, Arc<Hub>) {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    (dir, hub)
+}
+
+fn agent(hub: &Arc<Hub>, name: &str, ip: &str) -> AgentSession {
+    let mut s = hub.open_session(ConnInfo {
+        transport: "http".into(),
+        ip: ip.into(),
+        client: Some("test-client 1.0".into()),
+    });
+    s.connect(name, Some("feature-impl"), None).unwrap();
+    s
+}
+
+fn logs(limit: usize) -> LogFilter {
+    LogFilter {
+        limit,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn admin_adds_and_deletes_memories_anywhere_with_audit() {
+    let (_dir, hub) = hub();
+    let admin = hub.admin("192.168.1.9");
+
+    let m = admin
+        .add_memory(AdminNewMemory {
+            scope: Scope::Agent,
+            owner: "crash-bot".into(),
+            title: Some("Seeded note".into()),
+            kind: Some("insight".into()),
+            tags: vec!["seed".into()],
+            body: Some("hello".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(m.meta.id.to_string(), "agent/crash-bot/seeded-note");
+    assert_eq!(m.meta.author, ADMIN_ACTOR);
+
+    let detail = admin.get(&m.meta.id).unwrap();
+    assert!(detail.markdown.starts_with("---\n"));
+    assert_eq!(detail.path, "memories/agent/crash-bot/seeded-note.md");
+
+    admin.delete_memory(&m.meta.id).unwrap();
+    assert!(admin.get(&m.meta.id).is_err());
+
+    let records = hub.audit().read(&LogQuery::default()).unwrap();
+    let actions: Vec<_> = records
+        .iter()
+        .map(|r| r["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, vec!["add", "delete"]);
+    for r in &records {
+        assert_eq!(r["agent"], ADMIN_ACTOR);
+        assert_eq!(r["ip"], "192.168.1.9");
+        assert_eq!(r["transport"], "admin");
+    }
+}
+
+#[test]
+fn markdown_import_fills_properties_from_front_matter() {
+    let (_dir, hub) = hub();
+    let admin = hub.admin("127.0.0.1");
+    let markdown = "---\ntitle: Imported pitfall\nkind: pitfall\ntags: [ffi]\ngroups: [g1]\n---\n\nDo not panic across FFI.\n";
+
+    let m = admin
+        .add_memory(AdminNewMemory {
+            scope: Scope::Repo,
+            owner: "engine".into(),
+            markdown: Some(markdown.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(m.meta.id.to_string(), "repo/engine/imported-pitfall");
+    assert_eq!(m.meta.kind, "pitfall");
+    assert_eq!(m.meta.tags, vec!["ffi"]);
+    assert_eq!(m.meta.groups, vec!["g1"]);
+    assert_eq!(m.body, "Do not panic across FFI.\n");
+
+    let explicit = admin
+        .add_memory(AdminNewMemory {
+            scope: Scope::Repo,
+            owner: "engine".into(),
+            title: Some("Override".into()),
+            markdown: Some("# Heading title\n\nplain body".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(explicit.meta.title, "Override");
+    assert_eq!(explicit.meta.kind, "note");
+    assert_eq!(explicit.body, "# Heading title\n\nplain body\n");
+
+    assert!(admin
+        .add_memory(AdminNewMemory {
+            scope: Scope::Repo,
+            owner: "engine".into(),
+            ..Default::default()
+        })
+        .is_err());
+}
+
+#[test]
+fn folders_create_list_and_delete() {
+    let (_dir, hub) = hub();
+    let s = agent(&hub, "perf-bot", "10.0.0.2");
+    let mut s = s;
+    s.add_repo("engine", Some("game engine"), None).unwrap();
+    s.add_memory(AddMemory {
+        scope: Scope::Repo,
+        repo: Some("engine".into()),
+        title: "Hot loop".into(),
+        body: "x".into(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let admin = hub.admin("127.0.0.1");
+    assert!(admin.create_folder(Scope::Repo, "empty-repo").unwrap());
+    assert!(!admin.create_folder(Scope::Repo, "empty-repo").unwrap());
+    assert!(admin.create_folder(Scope::Repo, "bad/name").is_err());
+
+    let folders = admin.folders().unwrap();
+    let engine = folders.iter().find(|f| f.owner == "engine").unwrap();
+    assert_eq!(engine.memory_count, 1);
+    assert!(engine.registered);
+    assert_eq!(engine.description, "game engine");
+    let empty = folders.iter().find(|f| f.owner == "empty-repo").unwrap();
+    assert_eq!(empty.memory_count, 0);
+    assert!(!empty.registered);
+
+    let removed = admin.delete_folder(Scope::Repo, "engine").unwrap();
+    assert_eq!(
+        removed,
+        vec!["repo/engine/hot-loop".parse::<MemoryId>().unwrap()]
+    );
+    assert!(admin.folders().unwrap().iter().all(|f| f.owner != "engine"));
+    assert!(admin.delete_folder(Scope::Repo, "engine").is_err());
+
+    let updates = admin.updates(&logs(10)).unwrap();
+    let events: Vec<String> = updates
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r["event"].as_str().unwrap(),
+                r["action"].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "folder_deleted:-",
+            "memory_changed:delete",
+            "folder_created:-",
+            "memory_changed:add",
+        ],
+        "newest first"
+    );
+    assert_eq!(updates[0]["memory_count"], 1);
+
+    let by_agent = admin
+        .updates(&LogFilter {
+            agent: Some("perf-bot".into()),
+            ..logs(10)
+        })
+        .unwrap();
+    assert_eq!(by_agent.len(), 1);
+    let folder_events = admin
+        .updates(&LogFilter {
+            action: Some("folder_created".into()),
+            ..logs(10)
+        })
+        .unwrap();
+    assert_eq!(folder_events.len(), 1);
+    let by_memory = admin
+        .updates(&LogFilter {
+            memory: Some("HOT".into()),
+            ..logs(10)
+        })
+        .unwrap();
+    assert_eq!(by_memory.len(), 2, "matches the title case-insensitively");
+}
+
+#[test]
+fn connections_are_reconstructed_per_session() {
+    let (_dir, hub) = hub();
+    let mut a = agent(&hub, "crash-bot", "10.0.0.1");
+    a.add_repo("engine", None, None).unwrap();
+    a.add_memory(AddMemory {
+        scope: Scope::Agent,
+        title: "note".into(),
+        body: "b".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    a.close("client_closed");
+    let _b = agent(&hub, "crash-bot", "10.0.0.7");
+    let anonymous = hub.open_session(ConnInfo {
+        transport: "http".into(),
+        ip: "10.0.0.9".into(),
+        client: None,
+    });
+    anonymous.close("idle_timeout");
+
+    let admin = hub.admin("127.0.0.1");
+    let sessions = admin.connections(&logs(10)).unwrap();
+    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions[0].ip, "10.0.0.9", "newest first");
+    assert_eq!(sessions[0].agent, None);
+    assert_eq!(sessions[0].reason.as_deref(), Some("idle_timeout"));
+
+    let open = &sessions[1];
+    assert_eq!(open.agent.as_deref(), Some("crash-bot"));
+    assert!(!open.registered);
+    assert!(open.disconnected_at.is_none());
+
+    let first = &sessions[2];
+    assert_eq!(first.agent.as_deref(), Some("crash-bot"));
+    assert!(first.registered);
+    assert_eq!(first.client.as_deref(), Some("test-client 1.0"));
+    assert_eq!(first.reason.as_deref(), Some("client_closed"));
+    assert_eq!(first.changes, 1);
+    assert!(first.connected_at.is_some() && first.identified_at.is_some());
+
+    let filtered = admin
+        .connections(&LogFilter {
+            ip: Some("10.0.0.7".into()),
+            ..logs(10)
+        })
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+
+    let events = admin
+        .connection_events(&LogFilter {
+            agent: Some("crash-bot".into()),
+            ..logs(50)
+        })
+        .unwrap();
+    let connect = events
+        .iter()
+        .find(|e| e["event"] == "connect" && e["ip"] == "10.0.0.1")
+        .unwrap();
+    assert_eq!(connect["agent"], "crash-bot", "filled in from the session");
+    assert!(events.iter().all(|e| e["event"] != "memory_changed"));
+}
+
+#[test]
+fn stats_summarize_memories_and_activity() {
+    let (_dir, hub) = hub();
+    let mut a = agent(&hub, "crash-bot", "10.0.0.1");
+    a.add_repo("engine", None, None).unwrap();
+    for title in ["one", "two"] {
+        a.add_memory(AddMemory {
+            scope: Scope::Repo,
+            repo: Some("engine".into()),
+            title: title.into(),
+            kind: Some("pitfall".into()),
+            body: "b".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    a.add_memory(AddMemory {
+        scope: Scope::Agent,
+        title: "mine".into(),
+        body: "b".into(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let stats = hub.admin("127.0.0.1").stats().unwrap();
+    assert_eq!(stats.memories, 3);
+    assert_eq!(stats.repo_memories, 2);
+    assert_eq!(stats.agent_memories, 1);
+    assert_eq!((stats.repo_folders, stats.agent_folders), (1, 1));
+    assert_eq!((stats.registered_agents, stats.registered_repos), (1, 1));
+    assert_eq!(stats.kinds[0], ("pitfall".to_string(), 2));
+    assert_eq!(stats.top_folders[0], ("repo/engine".to_string(), 2));
+    assert_eq!(stats.top_agents, vec![("crash-bot".to_string(), 3)]);
+    assert_eq!(stats.activity.len(), 14);
+    assert_eq!(stats.connections_today, 1);
+    assert_eq!(stats.changes_today, 3);
+    assert_eq!(stats.active_agents_today, 1);
+    assert_eq!(stats.recent_updates.len(), 3);
+    assert!(stats.recent_updates[0].get("diff").is_none());
+}

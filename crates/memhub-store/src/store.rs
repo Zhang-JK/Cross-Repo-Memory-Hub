@@ -104,10 +104,10 @@ impl MemoryStore {
         };
 
         let dir = self.memories.join(new.scope.as_str()).join(&new.owner);
-        fs::create_dir_all(&dir).at(&dir)?;
         let now = Utc::now();
 
         let _guard = self.lock();
+        fs::create_dir_all(&dir).at(&dir)?;
         for n in 1u32.. {
             let slug = if n == 1 {
                 base.clone()
@@ -274,6 +274,40 @@ impl MemoryStore {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Creates the (empty) memory folder of a repo or agent. Returns `false`
+    /// if it already existed.
+    pub fn create_owner(&self, scope: Scope, owner: &str) -> Result<bool> {
+        validate_name(owner_kind(scope), owner)?;
+        let dir = self.memories.join(scope.as_str()).join(owner);
+        let _guard = self.lock();
+        if dir.is_dir() {
+            return Ok(false);
+        }
+        fs::create_dir(&dir).at(&dir)?;
+        Ok(true)
+    }
+
+    /// Moves a whole memory folder to `trash/<scope>/<owner>/<timestamp>/`
+    /// and returns the memories it contained.
+    pub fn delete_owner(&self, scope: Scope, owner: &str) -> Result<Vec<Memory>> {
+        validate_name(owner_kind(scope), owner)?;
+        let source = self.memories.join(scope.as_str()).join(owner);
+        let _guard = self.lock();
+        if !source.is_dir() {
+            return Err(StoreError::NotFound(format!("{scope}/{owner}")));
+        }
+        let memories = self.scan(&Filter {
+            scope: Some(scope),
+            owner: Some(owner.to_string()),
+            ..Default::default()
+        })?;
+        let dir = self.trash.join(scope.as_str()).join(owner);
+        fs::create_dir_all(&dir).at(&dir)?;
+        let target = dir.join(Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string());
+        fs::rename(&source, &target).at(&source)?;
+        Ok(memories)
     }
 
     fn modify(

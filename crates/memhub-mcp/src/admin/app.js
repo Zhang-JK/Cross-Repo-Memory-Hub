@@ -264,7 +264,7 @@ function showLogin(reason) {
     localStorage.setItem(TOKEN_KEY, app.token);
     overlay.remove();
     $('#logout').classList.remove('hidden');
-    render();
+    start();
   });
   $('#modal-root').append(overlay);
   setTimeout(() => input.focus(), 0);
@@ -1003,6 +1003,11 @@ window.addEventListener('hashchange', render);
     $('#view').replaceChildren(errorBox(new Error(`Cannot reach the server: ${e.message}`)));
     return;
   }
+  start();
+})();
+
+/** Runs once access is granted (at boot or after signing in). */
+function start() {
   if (route().tab !== 'dashboard') api('/stats').then((st) => updateServerInfo(st.server)).catch(() => {});
   render();
-})();
+}

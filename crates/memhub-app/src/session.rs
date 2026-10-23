@@ -556,10 +556,12 @@ impl AgentSession {
     ) -> Result<Change> {
         let me = self.require_agent()?.to_string();
         self.check_write(id.scope, &id.owner)?;
+        let new_folders = self.missing_folders(id.scope, &id.owner, folder)?;
         let change = self
             .hub
             .store()
             .move_memory(id, folder, slug, expected_version, &me)?;
+        self.record_new_folders(id.scope, &id.owner, new_folders);
         if !change.is_noop() {
             self.audit_change(
                 MemoryAction::Move,
@@ -598,15 +600,7 @@ impl AgentSession {
             author: me,
             slug: input.slug,
         })?;
-        for folder in new_folders {
-            self.hub.audit().record(AuditEvent::FolderCreated {
-                actor: self.actor(),
-                scope: input.scope.to_string(),
-                owner: owner.clone(),
-                folder,
-                description: None,
-            });
-        }
+        self.record_new_folders(input.scope, &owner, new_folders);
         self.audit_change(
             MemoryAction::Add,
             &memory,
@@ -694,19 +688,19 @@ impl AgentSession {
     /// Subfolders on the way to `folder` (inclusive) that do not exist yet,
     /// parents first.
     pub fn missing_folders(&self, scope: Scope, owner: &str, folder: &str) -> Result<Vec<String>> {
-        let store = self.hub.store();
-        let mut out = Vec::new();
-        let mut path = String::new();
-        for segment in folder.split('/').filter(|s| !s.is_empty()) {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path.push_str(segment);
-            if !store.folder_exists(scope, owner, &path)? {
-                out.push(path.clone());
-            }
+        self.hub.missing_folders(scope, owner, folder)
+    }
+
+    fn record_new_folders(&self, scope: Scope, owner: &str, folders: Vec<String>) {
+        for folder in folders {
+            self.hub.audit().record(AuditEvent::FolderCreated {
+                actor: self.actor(),
+                scope: scope.to_string(),
+                owner: owner.to_string(),
+                folder,
+                description: None,
+            });
         }
-        Ok(out)
     }
 
     /// Agent memory: only its owner may write. Repo memory: any agent that

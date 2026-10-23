@@ -362,6 +362,13 @@ async fn folder_hierarchy_workflow() {
             .contains("browse_memory"),
         "{join}"
     );
+    let (err, moved) = b
+        .tool(
+            "move_memory",
+            json!({ "id": "repo/shop/loose-note-3", "folder": "archive/2026" }),
+        )
+        .await;
+    assert!(!err, "{moved}");
 
     let events: Vec<String> = hub
         .audit()
@@ -386,6 +393,9 @@ async fn folder_hierarchy_workflow() {
             "memory_changed ",
             "folder_created task-logs",
             "folder_created task-logs/2026",
+            "folder_created archive",
+            "folder_created archive/2026",
+            "memory_changed ",
         ]
     );
 }

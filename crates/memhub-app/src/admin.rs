@@ -349,21 +349,8 @@ impl Admin {
             }
         }
 
-        let store = self.hub.store();
-        let mut new_folders = Vec::new();
-        let mut path = String::new();
-        for segment in new.folder.split('/').filter(|s| !s.is_empty()) {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path.push_str(segment);
-            if validate_owner(new.scope, &new.owner).is_ok()
-                && !store.folder_exists(new.scope, &new.owner, &path)?
-            {
-                new_folders.push(path.clone());
-            }
-        }
-        let memory = store.add(new)?;
+        let new_folders = self.hub.missing_folders(new.scope, &new.owner, &new.folder)?;
+        let memory = self.hub.store().add(new)?;
         for folder in new_folders {
             self.record_folder_created(memory.meta.scope(), memory.meta.owner(), &folder, None);
         }
@@ -381,10 +368,14 @@ impl Admin {
     /// renaming it.
     pub fn move_memory(&self, id: &MemoryId, folder: &str, slug: Option<&str>) -> Result<Memory> {
         let slug = slug.map(str::trim).filter(|s| !s.is_empty());
+        let new_folders = self.hub.missing_folders(id.scope, &id.owner, folder)?;
         let change = self
             .hub
             .store()
             .move_memory(id, folder, slug, None, ADMIN_ACTOR)?;
+        for path in new_folders {
+            self.record_folder_created(id.scope, &id.owner, &path, None);
+        }
         if !change.is_noop() {
             self.hub.audit().record(AuditEvent::MemoryChanged {
                 actor: self.actor.clone(),
@@ -439,17 +430,7 @@ impl Admin {
             return Ok(created);
         }
         let before = store.folder_description(scope, owner, &folder)?;
-        let mut missing = Vec::new();
-        let mut path = String::new();
-        for segment in folder.split('/') {
-            if !path.is_empty() {
-                path.push('/');
-            }
-            path.push_str(segment);
-            if !store.folder_exists(scope, owner, &path)? {
-                missing.push(path.clone());
-            }
-        }
+        let missing = self.hub.missing_folders(scope, owner, &folder)?;
         if !store.owners(scope)?.iter().any(|o| o == owner) {
             self.record_folder_created(scope, owner, "", None);
         }
@@ -852,14 +833,6 @@ impl Admin {
         stats.recent_updates = recent;
         Ok(stats)
     }
-}
-
-fn validate_owner(scope: Scope, owner: &str) -> Result<()> {
-    let kind = match scope {
-        Scope::Repo => "repo id",
-        Scope::Agent => "agent name",
-    };
-    Ok(memhub_store::validate_name(kind, owner)?)
 }
 
 fn str_field<'a>(record: &'a Value, key: &str) -> &'a str {

@@ -90,8 +90,10 @@ scripts/test-mcp.sh -v                         # print every request and respons
 
 It runs a full MCP session over HTTP (initialize, every tool, permission and version-conflict
 checks, session close) as agent `memhub-selftest` in repo `memhub-selftest`, deletes the
-memories it created, and exits non-zero on any failure. Proxies are bypassed unless
-`MEMHUB_TEST_PROXY=1`.
+memories it created, and exits non-zero on any failure. It is not a background watchdog:
+nothing runs it unless you do. Proxies are bypassed unless `MEMHUB_TEST_PROXY=1`.
+The management page omits this agent from the connection log, the update log, the
+activity counts, and the Excel export.
 
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs`, `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,

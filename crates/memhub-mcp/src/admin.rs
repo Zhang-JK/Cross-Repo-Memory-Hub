@@ -21,7 +21,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use memhub_app::{
-    admin::{AdminNewMemory, ConnectionSession, LogFilter},
+    admin::{is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
     store::{MemoryId, Scope},
     Admin, AppError,
 };
@@ -29,7 +29,7 @@ use rust_xlsxwriter::{Color, Format, Workbook, Worksheet, XlsxError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::http::{client_ip, HttpState};
+use crate::http::{client_ip, HttpState, LiveSession};
 
 const INDEX_HTML: &str = include_str!("admin/index.html");
 const APP_JS: &str = include_str!("admin/app.js");
@@ -261,6 +261,15 @@ fn caller(state: &HttpState, headers: &HeaderMap, peer: SocketAddr) -> String {
     client_ip(state.config(), headers, peer)
 }
 
+/// Live MCP sessions, without the self-test probe.
+fn shown_live(state: &HttpState) -> Vec<LiveSession> {
+    state
+        .live_sessions()
+        .into_iter()
+        .filter(|s| s.agent.as_deref().is_none_or(|a| !is_internal_agent(a)))
+        .collect()
+}
+
 fn parse_json<T: DeserializeOwned>(body: JsonBody) -> Result<T, ApiError> {
     let Json(value) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     serde_json::from_value(value).map_err(|e| ApiError::bad_request(e.to_string()))
@@ -284,7 +293,7 @@ async fn stats(
     let ip = caller(&state, &headers, peer);
     let stats = run(&state, ip, |admin| admin.stats()).await?;
     let mut v = serde_json::to_value(stats).map_err(|_| ApiError::internal())?;
-    v["live_sessions"] = json!(state.live_sessions());
+    v["live_sessions"] = json!(shown_live(&state));
     v["server"] = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "started_at": state.started_at(),
@@ -295,7 +304,7 @@ async fn stats(
 }
 
 async fn sessions(State(state): State<AppState>) -> ApiResult {
-    ok(json!({ "sessions": state.live_sessions() }))
+    ok(json!({ "sessions": shown_live(&state) }))
 }
 
 async fn folders(
@@ -476,8 +485,7 @@ async fn connections(
         let events = run(&state, ip, move |admin| admin.connection_events(&filter)).await?;
         return ok(json!({ "events": events }));
     }
-    let live: Vec<String> = state
-        .live_sessions()
+    let live: Vec<String> = shown_live(&state)
         .into_iter()
         .map(|s| s.session_id)
         .collect();
@@ -501,7 +509,7 @@ async fn connection_summary(
     let ip = caller(&state, &headers, peer);
     let summary = run(&state, ip, |admin| admin.connection_summary()).await?;
     ok(json!({
-        "live": state.live_sessions().len(),
+        "live": shown_live(&state).len(),
         "week": summary.week,
         "month": summary.month,
     }))
@@ -531,8 +539,7 @@ async fn export_connections(
         limit: EXPORT_MAX + 1,
         ..Default::default()
     };
-    let live: HashSet<String> = state
-        .live_sessions()
+    let live: HashSet<String> = shown_live(&state)
         .into_iter()
         .map(|s| s.session_id)
         .collect();

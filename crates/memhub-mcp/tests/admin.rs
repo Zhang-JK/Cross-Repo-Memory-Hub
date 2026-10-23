@@ -494,3 +494,35 @@ async fn connection_summary_and_year_export() {
     assert_eq!(summary["live"], 0);
     assert_eq!(summary["month"]["connections"], 0);
 }
+
+#[tokio::test]
+async fn selftest_agent_is_omitted_from_the_admin_api() {
+    let (_dir, router) = app(None);
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": { "name": "probe", "version": "1" } }
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header("content-type", "application/json")
+                .header("x-memhub-agent", "memhub-selftest")
+                .header("x-memhub-role", "selftest")
+                .body(Body::from(init.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (_, summary) = call(&router, "GET", "/api/admin/connections/summary", None, &[]).await;
+    assert_eq!(summary["live"], 0);
+    assert_eq!(summary["week"]["connections"], 0);
+    let (_, conns) = call(&router, "GET", "/api/admin/connections", None, &[]).await;
+    assert_eq!(conns["sessions"].as_array().unwrap().len(), 0);
+    let (_, stats) = call(&router, "GET", "/api/admin/stats", None, &[]).await;
+    assert_eq!(stats["live_sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(stats["connections_today"], 0);
+}

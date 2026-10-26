@@ -13,8 +13,8 @@ use crate::{
     frontmatter,
     model::{
         normalize_folder, normalize_labels, owner_kind, slugify, validate_label, validate_name,
-        Change, Filter, FolderInfo, GroupKey, Memory, MemoryId, MemoryMeta, MemoryPatch, NewMemory,
-        Scope, SearchHit, SearchQuery, MAX_FOLDER_DEPTH,
+        validate_title, Change, Filter, FolderInfo, GroupKey, Memory, MemoryId, MemoryMeta,
+        MemoryPatch, NewMemory, Scope, SearchHit, SearchQuery, MAX_FOLDER_DEPTH,
     },
     search,
 };
@@ -95,9 +95,7 @@ impl MemoryStore {
         validate_name(owner_kind(new.scope), &new.owner)?;
         let folder = normalize_folder(&new.folder)?;
         let title = new.title.trim().to_string();
-        if title.is_empty() {
-            return Err(StoreError::Invalid("title must not be empty".into()));
-        }
+        validate_title(&title)?;
         if new.author.trim().is_empty() {
             return Err(StoreError::Invalid("author must not be empty".into()));
         }
@@ -659,9 +657,7 @@ fn apply_patch(memory: &mut Memory, patch: MemoryPatch) -> Result<()> {
     let meta = &mut memory.meta;
     if let Some(title) = patch.title {
         let title = title.trim();
-        if title.is_empty() {
-            return Err(StoreError::Invalid("title must not be empty".into()));
-        }
+        validate_title(title)?;
         meta.title = title.to_string();
     }
     if let Some(kind) = patch.kind {

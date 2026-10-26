@@ -534,3 +534,155 @@ fn hand_written_files_are_picked_up() {
     assert_eq!(all.len(), 1, "malformed files are skipped");
     assert_eq!(all[0].meta.title, "Manual note");
 }
+
+const UNICODE_BODY: &str = "支付重试策略：最多 3 次 🔁\n\
+日本語: リトライは指数バックオフ ✅\n\
+한국어 메모, Ελληνικά, العربية\n\
+Symbols: → ≥ ≤ € £ © ™ «» — “quotes” ½ ∑ √\n\
+Emoji: 🚀 👍🏽 👨‍👩‍👧 🇯🇵\n";
+
+#[test]
+fn content_accepts_any_unicode() {
+    let (dir, store) = store();
+    let m = store
+        .add(NewMemory {
+            kind: Some("落とし穴".into()),
+            tags: vec!["支付".into(), "🚀".into(), "café".into()],
+            groups: vec!["チーム".into()],
+            ..new(Scope::Repo, "engine", "Payment retry policy", UNICODE_BODY)
+        })
+        .unwrap();
+    assert_eq!(m.meta.id.to_string(), "repo/engine/payment-retry-policy");
+    assert_eq!(m.body, UNICODE_BODY);
+
+    let on_disk = std::fs::read_to_string(
+        dir.path()
+            .join("memories/repo/engine/payment-retry-policy.md"),
+    )
+    .unwrap();
+    assert!(on_disk.contains("👨‍👩‍👧"), "stored as UTF-8, not escaped");
+    assert!(on_disk.contains("kind: 落とし穴"));
+
+    let fetched = store.get(m.id()).unwrap();
+    assert_eq!(fetched, m);
+    assert_eq!(fetched.meta.tags, vec!["支付", "🚀", "café"]);
+
+    let change = store
+        .update(
+            m.id(),
+            MemoryPatch {
+                append: Some("追加: 絵文字 🎉".into()),
+                tags: Some(vec!["Café".into(), "café".into(), "決済".into()]),
+                ..Default::default()
+            },
+            "bob",
+        )
+        .unwrap();
+    assert!(change.after.body.ends_with("追加: 絵文字 🎉\n"));
+    assert_eq!(change.after.meta.tags, vec!["Café", "決済"]);
+
+    for (query, expected) in [
+        ("重试", 1),
+        ("リトライ", 1),
+        ("🚀", 1),
+        ("€", 1),
+        ("絵文字", 1),
+        ("决济", 0),
+    ] {
+        let hits = store
+            .search(&SearchQuery {
+                text: Some(query.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), expected, "search {query:?}");
+    }
+
+    let long = format!("{}關鍵字在最後", "很长的一行".repeat(200));
+    store
+        .add(new(Scope::Repo, "engine", "Long line", &long))
+        .unwrap();
+    let hits = store
+        .search(&SearchQuery {
+            text: Some("很长".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].snippet.ends_with('…'),
+        "long CJK lines are cut on a character boundary"
+    );
+
+    assert!(store
+        .create_folder(Scope::Repo, "engine", "pitfalls", Some("坑和事故 🔥"))
+        .unwrap());
+    let tree = store.folders(Scope::Repo, "engine").unwrap();
+    let pitfalls = tree.iter().find(|f| f.path == "pitfalls").unwrap();
+    assert_eq!(pitfalls.description.as_deref(), Some("坑和事故 🔥"));
+}
+
+#[test]
+fn titles_must_be_ascii() {
+    let (_dir, store) = store();
+    for title in ["支付重试", "Retry 🔁", "Café notes", "naïve"] {
+        let err = store
+            .add(new(Scope::Repo, "engine", title, "body"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("title must be ASCII"), "{title}: {err}");
+        assert!(err.contains("body"), "the error points to the body: {err}");
+    }
+    let ok = store
+        .add(new(
+            Scope::Repo,
+            "engine",
+            "C++ & Rust: FFI rules (v2) #1 ~ 100%",
+            "printable ASCII punctuation is fine",
+        ))
+        .unwrap();
+    let err = store
+        .update(
+            ok.id(),
+            MemoryPatch {
+                title: Some("FFI 规则".into()),
+                ..Default::default()
+            },
+            "bob",
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("title must be ASCII"));
+    assert!(store
+        .add(new(Scope::Repo, "engine", "tab\there", "b"))
+        .is_err());
+}
+
+#[test]
+fn existing_non_ascii_titles_stay_readable() {
+    let (dir, store) = store();
+    let path = dir.path().join("memories/repo/engine");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(
+        path.join("legacy.md"),
+        "---\ntitle: 旧的标题 🔁\nkind: note\nversion: 1\n---\n\n旧内容\n",
+    )
+    .unwrap();
+    let id: MemoryId = "repo/engine/legacy".parse().unwrap();
+    let m = store.get(&id).unwrap();
+    assert_eq!(m.meta.title, "旧的标题 🔁");
+    let change = store
+        .update(
+            &id,
+            MemoryPatch {
+                append: Some("新内容 ✅".into()),
+                ..Default::default()
+            },
+            "bob",
+        )
+        .unwrap();
+    assert_eq!(
+        change.after.meta.title, "旧的标题 🔁",
+        "untouched titles are kept"
+    );
+    assert!(change.after.body.contains("新内容 ✅"));
+}

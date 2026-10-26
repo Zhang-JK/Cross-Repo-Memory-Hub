@@ -1084,7 +1084,7 @@ async function viewConnections(view, params) {
             : h('span', { class: 'badge', title: 'No disconnect recorded (server restarted or log window cut)', text: 'unknown' });
         const duration = r.live && r.connected_at ? (Date.now() - new Date(r.connected_at)) / 1000 : r.duration_secs;
         return h('tr', {},
-          h('td', {}, status),
+          h('td', {}, status, r.resumed ? [' ', h('span', { class: 'badge registered', title: 'The session had expired (idle timeout or server restart) and was reopened under the same id and agent', text: 'resumed' })] : null),
           h('td', {}, r.agent ? filterAgent(r.agent) : agentLabel(null), r.registered ? [' ', h('span', { class: 'badge registered', title: 'Agent registered by this connection', text: 'new' })] : null),
           h('td', { class: 'wrap' }, r.instance ? h('span', { text: r.instance }) : h('span', { class: 'muted', title: 'No X-Memhub-Instance header', text: '—' })),
           h('td', { class: 'mono nowrap', text: r.ip }),
@@ -1100,7 +1100,7 @@ async function viewConnections(view, params) {
   function eventsTable(rows) {
     const detail = (r) => {
       switch (r.event) {
-        case 'connect': return [r.client && `client ${r.client}`, r.instance && `instance ${r.instance}`].filter(Boolean).join(', ');
+        case 'connect': return [r.resumed && 'resumed expired session', r.client && `client ${r.client}`, r.instance && `instance ${r.instance}`].filter(Boolean).join(', ');
         case 'disconnect': return `${r.reason} after ${fmtDuration(r.duration_secs)}`;
         case 'agent_registered': return `registered with role ${r.role}`;
         case 'agent_login': return 'identified';

@@ -542,7 +542,7 @@ async fn connections(
         .into_iter()
         .map(|s| {
             let mut v = json!(s);
-            v["live"] = json!(live.contains(&s.session_id));
+            v["live"] = json!(is_live(&s, |id| live.iter().any(|l| l == id)));
             v
         })
         .collect();
@@ -656,7 +656,13 @@ const XLSX_COLUMNS: &[(&str, f64)] = &[
     ("Duration (seconds)", 18.0),
     ("Memory changes", 16.0),
     ("Live", 10.0),
+    ("Resumed", 10.0),
 ];
+
+/// A resumed session id has an entry per stretch; only the open one is live.
+fn is_live(session: &ConnectionSession, open: impl Fn(&str) -> bool) -> bool {
+    session.disconnected_at.is_none() && open(&session.session_id)
+}
 
 fn connections_xlsx(
     sessions: &[ConnectionSession],
@@ -680,7 +686,7 @@ fn connections_xlsx(
             sheet,
             u32::try_from(i + 1).unwrap_or(u32::MAX),
             session,
-            live.contains(&session.session_id),
+            is_live(session, |id| live.contains(id)),
             now,
             &seconds,
         )?;
@@ -731,6 +737,7 @@ fn write_session_row(
     }
     sheet.write_number(row, 12, session.changes as f64)?;
     sheet.write_string(row, 13, if live { "yes" } else { "no" })?;
+    sheet.write_string(row, 14, if session.resumed { "yes" } else { "no" })?;
     Ok(())
 }
 

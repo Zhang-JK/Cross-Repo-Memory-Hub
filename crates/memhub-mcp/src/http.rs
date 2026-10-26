@@ -7,13 +7,20 @@
 //! - `GET /mcp` returns 405: this server never pushes messages.
 //!
 //! Sessions idle for longer than the configured timeout are closed and
-//! audited with reason `idle_timeout`.
+//! audited with reason `idle_timeout`. The agent identity is bound to the
+//! session, so an expired session is remembered for
+//! [`HttpConfig::resume_ttl`]: when the client uses its id again, the session
+//! is reopened under the same id and identity instead of answering 404 (which
+//! makes clients start a fresh, unidentified session). Sessions open at
+//! shutdown are saved to [`HttpConfig::resume_file`] and resumable after a
+//! restart the same way.
 //!
 //! The same router serves the management UI ([`crate::admin`]) and `/health`.
 
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -28,7 +35,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use memhub_app::{clean_instance, ConnInfo, Hub};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -55,6 +62,37 @@ pub struct HttpConfig {
     pub idle_timeout: Duration,
     /// Required (as `Authorization: Bearer <token>`) by the admin API when set.
     pub admin_token: Option<String>,
+    /// How long an expired session can be resumed by its id.
+    pub resume_ttl: Duration,
+    /// Where sessions open at shutdown are saved for resumption after a
+    /// restart. `None` keeps them in memory only.
+    pub resume_file: Option<PathBuf>,
+}
+
+/// Longest list of resumable sessions kept; the oldest are dropped first.
+const MAX_RESUMABLE: usize = 10_000;
+
+/// What is needed to reopen an expired session under its old id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Resumable {
+    agent: Option<String>,
+    client: Option<String>,
+    instance: Option<String>,
+    protocol_version: String,
+    expired_at: DateTime<Utc>,
+}
+
+impl Resumable {
+    fn of(conn: &McpConnection) -> Self {
+        let session = conn.session();
+        Self {
+            agent: session.agent().map(str::to_string),
+            client: session.conn().client.clone(),
+            instance: session.conn().instance.clone(),
+            protocol_version: conn.protocol_version().to_string(),
+            expired_at: Utc::now(),
+        }
+    }
 }
 
 impl Default for HttpConfig {
@@ -64,6 +102,8 @@ impl Default for HttpConfig {
             allowed_origins: Vec::new(),
             idle_timeout: Duration::from_secs(60 * 60),
             admin_token: None,
+            resume_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            resume_file: None,
         }
     }
 }
@@ -89,17 +129,26 @@ pub struct HttpState {
     hub: Arc<Hub>,
     config: HttpConfig,
     sessions: Mutex<HashMap<String, SharedConnection>>,
+    resumable: Mutex<HashMap<String, Resumable>>,
     started_at: DateTime<Utc>,
 }
 
 impl HttpState {
     pub fn new(hub: Arc<Hub>, config: HttpConfig) -> Arc<Self> {
-        Arc::new(Self {
+        let resumable = config
+            .resume_file
+            .as_ref()
+            .map(load_resumable)
+            .unwrap_or_default();
+        let state = Arc::new(Self {
             hub,
             config,
             sessions: Mutex::new(HashMap::new()),
+            resumable: Mutex::new(resumable),
             started_at: Utc::now(),
-        })
+        });
+        state.prune_resumable();
+        state
     }
 
     pub fn hub(&self) -> &Arc<Hub> {
@@ -160,7 +209,7 @@ impl HttpState {
     /// skipped (they are, by definition, not idle).
     pub fn reap_idle(&self) {
         let now = Instant::now();
-        let expired: Vec<SharedConnection> = {
+        let expired: Vec<(String, SharedConnection)> = {
             let mut sessions = self.sessions();
             let ids: Vec<String> = sessions
                 .iter()
@@ -170,20 +219,106 @@ impl HttpState {
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
-            ids.iter().filter_map(|id| sessions.remove(id)).collect()
+            ids.iter()
+                .filter_map(|id| sessions.remove_entry(id))
+                .collect()
         };
-        for conn in expired {
+        for (id, conn) in expired {
+            self.remember(&id, &conn);
             close_shared(conn, "idle_timeout");
+        }
+        self.prune_resumable();
+    }
+
+    /// Closes every open session (on server shutdown). They stay resumable
+    /// and are saved to the resume file, if one is configured.
+    pub fn close_all(&self, reason: &str) {
+        let all: Vec<(String, SharedConnection)> = self.sessions().drain().collect();
+        for (id, conn) in all {
+            self.remember(&id, &conn);
+            close_shared(conn, reason);
+        }
+        self.prune_resumable();
+        if let Some(path) = &self.config.resume_file {
+            if let Err(e) = save_resumable(path, &self.resumable_sessions()) {
+                tracing::warn!("cannot save resumable sessions to {}: {e}", path.display());
+            }
         }
     }
 
-    /// Closes every open session (on server shutdown).
-    pub fn close_all(&self, reason: &str) {
-        let all: Vec<SharedConnection> = self.sessions().drain().map(|(_, c)| c).collect();
-        for conn in all {
-            close_shared(conn, reason);
+    /// Number of expired sessions that can still be resumed.
+    pub fn resumable_count(&self) -> usize {
+        self.resumable_sessions().len()
+    }
+
+    fn remember(&self, id: &str, conn: &SharedConnection) {
+        if let Ok(c) = conn.try_lock() {
+            self.resumable_sessions()
+                .insert(id.to_string(), Resumable::of(&c));
         }
     }
+
+    fn prune_resumable(&self) {
+        let ttl =
+            chrono::Duration::from_std(self.config.resume_ttl).unwrap_or(chrono::Duration::MAX);
+        let cutoff = Utc::now() - ttl;
+        let mut resumable = self.resumable_sessions();
+        resumable.retain(|_, r| r.expired_at > cutoff);
+        if resumable.len() > MAX_RESUMABLE {
+            let mut by_age: Vec<(DateTime<Utc>, String)> = resumable
+                .iter()
+                .map(|(id, r)| (r.expired_at, id.clone()))
+                .collect();
+            by_age.sort();
+            let excess = resumable.len() - MAX_RESUMABLE;
+            for (_, id) in by_age.into_iter().take(excess) {
+                resumable.remove(&id);
+            }
+        }
+    }
+
+    /// Takes the resumable record for `id`, if it has not outlived the TTL.
+    fn take_resumable(&self, id: &str) -> Option<Resumable> {
+        let ttl =
+            chrono::Duration::from_std(self.config.resume_ttl).unwrap_or(chrono::Duration::MAX);
+        self.resumable_sessions()
+            .remove(id)
+            .filter(|r| r.expired_at > Utc::now() - ttl)
+    }
+
+    fn resumable_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Resumable>> {
+        self.resumable.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn load_resumable(path: &PathBuf) -> HashMap<String, Resumable> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(
+                "cannot read resumable sessions from {}: {e}",
+                path.display()
+            );
+            return HashMap::new();
+        }
+    };
+    // Loaded once: a session resumed after this start must not be resumable
+    // again from a stale copy after the next restart.
+    let _ = std::fs::remove_file(path);
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        tracing::warn!("ignoring malformed {}: {e}", path.display());
+        HashMap::new()
+    })
+}
+
+fn save_resumable(path: &PathBuf, sessions: &HashMap<String, Resumable>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(sessions)?)?;
+    std::fs::rename(tmp, path)
 }
 
 /// If an in-flight request still holds the connection, the session's `Drop`
@@ -330,12 +465,19 @@ async fn handle_post(
             "missing Mcp-Session-Id header; send initialize first",
         );
     };
-    let Some(conn) = state.sessions().get(session_id).cloned() else {
-        return rpc_error(
-            StatusCode::NOT_FOUND,
-            protocol::NOT_INITIALIZED,
-            "unknown or expired session; re-initialize",
-        );
+    let existing = state.sessions().get(session_id).cloned();
+    let conn = match existing {
+        Some(conn) => conn,
+        None => match resume(&state, session_id, &headers, peer).await {
+            Some(conn) => conn,
+            None => {
+                return rpc_error(
+                    StatusCode::NOT_FOUND,
+                    protocol::NOT_INITIALIZED,
+                    "unknown or expired session; re-initialize",
+                )
+            }
+        },
     };
 
     let guard = conn.lock_owned().await;
@@ -433,12 +575,70 @@ async fn initialize(
     res
 }
 
+/// Reopens an expired session that is still resumable, under the same id and
+/// agent. The agent header fills in an identity the old session never had.
+async fn resume(
+    state: &Arc<HttpState>,
+    session_id: &str,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Option<SharedConnection> {
+    let Some(record) = state.take_resumable(session_id) else {
+        // A concurrent request may have resumed it a moment ago.
+        return state.sessions().get(session_id).cloned();
+    };
+    let conn_info = ConnInfo {
+        transport: "http".into(),
+        ip: client_ip(&state.config, headers, peer),
+        client: record.client.clone(),
+        instance: header_str(headers, INSTANCE_HEADER)
+            .and_then(clean_instance)
+            .or(record.instance.clone()),
+    };
+    let agent = record
+        .agent
+        .clone()
+        .or_else(|| header_str(headers, AGENT_HEADER).map(str::to_owned));
+    let role = header_str(headers, ROLE_HEADER).map(str::to_owned);
+    let hub = state.hub.clone();
+    let id = session_id.to_string();
+    let conn = tokio::task::spawn_blocking(move || {
+        McpConnection::resume(
+            &hub,
+            &id,
+            conn_info,
+            &record.protocol_version,
+            agent.as_deref(),
+            role.as_deref(),
+        )
+    })
+    .await
+    .ok()?;
+    tracing::info!(
+        session = %session_id,
+        agent = ?conn.session().agent(),
+        "mcp session resumed"
+    );
+    let shared = Arc::new(tokio::sync::Mutex::new(conn));
+    Some(
+        state
+            .sessions()
+            .entry(session_id.to_string())
+            .or_insert(shared)
+            .clone(),
+    )
+}
+
 async fn handle_delete(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
     let Some(session_id) = header_str(&headers, SESSION_HEADER) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(conn) = state.sessions().remove(session_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return if state.take_resumable(session_id).is_some() {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
     };
     // Wait for any in-flight request on this session before closing it.
     drop(conn.lock().await);

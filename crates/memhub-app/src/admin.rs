@@ -138,6 +138,9 @@ pub struct ConnectionSession {
     pub duration_secs: Option<f64>,
     /// Memory changes made during the connection.
     pub changes: usize,
+    /// The session had expired (idle timeout, server restart) and was
+    /// reopened under the same id; the earlier part is a separate entry.
+    pub resumed: bool,
 }
 
 /// Distinct connections, client IPs, agents and agent instances active in one
@@ -592,15 +595,22 @@ impl Admin {
             if !CONNECTION_EVENTS.contains(&event) {
                 continue;
             }
-            let i = *index.entry(sid.to_string()).or_insert_with(|| {
+            // A resumed session reconnects under the id of an earlier,
+            // already disconnected entry: it gets an entry of its own.
+            let reopened = event == "connect"
+                && index
+                    .get(sid)
+                    .is_some_and(|&i| sessions[i].disconnected_at.is_some());
+            if reopened || !index.contains_key(sid) {
                 sessions.push(ConnectionSession {
                     session_id: sid.to_string(),
                     ip: str_field(&record, "ip").to_string(),
                     transport: str_field(&record, "transport").to_string(),
                     ..Default::default()
                 });
-                sessions.len() - 1
-            });
+                index.insert(sid.to_string(), sessions.len() - 1);
+            }
+            let i = index[sid];
             let s = &mut sessions[i];
             let ts = record.get("ts").and_then(Value::as_str).map(str::to_string);
             if let Some(agent) = record.get("agent").and_then(Value::as_str) {
@@ -617,6 +627,7 @@ impl Admin {
                         .get("instance")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    s.resumed = record.get("resumed") == Some(&Value::Bool(true));
                 }
                 "agent_login" | "agent_registered" => {
                     s.identified_at = s.identified_at.take().or(ts);
@@ -842,7 +853,9 @@ impl Admin {
             }
             let agent = named.as_deref();
             match event {
-                "connect" => activity.connections += 1,
+                "connect" if record.get("resumed") != Some(&Value::Bool(true)) => {
+                    activity.connections += 1
+                }
                 "memory_changed" => {
                     activity.changes += 1;
                     if let Some(agent) = agent {
@@ -908,7 +921,7 @@ fn session_active_since(session: &ConnectionSession, start: DateTime<Utc>) -> bo
 fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> WindowCounts {
     let mut ips = HashSet::new();
     let mut agents = HashSet::new();
-    let mut connections = 0;
+    let mut connections = HashSet::new();
     let active: Vec<&ConnectionSession> = sessions
         .iter()
         .filter(|s| session_active_since(s, start))
@@ -919,7 +932,7 @@ fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> Window
             .map(|s| (s.agent.as_deref(), s.instance.as_deref(), s.ip.as_str())),
     );
     for session in active {
-        connections += 1;
+        connections.insert(session.session_id.as_str());
         if !session.ip.is_empty() {
             ips.insert(session.ip.clone());
         }
@@ -932,7 +945,7 @@ fn window_counts(sessions: &[ConnectionSession], start: DateTime<Utc>) -> Window
         }
     }
     WindowCounts {
-        connections,
+        connections: connections.len(),
         ips: ips.len(),
         agents: agents.len(),
         instances,

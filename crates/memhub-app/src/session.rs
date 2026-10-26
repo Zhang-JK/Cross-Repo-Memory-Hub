@@ -155,9 +155,18 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub(crate) fn open(hub: Arc<Hub>, conn: ConnInfo) -> Self {
+        Self::start(hub, conn, uuid::Uuid::new_v4().simple().to_string(), false)
+    }
+
+    /// Reopens an expired session under its old id (see [`Hub::resume_session`]).
+    pub(crate) fn resume(hub: Arc<Hub>, conn: ConnInfo, id: String) -> Self {
+        Self::start(hub, conn, id, true)
+    }
+
+    fn start(hub: Arc<Hub>, conn: ConnInfo, id: String, resumed: bool) -> Self {
         let session = Self {
             hub,
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id,
             conn,
             agent: None,
             opened: Instant::now(),
@@ -168,6 +177,7 @@ impl AgentSession {
             actor: session.actor(),
             client: session.conn.client.clone(),
             instance: session.conn.instance.clone(),
+            resumed,
         });
         session
     }

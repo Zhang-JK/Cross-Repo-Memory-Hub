@@ -737,10 +737,163 @@ async fn idle_sessions_are_reaped() {
     assert_eq!(log[0]["agent"], "sleepy");
     assert_eq!(log[0]["ip"], "192.168.0.2");
 
+    // The client keeps using its session id: the session is reopened under
+    // the same id, still identified, instead of answering 404.
+    let old_id = c.session.clone();
+    let (is_error, created) = c
+        .tool(
+            "add_memory",
+            json!({ "scope": "agent", "title": "After idle", "body": "still me" }),
+        )
+        .await;
+    assert!(!is_error, "{created}");
+    assert_eq!(c.session, old_id);
+    assert_eq!(state.session_count(), 1);
+    assert_eq!(state.resumable_count(), 0);
+
+    let connects = hub
+        .audit()
+        .read(&LogQuery {
+            event: Some("connect".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(connects.len(), 2);
+    assert!(connects[0].get("resumed").is_none());
+    assert_eq!(connects[1]["resumed"], true);
+    assert_eq!(connects[1]["session_id"], connects[0]["session_id"]);
+    assert_eq!(connects[1]["client"], "test-client 1.0");
+    let change = hub
+        .audit()
+        .read(&LogQuery {
+            event: Some("memory_changed".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(change[0]["agent"], "sleepy");
+    assert_eq!(change[0]["session_id"], connects[0]["session_id"]);
+
+    // Expire again, then end it explicitly: the resumable record goes away.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    state.reap_idle();
+    assert_eq!(state.resumable_count(), 1);
+    assert_eq!(c.delete().await, StatusCode::NO_CONTENT);
+    assert_eq!(state.resumable_count(), 0);
     let (status, _) = c
         .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), &[])
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn resume_fills_identity_from_agent_header() {
+    let (_dir, _hub, state) = setup(Duration::from_millis(50));
+    let mut c = client(&state, "192.168.0.3");
+    c.initialize(&[]).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    state.reap_idle();
+
+    // The old session was never identified; the header (re-sent with every
+    // request by MCP clients) identifies the resumed one.
+    c.next_id += 1;
+    let (status, body) = c
+        .send(
+            json!({ "jsonrpc": "2.0", "id": c.next_id, "method": "tools/call",
+                    "params": { "name": "whoami", "arguments": {} } }),
+            &[
+                ("x-memhub-agent", "late-name"),
+                ("x-memhub-role", "feature-impl"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.unwrap()["result"].to_string();
+    assert!(text.contains("late-name"), "{text}");
+}
+
+#[tokio::test]
+async fn expired_sessions_outliving_resume_ttl_are_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    let state = HttpState::new(
+        hub,
+        HttpConfig {
+            idle_timeout: Duration::from_millis(50),
+            resume_ttl: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    let mut c = client(&state, "192.168.0.4");
+    c.initialize(&[]).await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    state.reap_idle();
+    assert_eq!(state.resumable_count(), 0);
+    let (status, _) = c
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), &[])
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sessions_resume_after_server_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let resume_file = dir.path().join("run").join("resumable-sessions.json");
+    let config = HttpConfig {
+        resume_file: Some(resume_file.clone()),
+        ..Default::default()
+    };
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    let state = HttpState::new(hub.clone(), config.clone());
+    let mut c = client(&state, "192.168.0.5");
+    c.initialize(&[("x-memhub-instance", "alice-laptop")]).await;
+    c.tool(
+        "connect_agent",
+        json!({ "name": "survivor", "role": "feature-impl" }),
+    )
+    .await;
+    state.close_all("server_shutdown");
+    drop(state);
+    assert!(resume_file.exists());
+
+    let restarted = HttpState::new(hub.clone(), config.clone());
+    assert!(!resume_file.exists(), "the resume file is read once");
+    assert_eq!(restarted.resumable_count(), 1);
+    c.app = router(restarted.clone()).layer(MockConnectInfo(
+        "192.168.0.5:40000".parse::<SocketAddr>().unwrap(),
+    ));
+    let (is_error, created) = c
+        .tool(
+            "add_memory",
+            json!({ "scope": "agent", "title": "After restart", "body": "same agent" }),
+        )
+        .await;
+    assert!(!is_error, "{created}");
+
+    let connects = hub
+        .audit()
+        .read(&LogQuery {
+            event: Some("connect".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(connects.len(), 2);
+    assert_eq!(connects[1]["resumed"], true);
+    assert_eq!(connects[1]["instance"], "alice-laptop");
+    let logins = hub
+        .audit()
+        .read(&LogQuery {
+            event: Some("agent_login".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0]["agent"], "survivor");
+    assert_eq!(logins[0]["session_id"], connects[0]["session_id"]);
+
+    // A third start without a clean shutdown has nothing left to resume.
+    drop(restarted);
+    let again = HttpState::new(hub, config);
+    assert_eq!(again.resumable_count(), 0);
 }
 
 #[test]

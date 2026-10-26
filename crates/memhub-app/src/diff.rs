@@ -22,3 +22,17 @@ pub(crate) fn unified_diff(before: &str, after: &str) -> Option<String> {
     }
     Some(diff)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_multibyte_diffs_on_a_char_boundary() {
+        let after = "重试策略 🔁 ".repeat(2000);
+        let diff = unified_diff("", &after).unwrap();
+        assert!(diff.ends_with("… (diff truncated)\n"));
+        assert!(diff.len() <= MAX_DIFF_BYTES + 32);
+        assert!(diff.contains("重试策略 🔁"));
+    }
+}

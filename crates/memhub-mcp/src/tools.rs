@@ -196,8 +196,8 @@ struct CreateFolderArgs {
     repo: Option<String>,
     /// Folder path below the repo / agent root, e.g. "modules/auth". Missing parents are created.
     folder: String,
-    /// One line on what belongs in this folder, shown by browse_memory. Replaces the current
-    /// description of an existing folder; "" removes it.
+    /// One line on what belongs in this folder, shown by browse_memory (any Unicode). Replaces
+    /// the current description of an existing folder; "" removes it.
     #[serde(default)]
     description: Option<String>,
 }
@@ -231,9 +231,10 @@ struct AddMemoryArgs {
     /// only for the repo's top-level overview.
     #[serde(default)]
     folder: Option<String>,
-    /// Short descriptive title.
+    /// Short descriptive title in ASCII (English letters, digits, spaces, punctuation), e.g.
+    /// "Payment retry policy". It also becomes the file name. Non-ASCII titles are rejected.
     title: String,
-    /// Markdown content.
+    /// Markdown content. Any Unicode is welcome: Chinese, Japanese, emoji, symbols, code.
     body: String,
     /// Category. Repo: overview, architecture, implementation, how-to, pitfall, decision.
     /// Agent: task-log, insight, todo.
@@ -253,20 +254,21 @@ struct AddMemoryArgs {
 struct UpdateMemoryArgs {
     /// Memory id.
     id: String,
+    /// New title; ASCII only (English letters, digits, spaces, punctuation).
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     kind: Option<String>,
-    /// Replaces all tags.
+    /// Replaces all tags (any Unicode).
     #[serde(default)]
     tags: Option<Vec<String>>,
     /// Replaces all groups.
     #[serde(default)]
     groups: Option<Vec<String>>,
-    /// Replaces the whole body.
+    /// Replaces the whole body (Markdown, any Unicode).
     #[serde(default)]
     body: Option<String>,
-    /// Appended to the body as a new paragraph.
+    /// Appended to the body as a new paragraph (Markdown, any Unicode).
     #[serde(default)]
     append: Option<String>,
     /// Fail if the memory's current version differs (optimistic locking).
@@ -389,7 +391,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "add_memory",
         title: "Add memory",
-        description: "Create a memory. scope=repo is for general repo knowledge shared by all agents (architecture, modules, how-to, pitfalls, decisions) in a repo you joined. scope=agent is for your own task-specific notebook (work logs, progress, to-dos, personal tricks). Ask: should another agent on a different task know this? Yes means repo, no means agent. Put it in the most specific fitting folder (e.g. folder=\"modules/auth\"); keep the root for the overview only.",
+        description: "Create a memory. scope=repo is for general repo knowledge shared by all agents (architecture, modules, how-to, pitfalls, decisions) in a repo you joined. scope=agent is for your own task-specific notebook (work logs, progress, to-dos, personal tricks). Ask: should another agent on a different task know this? Yes means repo, no means agent. Put it in the most specific fitting folder (e.g. folder=\"modules/auth\"); keep the root for the overview only. Title in English ASCII; body in any language (Unicode, emoji welcome).",
         schema: schema::<AddMemoryArgs>,
         read_only: false,
         destructive: false,

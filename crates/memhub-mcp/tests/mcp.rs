@@ -438,6 +438,91 @@ async fn folder_hierarchy_workflow() {
 }
 
 #[tokio::test]
+async fn unicode_content_and_ascii_titles() {
+    let (_dir, _hub, state) = setup(Duration::from_secs(600));
+    let mut a = client(&state, "10.2.0.3");
+    let (_, init) = a
+        .initialize(&[("x-memhub-agent", "i18n-bot"), ("x-memhub-role", "docs")])
+        .await;
+    let instructions = init.unwrap()["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        instructions.contains("accept any Unicode"),
+        "{instructions}"
+    );
+    let (err, _) = a.tool("add_repo", json!({ "repo": "shop" })).await;
+    assert!(!err);
+
+    let body = "结账流程 🛒\nリトライは 3 回まで ✅\n→ ≥ € 👨‍👩‍👧";
+    let (err, added) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
+                    "title": "Checkout flow", "body": body, "tags": ["结账", "🛒"] }),
+        )
+        .await;
+    assert!(!err, "{added}");
+    let id = added["created"]["id"].as_str().unwrap().to_string();
+    assert_eq!(id, "repo/shop/modules/checkout/checkout-flow");
+    assert_eq!(added["created"]["tags"], json!(["结账", "🛒"]));
+
+    let text = a.tool_text("get_memory", json!({ "id": id })).await;
+    assert!(text.contains(body), "{text}");
+    let (_, hits) = a
+        .tool("search_memory", json!({ "query": "リトライ" }))
+        .await;
+    assert_eq!(hits["hits"][0]["id"], id.as_str());
+    let (err, _) = a
+        .tool("update_memory", json!({ "id": id, "append": "追加 🎉" }))
+        .await;
+    assert!(!err);
+
+    let (err, msg) = a
+        .tool(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "title": "结账流程", "body": "x" }),
+        )
+        .await;
+    assert!(err);
+    let msg = msg.as_str().unwrap();
+    assert!(msg.contains("title must be ASCII"), "{msg}");
+    assert!(msg.contains("put Chinese, Japanese, emoji"), "{msg}");
+    let (err, msg) = a
+        .tool("update_memory", json!({ "id": id, "title": "Checkout 🛒" }))
+        .await;
+    assert!(
+        err && msg.as_str().unwrap().contains("title must be ASCII"),
+        "{msg}"
+    );
+
+    let (_, list) = a
+        .send(
+            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" }),
+            &[],
+        )
+        .await;
+    let list = list.unwrap();
+    let add = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "add_memory")
+        .unwrap()
+        .clone();
+    let props = &add["inputSchema"]["properties"];
+    assert!(props["title"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("ASCII"));
+    assert!(props["body"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Unicode"));
+}
+
+#[tokio::test]
 async fn full_http_workflow() {
     let (_dir, hub, state) = setup(Duration::from_secs(600));
 

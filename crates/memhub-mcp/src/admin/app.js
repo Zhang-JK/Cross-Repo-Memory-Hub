@@ -844,13 +844,14 @@ async function viewMemories(view, params) {
     scope.addEventListener('change', () => { fillOwners(); if (!st.folders.some((f) => f.scope === scope.value && f.owner === owner.value)) owner.value = ''; fillFolders(); });
     owner.addEventListener('input', fillFolders);
     fillOwners(); fillFolders();
-    const title = h('input', { type: 'text', autocomplete: 'off' });
+    const TITLE_HINT = 'English / ASCII only, e.g. Payment retry policy';
+    const title = h('input', { type: 'text', autocomplete: 'off', placeholder: TITLE_HINT });
     const kindList = h('datalist', { id: 'kind-options' }, ['overview', 'architecture', 'implementation', 'how-to', 'pitfall', 'decision', 'task-log', 'insight', 'todo', 'note'].map((k) => h('option', { value: k })));
     const kind = h('input', { type: 'text', list: 'kind-options', placeholder: 'note' });
     const tags = h('input', { type: 'text', placeholder: 'comma, separated' });
     const groups = h('input', { type: 'text', placeholder: 'comma, separated' });
     const slug = h('input', { type: 'text', placeholder: 'derived from the title', autocomplete: 'off' });
-    const body = h('textarea', { rows: 12, placeholder: 'Markdown content…' });
+    const body = h('textarea', { rows: 12, placeholder: 'Markdown content… any language, symbols and emoji are fine' });
     const useFm = h('input', { type: 'checkbox' });
     const fmNote = h('div', { class: 'note hidden' });
     const file = h('input', { type: 'file', accept: '.md,.markdown,.txt,text/markdown,text/plain', class: 'hidden' });
@@ -858,7 +859,7 @@ async function viewMemories(view, params) {
     const updateFm = () => {
       fmNote.classList.toggle('hidden', !useFm.checked);
       fmNote.textContent = 'The content is a complete memory file: title, kind, tags and groups are read from its front matter (or first "# heading") unless you fill them in above.';
-      title.placeholder = useFm.checked ? 'from front matter / first heading' : '';
+      title.placeholder = useFm.checked ? 'from front matter / first heading' : TITLE_HINT;
     };
     useFm.addEventListener('change', updateFm);
     file.addEventListener('change', async () => {
@@ -875,6 +876,7 @@ async function viewMemories(view, params) {
       err.textContent = '';
       if (!owner.value.trim()) { err.textContent = 'Choose the repo or agent.'; return; }
       if (!useFm.checked && !title.value.trim()) { err.textContent = 'A title is required.'; return; }
+      if (/[^\x20-\x7e]/.test(title.value)) { err.textContent = 'The title must be English / ASCII (it becomes the file name). Put Chinese, Japanese, emoji or other text in the content.'; return; }
       const payload = {
         scope: scope.value, owner: owner.value.trim(), folder: folder.value.trim(), title: title.value, kind: kind.value,
         tags: list(tags.value), groups: list(groups.value), slug: slug.value,

@@ -69,6 +69,11 @@ memories have no fitting home. Keep nesting shallow (2-3 levels).
 reorganize with `move_memory`, and keep the overview's folder map current.
 - Tool results may carry `hints` about organization; follow them.
 
+Text: titles, folder names, slugs, repo ids and agent names are ASCII only, because they \
+become file and folder names. Write titles in English (e.g. \"Payment retry policy\"). Memory \
+bodies, tags, kinds and descriptions accept any Unicode, so write the content in whatever \
+language and notation is clearest: Chinese, Japanese, emoji, symbols, code.
+
 Memory ids include the folder path: `repo/<repo>/[<folder>/]<slug>`, e.g. \
 `repo/payment-service/pitfalls/retry-storms`, or `agent/<agent>/[<folder>/]<slug>`. Moving a \
 memory changes its id. Pass `expected_version` when updating to avoid overwriting concurrent edits.";

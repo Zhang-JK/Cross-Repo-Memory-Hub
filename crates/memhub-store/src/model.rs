@@ -82,6 +82,23 @@ pub fn validate_name(kind: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates a memory title: non-empty printable ASCII (letters, digits,
+/// spaces and punctuation). Titles become file names and must stay readable in
+/// every tool; bodies, tags, kinds and descriptions accept any Unicode.
+pub fn validate_title(title: &str) -> Result<()> {
+    if title.trim().is_empty() {
+        return Err(StoreError::Invalid("title must not be empty".into()));
+    }
+    if let Some(c) = title.chars().find(|c| !matches!(c, ' '..='~')) {
+        return Err(StoreError::Invalid(format!(
+            "title must be ASCII (English letters, digits, spaces and punctuation), found {c:?}. \
+             Write the title in English, e.g. \"Payment retry policy\", and put Chinese, Japanese, \
+             emoji or other text in the body, which accepts any Unicode."
+        )));
+    }
+    Ok(())
+}
+
 /// Validates free-form labels such as tags, groups and kinds.
 pub fn validate_label(kind: &'static str, value: &str) -> Result<()> {
     let err = |reason| StoreError::InvalidName {

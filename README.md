@@ -97,6 +97,19 @@ Billing computes invoices nightly.
 
 Files can also be edited by hand; unknown front-matter keys are preserved.
 
+Text rules (files are UTF-8):
+
+| Field | Allowed |
+| --- | --- |
+| Body, tags, groups, kind, folder and repo descriptions, agent role | Any Unicode: Chinese, Japanese, Korean, symbols, emoji, ... |
+| Title | Printable ASCII (English letters, digits, spaces, punctuation) |
+| Repo id, agent name, folder names, slug (file name) | ASCII letters, digits, `-`, `_`, `.` |
+
+Titles stay ASCII so file names derived from them are meaningful and every tool can display
+them. A non-ASCII title is rejected with an error that asks for an English title and points to
+the body. Existing files with non-ASCII titles still load and can be edited; only setting a new
+title is checked. Search matches any Unicode text, including CJK words without spaces and emoji.
+
 ## Running
 
 ```bash

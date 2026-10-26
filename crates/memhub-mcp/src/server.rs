@@ -146,6 +146,30 @@ impl McpConnection {
         )
     }
 
+    /// Revives an expired session under its old id with the protocol version
+    /// it negotiated, re-identifying it as `agent` when it had one. An agent
+    /// that no longer exists leaves the session unidentified.
+    pub fn resume(
+        hub: &Arc<Hub>,
+        session_id: &str,
+        conn: ConnInfo,
+        protocol_version: &str,
+        agent: Option<&str>,
+        role: Option<&str>,
+    ) -> Self {
+        let mut session = hub.resume_session(session_id, conn);
+        if let Some(agent) = agent {
+            if let Err(e) = session.connect(agent, role, None) {
+                tracing::warn!(session = %session_id, "cannot restore identity '{agent}': {e}");
+            }
+        }
+        Self {
+            session,
+            protocol_version: protocol::negotiate_version(Some(protocol_version)),
+            last_seen: Instant::now(),
+        }
+    }
+
     pub fn session(&self) -> &AgentSession {
         &self.session
     }

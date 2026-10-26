@@ -49,6 +49,10 @@ enum Command {
         /// is open to anyone who can reach the server.
         #[arg(long, env = "MEMHUB_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: Option<String>,
+        /// Keep expired sessions (idle timeout, server restart) resumable by
+        /// their id, with the same agent identity, for this many seconds.
+        #[arg(long, default_value_t = 7 * 24 * 3600)]
+        resume_ttl_secs: u64,
     },
     /// Run the MCP server over stdio (one agent per process).
     Stdio {
@@ -107,12 +111,15 @@ fn main() -> anyhow::Result<()> {
             trust_proxy,
             allowed_origins,
             admin_token,
+            resume_ttl_secs,
         } => {
             let config = HttpConfig {
                 trust_proxy,
                 allowed_origins,
                 idle_timeout: Duration::from_secs(idle_timeout_secs.max(1)),
                 admin_token: admin_token.filter(|t| !t.trim().is_empty()),
+                resume_ttl: Duration::from_secs(resume_ttl_secs),
+                resume_file: Some(cli.data_dir.join("run").join("resumable-sessions.json")),
             };
             tokio::runtime::Runtime::new()?.block_on(serve(hub, bind, config))
         }
@@ -204,7 +211,7 @@ async fn serve(
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
+        shutdown_signal().await;
         tracing::info!("shutting down");
     })
     .await?;
@@ -214,6 +221,22 @@ async fn serve(
     Ok(())
 }
 
+/// Ctrl-C / SIGINT, or SIGTERM (sent by service managers) on Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn print_record(r: &Value, with_diff: bool) {
     let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("");
     let ts = s("ts").get(..19).unwrap_or(s("ts")).replace('T', " ");
@@ -221,12 +244,17 @@ fn print_record(r: &Value, with_diff: bool) {
     let event = s("event");
     let detail = match event {
         "connect" => format!(
-            "client={}{}",
+            "client={}{}{}",
             r.get("client").and_then(Value::as_str).unwrap_or("?"),
             r.get("instance")
                 .and_then(Value::as_str)
                 .map(|i| format!(" instance={i}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if r.get("resumed") == Some(&Value::Bool(true)) {
+                " resumed"
+            } else {
+                ""
+            }
         ),
         "disconnect" => format!(
             "reason={} after {:.1}s",

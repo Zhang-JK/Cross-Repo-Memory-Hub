@@ -81,6 +81,13 @@ impl Hub {
         AgentSession::open(self.clone(), conn)
     }
 
+    /// Opens a session under the id of one that expired, so a client that
+    /// keeps using that id carries on instead of starting over unidentified.
+    /// The caller restores the identity with [`AgentSession::connect`].
+    pub fn resume_session(self: &Arc<Self>, id: &str, conn: ConnInfo) -> AgentSession {
+        AgentSession::resume(self.clone(), conn, id.to_string())
+    }
+
     pub(crate) fn touch_agent(&self, name: &str) -> Result<()> {
         let _guard = self.registry.lock();
         if let Some(mut profile) = self.registry.agent(name)? {
@@ -108,7 +115,11 @@ impl Hub {
                 path.push('/');
             }
             path.push_str(segment);
-            if !self.store.folder_exists(scope, owner, &path).unwrap_or(true) {
+            if !self
+                .store
+                .folder_exists(scope, owner, &path)
+                .unwrap_or(true)
+            {
                 out.push(path.clone());
             }
         }

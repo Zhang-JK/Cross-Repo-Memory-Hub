@@ -156,8 +156,23 @@ activity counts, and the Excel export.
 
 Global option: `--data-dir` (`MEMHUB_DATA_DIR`).
 `serve` options: `--idle-timeout-secs` (default 3600: a session with no request for an hour is
-closed; the client's next request gets a 404 and it re-initializes), `--trust-proxy` (use `X-Forwarded-For`), `--allowed-origin`,
-`--admin-token` (`MEMHUB_ADMIN_TOKEN`).
+closed), `--resume-ttl-secs` (default 604800, 7 days; see below), `--trust-proxy` (use
+`X-Forwarded-For`), `--allowed-origin`, `--admin-token` (`MEMHUB_ADMIN_TOKEN`).
+
+**Idle timeout and session resume.** The agent identity belongs to the MCP session. When a
+session closes on idle timeout (or on a graceful server shutdown, SIGINT or SIGTERM), the hub
+remembers its id, agent, client and instance label for `--resume-ttl-secs`. If the client sends
+that `Mcp-Session-Id` again, the session reopens under the same id with the same identity,
+so the request succeeds and writes don't fail with `not_identified`. Without this, the client
+got a 404, started a fresh session, and stayed unidentified until it called `connect_agent`
+again. The audit log records a `connect` with `resumed: true` and, for identified sessions,
+an `agent_login`. The Connections page shows the reopened stretch as a separate row marked
+**resumed** that doesn't add to the connection or instance counts. Sessions open at shutdown are
+saved to `<data-dir>/run/resumable-sessions.json`, which is read once at the next start and then
+deleted. After a crash or `kill -9` nothing is saved, so clients re-initialize as before. A
+session ended with `DELETE /mcp` is never resumed. A session that never identified itself can
+be identified on resume from the `X-Memhub-Agent` header (and `X-Memhub-Role` for a new agent),
+so configuring the header remains the most robust option.
 
 ### Management web UI
 
@@ -285,7 +300,7 @@ against honest mistakes, not against an agent deliberately using another agent's
 ## Audit log
 
 Every record carries `ts`, `event`, `session_id`, `agent` (once identified), `ip` and `transport`.
-Events: `connect` (with MCP client name and `instance` label), `disconnect` (`client_closed`, `idle_timeout`,
+Events: `connect` (with MCP client name, `instance` label, and `resumed: true` when an expired session was reopened), `disconnect` (`client_closed`, `idle_timeout`,
 `stdio_eof`, `server_shutdown`, `connect_failed`, ...), `agent_registered` (first connection
 of a new agent), `agent_login`, `repo_joined`, `repo_left`, `memory_changed` with
 `action` (`add`/`update`/`move`/`delete`/`group_add`/`group_remove`), versions, changed fields,

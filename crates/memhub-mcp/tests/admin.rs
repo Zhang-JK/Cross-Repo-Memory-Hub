@@ -448,6 +448,72 @@ async fn connection_log_marks_live_sessions() {
     assert_eq!(events["events"][2]["agent"], "crash-bot");
 }
 
+#[tokio::test]
+async fn resumed_session_is_a_new_connection_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    let state = HttpState::new(
+        hub,
+        HttpConfig {
+            idle_timeout: std::time::Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+    let addr: SocketAddr = "10.1.2.3:5000".parse().unwrap();
+    let app = router(state.clone()).layer(MockConnectInfo(addr));
+    let post = |sid: Option<&str>, body: Value| {
+        let mut req = Request::post("/mcp")
+            .header("content-type", "application/json")
+            .header("x-memhub-agent", "napper")
+            .header("x-memhub-role", "feature-impl");
+        if let Some(sid) = sid {
+            req = req.header("mcp-session-id", sid);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+    };
+    let res = post(
+        None,
+        json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": { "name": "probe", "version": "1" } } }),
+    )
+    .await
+    .unwrap();
+    let sid = res.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    state.reap_idle();
+    let res = post(
+        Some(&sid),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (_, conns) = call(&app, "GET", "/api/admin/connections", None, &[]).await;
+    let sessions = conns["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0]["session_id"], sid.as_str());
+    assert_eq!(sessions[0]["resumed"], true);
+    assert_eq!(sessions[0]["live"], true);
+    assert_eq!(sessions[0]["agent"], "napper");
+    assert_eq!(sessions[0]["client"], "probe 1");
+    assert_eq!(sessions[1]["session_id"], sid.as_str());
+    assert_eq!(sessions[1]["resumed"], false);
+    assert_eq!(sessions[1]["live"], false);
+    assert_eq!(sessions[1]["reason"], "idle_timeout");
+
+    let (_, summary) = call(&app, "GET", "/api/admin/connections/summary", None, &[]).await;
+    assert_eq!(summary["week"]["connections"], 1, "{summary}");
+    let (_, stats) = call(&app, "GET", "/api/admin/stats", None, &[]).await;
+    assert_eq!(stats["connections_today"], 1);
+}
+
 fn append_log(dir: &std::path::Path, days_ago: i64, event: &str, rest: &str) {
     let ts = Utc::now() - Duration::days(days_ago);
     let path = dir

@@ -7,7 +7,11 @@ pub enum AppError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    #[error("not identified: call connect_agent with your agent name before using this tool")]
+    #[error(
+        "not identified: this MCP session has no agent identity. Call connect_agent with your agent \
+         name, then retry. To have every session identified automatically, set the X-Memhub-Agent \
+         header in the MCP client config"
+    )]
     NotIdentified,
 
     #[error("this connection is already identified as agent '{0}'")]

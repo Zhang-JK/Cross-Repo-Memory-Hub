@@ -50,6 +50,10 @@ pub enum AuditEvent {
         /// Label of the running agent copy (`X-Memhub-Instance` / `--instance`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<String>,
+        /// The session expired (idle timeout or server restart) and was
+        /// revived under the same id when the client used it again.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumed: bool,
     },
     Disconnect {
         #[serde(flatten)]
@@ -305,6 +309,7 @@ mod tests {
             actor: actor(None),
             client: Some("cursor 1.0".into()),
             instance: Some("alice-laptop".into()),
+            resumed: false,
         });
         log.record(AuditEvent::MemoryChanged {
             actor: actor(Some("alice")),
@@ -325,6 +330,7 @@ mod tests {
         assert_eq!(all[0]["ip"], "10.0.0.7");
         assert!(all[0].get("agent").is_none());
         assert_eq!(all[0]["instance"], "alice-laptop");
+        assert!(all[0].get("resumed").is_none());
         assert_eq!(all[1]["event"], "memory_changed");
         assert_eq!(all[1]["action"], "update");
         assert_eq!(all[1]["agent"], "alice");

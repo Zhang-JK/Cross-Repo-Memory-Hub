@@ -981,6 +981,203 @@ async fn sessions_resume_after_server_restart() {
     assert_eq!(again.resumable_count(), 0);
 }
 
+impl Client {
+    async fn admin_get(&self, uri: &str) -> Value {
+        let res = self
+            .app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+}
+
+async fn read(c: &mut Client, id: &str) -> (bool, Value) {
+    c.tool("get_memory", json!({ "id": id })).await
+}
+
+#[tokio::test]
+async fn memory_reads_are_counted_and_ranked() {
+    let (dir, hub, state) = setup(Duration::from_secs(3600));
+    let mut a = client(&state, "10.0.0.1");
+    a.initialize(&[("x-memhub-agent", "alice"), ("x-memhub-role", "dev")])
+        .await;
+    let mut b = client(&state, "10.0.0.2");
+    b.initialize(&[("x-memhub-agent", "bob"), ("x-memhub-role", "dev")])
+        .await;
+    a.tool("add_repo", json!({ "repo": "shop" })).await;
+    for (folder, title) in [
+        ("", "Overview"),
+        ("modules/cart", "Cart rules"),
+        ("modules/cart", "Cart pitfalls"),
+        ("modules/auth", "Login flow"),
+    ] {
+        let (err, out) = a
+            .tool(
+                "add_memory",
+                json!({ "scope": "repo", "repo": "shop", "folder": folder, "title": title, "body": "x" }),
+            )
+            .await;
+        assert!(!err, "{out}");
+    }
+
+    for _ in 0..3 {
+        read(&mut a, "repo/shop/modules/cart/cart-rules").await;
+    }
+    let (_, out) = read(&mut b, "repo/shop/modules/cart/cart-rules").await;
+    assert_eq!(out["read_count"], 4);
+    read(&mut b, "repo/shop/modules/auth/login-flow").await;
+    read(&mut b, "repo/shop/overview").await;
+    read(&mut a, "repo/shop/overview").await;
+
+    // Listing, browsing and searching are not reads; nor is the admin UI.
+    a.tool("list_memories", json!({})).await;
+    a.tool("search_memory", json!({ "query": "cart" })).await;
+    let detail = a
+        .admin_get("/api/admin/memories/repo/shop/modules/cart/cart-rules")
+        .await;
+    assert_eq!(detail["reads"]["count"], 4);
+    assert_eq!(detail["reads"]["by_agent"]["alice"], 3);
+    assert_eq!(detail["reads"]["by_agent"]["bob"], 1);
+    assert_eq!(detail["reads"]["last_reader"], "bob");
+    assert_eq!(detail["memory"]["version"], 1, "reads leave the file alone");
+
+    let list = a
+        .admin_get("/api/admin/memories?scope=repo&owner=shop")
+        .await;
+    let reads_of = |id: &str| {
+        list["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()["reads"]
+            .clone()
+    };
+    assert_eq!(reads_of("repo/shop/modules/cart/cart-rules"), 4);
+    assert_eq!(reads_of("repo/shop/modules/cart/cart-pitfalls"), 0);
+
+    // Global ranking: memories and folders (folders include subfolders).
+    let global = a.admin_get("/api/admin/reads").await;
+    assert_eq!(global["total_reads"], 7);
+    assert_eq!(global["memory_count"], 4);
+    assert_eq!(global["unread_count"], 1);
+    let ids: Vec<&str> = global["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "repo/shop/modules/cart/cart-rules",
+            "repo/shop/overview",
+            "repo/shop/modules/auth/login-flow"
+        ]
+    );
+    assert_eq!(global["memories"][0]["rank"], 1);
+    assert_eq!(global["memories"][0]["readers"], 2);
+    let folders: Vec<(String, u64)> = global["folders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["folder"].as_str().unwrap().to_string(),
+                f["reads"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        folders,
+        [
+            ("".to_string(), 7),
+            ("modules".to_string(), 5),
+            ("modules/cart".to_string(), 4),
+            ("modules/auth".to_string(), 1),
+        ]
+    );
+
+    // Local ranking inside one folder.
+    let local = a
+        .admin_get("/api/admin/reads?scope=repo&owner=shop&folder=modules/cart&days=7")
+        .await;
+    assert_eq!(local["days"], 7);
+    assert_eq!(local["total_reads"], 4);
+    assert_eq!(local["memory_count"], 2);
+    assert_eq!(local["unread_count"], 1);
+    assert_eq!(local["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(local["folders"].as_array().unwrap().len(), 1);
+    assert_eq!(local["folders"][0]["folder"], "modules/cart");
+    assert_eq!(local["folders"][0]["read_memories"], 1);
+
+    // Moving keeps the count; deleting drops it.
+    let (err, out) = a
+        .tool(
+            "move_memory",
+            json!({ "id": "repo/shop/modules/cart/cart-rules", "folder": "modules/checkout" }),
+        )
+        .await;
+    assert!(!err, "{out}");
+    let (_, out) = read(&mut a, "repo/shop/modules/checkout/cart-rules").await;
+    assert_eq!(out["read_count"], 5);
+    a.tool("delete_memory", json!({ "id": "repo/shop/overview" }))
+        .await;
+    let global = a.admin_get("/api/admin/reads").await;
+    assert_eq!(global["total_reads"], 6);
+    assert_eq!(global["memory_count"], 3);
+
+    // The self-test agent's reads are not counted.
+    let mut probe = client(&state, "10.0.0.3");
+    probe
+        .initialize(&[
+            ("x-memhub-agent", "memhub-selftest"),
+            ("x-memhub-role", "probe"),
+        ])
+        .await;
+    let (_, out) = read(&mut probe, "repo/shop/modules/auth/login-flow").await;
+    assert_eq!(out["read_count"], 1);
+    read(&mut b, "repo/shop/modules/cart/cart-pitfalls").await;
+
+    // Deleting a folder from the admin UI drops the counts inside it.
+    let res = probe
+        .app
+        .clone()
+        .oneshot(
+            Request::delete("/api/admin/folders/repo/shop?folder=modules/cart")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let global = probe.admin_get("/api/admin/reads").await;
+    assert_eq!(global["total_reads"], 6);
+    assert!(hub
+        .reads()
+        .all()
+        .keys()
+        .all(|k| !k.contains("modules/cart/")));
+
+    // Counts survive a restart.
+    drop((a, b, probe));
+    state.close_all("server_shutdown");
+    drop(state);
+    drop(hub);
+    let stats: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("stats").join("reads.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stats["repo/shop/modules/checkout/cart-rules"]["count"], 5);
+    let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
+    let id = "repo/shop/modules/auth/login-flow".parse().unwrap();
+    assert_eq!(hub.reads().get(&id).count, 1);
+}
+
 #[test]
 fn stdio_transport() {
     let dir = tempfile::tempdir().unwrap();

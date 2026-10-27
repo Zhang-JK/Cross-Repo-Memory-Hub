@@ -40,7 +40,7 @@ function s(tag, attrs, ...children) {
   return el;
 }
 
-/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers, folder. */
+/** Small line icon. Names: grid, book, nodes, pencil, users, pulse, layers, folder, eye. */
 function icon(name) {
   const pen = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
   const paths = {
@@ -72,6 +72,10 @@ function icon(name) {
     ],
     pulse: [s('path', { d: 'M3 12h4l2.2-6 3.6 12L15 12h6' })],
     folder: [s('path', { d: 'M3 7.5A1.5 1.5 0 0 1 4.5 6H9l2 2.2h8.5A1.5 1.5 0 0 1 21 9.7v8.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z' })],
+    eye: [
+      s('path', { d: 'M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z' }),
+      s('circle', { cx: 12, cy: 12, r: 3 }),
+    ],
     layers: [
       s('path', { d: 'M12 3l9 5-9 5-9-5 9-5z' }),
       s('path', { d: 'M3 12l9 5 9-5' }),
@@ -529,10 +533,15 @@ async function viewMemories(view, params) {
     folder: params.get('folder') || '',
     q: params.get('q') || '',
     id: params.get('id') || '',
+    ranking: params.get('view') === 'ranking',
+    days: params.get('days') || '',
     folders: [],
     mode: 'preview',
   };
-  const sync = () => setRouteParams('memories', { scope: st.scope, owner: st.owner, folder: st.folder, q: st.q, id: st.id });
+  const sync = () => setRouteParams('memories', st.ranking
+    ? { view: 'ranking', scope: st.scope, owner: st.owner, folder: st.folder, days: st.days }
+    : { scope: st.scope, owner: st.owner, folder: st.folder, q: st.q, id: st.id });
+  const where = { scope: st.scope, owner: st.owner, folder: st.folder };
 
   const treeBox = h('div', { class: 'scroll' });
   const listBox = h('div', { class: 'scroll' });
@@ -541,14 +550,28 @@ async function viewMemories(view, params) {
   const detailBox = h('div', { class: 'scroll' });
   const search = h('input', { type: 'search', placeholder: 'Search title, folder, tags, body…', value: st.q });
 
-  setHead('Memories', 'Every repo and agent memory, organized in folders and stored as Markdown files with front-matter properties', [
+  const modeSwitch = h('div', { class: 'seg' },
+    h('a', { class: st.ranking ? '' : 'on', href: `#/memories${query(where)}`, text: 'Browse' }),
+    h('a', { class: st.ranking ? 'on' : '', href: `#/memories${query({ view: 'ranking', ...where })}`, title: 'Memories ranked by how often agents read them', text: 'Ranking' }));
+  setHead('Memories', st.ranking
+    ? 'How often agents read each memory (get_memory), for all memories or the selected folder'
+    : 'Every repo and agent memory, organized in folders and stored as Markdown files with front-matter properties', [
+    modeSwitch,
     h('button', { type: 'button', on: { click: () => newFolderModal() } }, '+ New folder'),
     h('button', { class: 'primary', type: 'button', on: { click: () => newMemoryModal() } }, '+ New memory')]);
 
-  view.replaceChildren(h('div', { class: 'mem-layout' },
-    h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { text: 'Folders' })), treeBox),
-    h('div', { class: 'panel' }, h('div', { class: 'search-row' }, search), h('div', { class: 'panel-head' }, h('h2', { id: 'list-title' }), listCount), listDesc, listBox),
-    h('div', { class: 'panel' }, detailBox)));
+  const rankBox = h('div', { class: 'scroll' });
+  const rankTitle = h('h2');
+  const daysSeg = h('div', { class: 'seg' }, [['', 'All time'], ['30', '30 days'], ['7', '7 days']].map(([v, label]) =>
+    h('button', { type: 'button', class: st.days === v ? 'on' : '', dataset: { days: v }, text: label,
+      on: { click: () => { st.days = v; daysSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.days === v)); sync(); loadRanking(); } } })));
+  const treePanel = h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { text: 'Folders' })), treeBox);
+  view.replaceChildren(st.ranking
+    ? h('div', { class: 'mem-layout ranking' }, treePanel,
+      h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, rankTitle, daysSeg), rankBox))
+    : h('div', { class: 'mem-layout' }, treePanel,
+      h('div', { class: 'panel' }, h('div', { class: 'search-row' }, search), h('div', { class: 'panel-head' }, h('h2', { id: 'list-title' }), listCount), listDesc, listBox),
+      h('div', { class: 'panel' }, detailBox)));
 
   search.addEventListener('input', debounce(() => { st.q = search.value.trim(); sync(); loadList(); }, 250));
 
@@ -601,7 +624,65 @@ async function viewMemories(view, params) {
 
   function select(scope, owner, folder) {
     st.scope = scope; st.owner = owner; st.folder = folder;
-    sync(); renderTree(); loadList();
+    sync(); renderTree(); refresh();
+  }
+
+  const refresh = () => (st.ranking ? loadRanking() : loadList());
+  const reloadMain = () => (st.ranking ? loadRanking() : Promise.all([loadList(), loadDetail()]));
+  const selectionLabel = () => (st.owner ? `${st.scope}/${st.owner}${st.folder ? `/${st.folder}` : ''}` : st.scope ? `All ${st.scope} memories` : 'All memories');
+
+  async function loadRanking() {
+    const period = st.days ? `last ${st.days} days` : 'all time';
+    rankTitle.textContent = `Most read · ${selectionLabel()}`;
+    rankBox.replaceChildren(loading());
+    try {
+      const r = await api('/reads' + query({ scope: st.scope, owner: st.owner, folder: st.folder, days: st.days }));
+      const metric = (n, label) => h('div', { class: 'metric' }, h('div', { class: 'n', text: String(n) }), h('div', { class: 'l', text: label }));
+      const bar = (n, max) => {
+        const fill = h('div', { class: 'fill' });
+        fill.style.width = `${max ? Math.max(2, (100 * n) / max) : 0}%`;
+        return h('div', { class: 'rank-bar' }, h('div', { class: 'track' }, fill), h('span', { class: 'num', text: String(n) }));
+      };
+      const summary = h('div', { class: 'rank-summary' },
+        metric(r.total_reads, `reads · ${period}`),
+        metric(`${r.memory_count - r.unread_count} / ${r.memory_count}`, 'memories read'),
+        metric(r.unread_count, `never read · ${period}`));
+      if (!r.memories.length) {
+        rankBox.replaceChildren(summary, h('div', { class: 'empty' }, r.memory_count
+          ? `No memory here was read by an agent (${period}).`
+          : 'This folder is empty.'));
+        return;
+      }
+      const maxMem = r.memories[0].reads;
+      const memTable = h('table', { class: 'rank-table' },
+        h('thead', {}, h('tr', {}, ['#', 'Memory', 'Folder', `Reads · ${period}`, 'All time', 'Readers', 'Last read'].map((c) => h('th', { text: c })))),
+        h('tbody', {}, r.memories.map((m) => {
+          const { scope, owner, folder } = parseId(m.id);
+          return h('tr', {},
+            h('td', { class: 'rank', text: String(m.rank) }),
+            h('td', { class: 'wrap' }, h('a', { href: memoryHash(m.id), title: 'Open this memory', text: m.title }), h('div', { class: 'id mono muted', text: m.id })),
+            h('td', { class: 'wrap' }, h('button', { class: 'link folder-link', type: 'button', title: 'Rank inside this folder', on: { click: () => select(scope, owner, folder) } },
+              icon('folder'), `${scope}/${owner}${folder ? `/${folder}` : ''}`)),
+            h('td', {}, bar(m.reads, maxMem)),
+            h('td', { class: 'num', text: String(m.total_reads) }),
+            h('td', { class: 'num', title: 'Distinct agents that read it (all time)', text: String(m.readers) }),
+            h('td', { class: 'nowrap', title: fmtTime(m.last_read_at) }, ago(m.last_read_at), m.last_reader ? h('div', { class: 'muted', text: `by ${m.last_reader}` }) : null));
+        })));
+      const maxFolder = r.folders.length ? r.folders[0].reads : 0;
+      const folderTable = h('table', { class: 'rank-table' },
+        h('thead', {}, h('tr', {}, ['#', 'Folder (with subfolders)', `Reads · ${period}`, 'Memories read'].map((c) => h('th', { text: c })))),
+        h('tbody', {}, r.folders.map((f, i) => h('tr', {},
+          h('td', { class: 'rank', text: String(i + 1) }),
+          h('td', { class: 'wrap' }, h('button', { class: 'link folder-link', type: 'button', title: 'Rank inside this folder', on: { click: () => select(f.scope, f.owner, f.folder) } },
+            icon('folder'), `${f.scope}/${f.owner}${f.folder ? `/${f.folder}` : ''}`)),
+          h('td', {}, bar(f.reads, maxFolder)),
+          h('td', { class: 'num', text: `${f.read_memories} / ${f.memory_count}` })))));
+      rankBox.replaceChildren(summary,
+        h('div', { class: 'rank-section' }, h('h3', { text: 'Memories' }), h('div', { class: 'table-wrap' }, memTable)),
+        h('div', { class: 'rank-section' }, h('h3', { text: 'Folders' }), h('div', { class: 'table-wrap' }, folderTable)));
+    } catch (e) {
+      rankBox.replaceChildren(errorBox(e));
+    }
   }
 
   function renderListHead() {
@@ -645,6 +726,7 @@ async function viewMemories(view, params) {
           rel ? h('span', { class: 'chip folder-chip', title: `in ${folder}/` }, icon('folder'), rel) : null,
           h('span', { class: 'chip', text: m.kind }),
           (m.tags || []).slice(0, 3).map((t) => h('span', { class: 'chip', text: `#${t}` })),
+          h('span', { class: `reads ${m.reads ? '' : 'none'}`, title: `Read ${m.reads} time${m.reads === 1 ? '' : 's'} by agents` }, icon('eye'), String(m.reads || 0)),
           h('span', { title: fmtTime(m.updated_at), text: ago(m.updated_at) })),
         m.snippet ? h('div', { class: 'snip', text: m.snippet }) : null);
       }));
@@ -716,8 +798,19 @@ async function viewMemories(view, params) {
           row('created', h('span', { title: m.created_at, text: `${fmtTime(m.created_at)} (${ago(m.created_at)})` })),
           row('updated', h('span', { title: m.updated_at, text: `${fmtTime(m.updated_at)} (${ago(m.updated_at)})` })),
           row('version', String(m.version)),
+          row('reads', readsCell(d.reads)),
           extra.map(([k, v]) => row(k, h('span', { class: 'mono', text: typeof v === 'string' ? v : JSON.stringify(v) }))))),
         h('div', { class: 'body-tabs' }, h('h2', { text: 'Content' }), seg), bodyBox));
+  }
+
+  function readsCell(r) {
+    if (!r || !r.count) return h('span', { class: 'muted', text: 'never read by an agent' });
+    const recent = (days) => Object.entries(r.days || {}).filter(([day]) => (Date.now() - new Date(`${day}T00:00:00Z`)) / 86400000 < days).reduce((n, [, c]) => n + c, 0);
+    const agents = Object.entries(r.by_agent || {}).sort((a, b) => b[1] - a[1]);
+    return h('span', {},
+      h('b', { text: String(r.count) }), ` total · ${recent(7)} in 7 days · ${recent(30)} in 30 days`,
+      h('div', { class: 'muted', title: fmtTime(r.last_read_at) }, `last ${ago(r.last_read_at)}${r.last_reader ? ` by ${r.last_reader}` : ''}`),
+      h('div', { class: 'muted' }, agents.slice(0, 5).map(([a, n]) => `${a} ${n}`).join(' · ') + (agents.length > 5 ? ` · +${agents.length - 5} more` : '')));
   }
 
   async function deleteMemory(m) {
@@ -730,7 +823,7 @@ async function viewMemories(view, params) {
       await api(memoryUrl(m.id), { method: 'DELETE' });
       toast(`Deleted ${m.id}`);
       st.id = ''; sync();
-      await Promise.all([loadTree(), loadList(), loadDetail()]);
+      await loadTree(); await reloadMain();
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -751,7 +844,7 @@ async function viewMemories(view, params) {
         m.close();
         st.id = res.moved.id; st.folder = parseId(res.moved.id).folder; sync();
         await loadTree();
-        await Promise.all([loadList(), loadDetail()]);
+        await reloadMain();
       } catch (e) { err.textContent = e.message; }
     };
     [folder, slug].forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); }));
@@ -788,7 +881,7 @@ async function viewMemories(view, params) {
       if (st.id.startsWith(path + '/')) st.id = '';
       sync();
       await loadTree();
-      await Promise.all([loadList(), loadDetail()]);
+      await reloadMain();
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -889,7 +982,7 @@ async function viewMemories(view, params) {
         st.scope = scope.value; st.owner = payload.owner; st.folder = parseId(res.created.id).folder; st.id = res.created.id; st.q = ''; search.value = '';
         sync();
         await loadTree();
-        await Promise.all([loadList(), loadDetail()]);
+        await reloadMain();
       } catch (e) { err.textContent = e.message; }
     };
     const m = openModal({
@@ -910,7 +1003,7 @@ async function viewMemories(view, params) {
   }
 
   await loadTree();
-  await Promise.all([loadList(), loadDetail()]);
+  await reloadMain();
 }
 
 function copy(text) {

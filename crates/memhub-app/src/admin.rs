@@ -25,6 +25,7 @@ use crate::{
     diff::unified_diff,
     error::{AppError, Result},
     hub::Hub,
+    reads::ReadStat,
 };
 
 /// Agent name recorded for admin actions. Not a valid agent name, so it can
@@ -73,6 +74,8 @@ pub struct MemoryDetail {
     pub markdown: String,
     /// Path relative to the data directory.
     pub path: String,
+    /// How often agents read this memory.
+    pub reads: ReadStat,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +86,55 @@ pub struct MemoryListItem {
     pub score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// Reads by agents, all time.
+    pub reads: u64,
+}
+
+/// Memories ranked by how often agents read them, see [`Admin::read_ranking`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadRanking {
+    /// `None` = all time.
+    pub days: Option<u32>,
+    /// Reads of all memories in the selection during the window.
+    pub total_reads: u64,
+    /// Memories in the selection.
+    pub memory_count: usize,
+    /// Memories in the selection not read during the window.
+    pub unread_count: usize,
+    /// Most read first; only memories read during the window.
+    pub memories: Vec<RankedMemory>,
+    /// Every folder in the selection with reads during the window, counting
+    /// its subfolders, most read first.
+    pub folders: Vec<RankedFolder>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedMemory {
+    pub rank: usize,
+    pub id: MemoryId,
+    pub title: String,
+    pub kind: String,
+    /// Reads during the window.
+    pub reads: u64,
+    pub total_reads: u64,
+    /// Distinct agents that read it (all time).
+    pub readers: usize,
+    pub last_read_at: Option<DateTime<Utc>>,
+    pub last_reader: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedFolder {
+    pub scope: Scope,
+    pub owner: String,
+    /// Empty for the owner's root (the whole repo / agent space).
+    pub folder: String,
+    /// Reads during the window, subfolders included.
+    pub reads: u64,
+    /// Memories, subfolders included.
+    pub memory_count: usize,
+    /// Memories read during the window, subfolders included.
+    pub read_memories: usize,
 }
 
 /// Input for [`Admin::add_memory`]. With `markdown`, the file's front matter
@@ -320,6 +372,8 @@ impl Admin {
             ..Default::default()
         };
         let store = self.hub.store();
+        let reads = self.hub.reads().all();
+        let count = |meta: &MemoryMeta| reads.get(&meta.id.to_string()).map_or(0, |r| r.count);
         match query.map(str::trim).filter(|q| !q.is_empty()) {
             Some(text) => Ok(store
                 .search(&SearchQuery {
@@ -329,6 +383,7 @@ impl Admin {
                 })?
                 .into_iter()
                 .map(|h| MemoryListItem {
+                    reads: count(&h.meta),
                     meta: h.meta,
                     score: Some(h.score),
                     snippet: Some(h.snippet),
@@ -338,6 +393,7 @@ impl Admin {
                 .list(&filter)?
                 .into_iter()
                 .map(|m| MemoryListItem {
+                    reads: count(&m.meta),
                     meta: m.meta,
                     score: None,
                     snippet: None,
@@ -351,7 +407,110 @@ impl Admin {
         Ok(MemoryDetail {
             markdown: render_memory(&memory)?,
             path: format!("memories/{id}.md"),
+            reads: self.hub.reads().get(id),
             memory,
+        })
+    }
+
+    /// Memories of a scope / owner / folder (subfolders included; nothing
+    /// selected = every memory) ranked by agent reads in the last `days`
+    /// days (`None` = all time), plus the folders of the selection ranked
+    /// the same way.
+    pub fn read_ranking(
+        &self,
+        scope: Option<Scope>,
+        owner: Option<&str>,
+        folder: Option<&str>,
+        days: Option<u32>,
+        limit: usize,
+    ) -> Result<ReadRanking> {
+        let folder = folder.map(normalize_folder).transpose()?;
+        let memories = self.hub.store().list(&Filter {
+            scope,
+            owner: owner.map(str::to_string),
+            folder: folder.clone().filter(|f| !f.is_empty()),
+            ..Default::default()
+        })?;
+        let stats = self.hub.reads().all();
+        let no_reads = ReadStat::default();
+
+        let mut ranked = Vec::new();
+        let mut folders: BTreeMap<(Scope, String, String), RankedFolder> = BTreeMap::new();
+        let mut total_reads = 0;
+        for memory in &memories {
+            let meta = &memory.meta;
+            let stat = stats.get(&meta.id.to_string()).unwrap_or(&no_reads);
+            let reads = stat.count_since(days);
+            total_reads += reads;
+            // The memory counts for its folder and every parent folder up to
+            // the owner's root, but not above the selected folder.
+            let floor = folder.as_deref().unwrap_or("");
+            let mut path = meta.folder().to_string();
+            loop {
+                if !memhub_store::is_under(&path, floor) {
+                    break;
+                }
+                let entry = folders
+                    .entry((meta.scope(), meta.owner().to_string(), path.clone()))
+                    .or_insert_with(|| RankedFolder {
+                        scope: meta.scope(),
+                        owner: meta.owner().to_string(),
+                        folder: path.clone(),
+                        reads: 0,
+                        memory_count: 0,
+                        read_memories: 0,
+                    });
+                entry.reads += reads;
+                entry.memory_count += 1;
+                entry.read_memories += usize::from(reads > 0);
+                if path.is_empty() {
+                    break;
+                }
+                path = path
+                    .rsplit_once('/')
+                    .map_or("", |(parent, _)| parent)
+                    .to_string();
+            }
+            if reads > 0 {
+                ranked.push(RankedMemory {
+                    rank: 0,
+                    id: meta.id.clone(),
+                    title: meta.title.clone(),
+                    kind: meta.kind.clone(),
+                    reads,
+                    total_reads: stat.count,
+                    readers: stat.readers(),
+                    last_read_at: stat.last_read_at,
+                    last_reader: stat.last_reader.clone(),
+                });
+            }
+        }
+        let unread_count = memories.len() - ranked.len();
+        ranked.sort_by(|a, b| {
+            b.reads
+                .cmp(&a.reads)
+                .then_with(|| b.last_read_at.cmp(&a.last_read_at))
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        ranked.truncate(limit);
+        for (i, m) in ranked.iter_mut().enumerate() {
+            m.rank = i + 1;
+        }
+        let mut folders: Vec<RankedFolder> =
+            folders.into_values().filter(|f| f.reads > 0).collect();
+        folders.sort_by(|a, b| {
+            b.reads
+                .cmp(&a.reads)
+                .then_with(|| (a.scope, &a.owner, &a.folder).cmp(&(b.scope, &b.owner, &b.folder)))
+        });
+        folders.truncate(limit);
+        Ok(ReadRanking {
+            days,
+            total_reads,
+            memory_count: memories.len(),
+            unread_count,
+            memories: ranked,
+            folders,
         })
     }
 
@@ -422,6 +581,7 @@ impl Admin {
             .hub
             .store()
             .move_memory(id, folder, slug, None, ADMIN_ACTOR)?;
+        self.hub.reads().rename(id, &change.after.meta.id);
         for path in new_folders {
             self.record_folder_created(id.scope, &id.owner, &path, None);
         }
@@ -448,6 +608,7 @@ impl Admin {
 
     pub fn delete_memory(&self, id: &MemoryId) -> Result<Memory> {
         let memory = self.hub.store().delete(id, None)?;
+        self.hub.reads().forget(&memory.meta.id);
         self.record_change(
             MemoryAction::Delete,
             &memory,
@@ -524,6 +685,7 @@ impl Admin {
         let folder = normalize_folder(folder)?;
         let memories = self.hub.store().delete_folder(scope, owner, &folder)?;
         for memory in &memories {
+            self.hub.reads().forget(&memory.meta.id);
             self.record_change(
                 MemoryAction::Delete,
                 memory,

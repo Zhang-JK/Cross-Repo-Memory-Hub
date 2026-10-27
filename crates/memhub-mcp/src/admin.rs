@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use memhub_app::{
     admin::{count_instances, is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
     store::{normalize_folder, MemoryId, Scope},
-    Admin, AppError,
+    Admin, AppError, READ_HISTORY_DAYS,
 };
 use rust_xlsxwriter::{Color, Format, Workbook, Worksheet, XlsxError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -38,6 +38,8 @@ const APP_CSS: &str = include_str!("admin/app.css");
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
                    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
+const DEFAULT_RANKING_LIMIT: usize = 100;
+const MAX_RANKING_LIMIT: usize = 1000;
 const DEFAULT_LOG_LIMIT: usize = 200;
 const MAX_LOG_LIMIT: usize = 5000;
 /// Excel export covers at most this many days, and at most this many sessions
@@ -57,6 +59,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/folders/{scope}/{owner}", delete(delete_folder))
         .route("/memories", get(list_memories).post(add_memory))
         .route("/memories/move", post(move_memory))
+        .route("/reads", get(read_ranking))
         .route("/memories/{*id}", get(get_memory).delete(delete_memory))
         .route("/connections", get(connections))
         .route("/connections/summary", get(connection_summary))
@@ -396,6 +399,43 @@ async fn list_memories(
     })
     .await?;
     ok(json!({ "count": memories.len(), "memories": memories }))
+}
+
+#[derive(Deserialize)]
+struct RankingQuery {
+    scope: Option<String>,
+    owner: Option<String>,
+    folder: Option<String>,
+    /// Window in days (at most [`READ_HISTORY_DAYS`]); missing or 0 = all time.
+    days: Option<u32>,
+    limit: Option<usize>,
+}
+
+async fn read_ranking(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<RankingQuery>,
+) -> ApiResult {
+    let ip = caller(&state, &headers, peer);
+    let scope = match non_empty(query.scope) {
+        Some(s) => Some(s.parse::<Scope>()?),
+        None => None,
+    };
+    let owner = non_empty(query.owner);
+    let folder = non_empty(query.folder);
+    let days = query
+        .days
+        .filter(|d| *d > 0)
+        .map(|d| d.min(READ_HISTORY_DAYS));
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_RANKING_LIMIT)
+        .clamp(1, MAX_RANKING_LIMIT);
+    ok(run(&state, ip, move |admin| {
+        admin.read_ranking(scope, owner.as_deref(), folder.as_deref(), days, limit)
+    })
+    .await?)
 }
 
 async fn get_memory(

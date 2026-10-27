@@ -13,12 +13,14 @@ pub mod admin;
 mod diff;
 mod error;
 mod hub;
+pub mod reads;
 mod registry;
 mod session;
 
 pub use admin::{Admin, ADMIN_ACTOR};
 pub use error::{AppError, Result};
 pub use hub::{Hub, HubConfig};
+pub use reads::{ReadStat, ReadStats, READ_HISTORY_DAYS};
 pub use registry::{AgentProfile, RepoProfile};
 pub use session::{
     clean_instance, AddMemory, AgentSession, Browse, ConnInfo, Connected, FolderResult, RepoJoin,

@@ -9,6 +9,7 @@ use memhub_store::{
 use serde::Serialize;
 
 use crate::{
+    admin::is_internal_agent,
     diff::unified_diff,
     error::{AppError, Result},
     hub::Hub,
@@ -421,9 +422,14 @@ impl AgentSession {
 
     // ---- memory: reads ----------------------------------------------------
 
+    /// Fetches a memory and counts the read (see [`crate::reads`]).
     pub fn get_memory(&self, id: &MemoryId) -> Result<Memory> {
-        self.require_agent()?;
-        Ok(self.hub.store().get(id)?)
+        let me = self.require_agent()?;
+        let memory = self.hub.store().get(id)?;
+        if !is_internal_agent(me) {
+            self.hub.reads().record(&memory.meta.id, me);
+        }
+        Ok(memory)
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>> {
@@ -599,6 +605,7 @@ impl AgentSession {
             .hub
             .store()
             .move_memory(id, folder, slug, expected_version, &me)?;
+        self.hub.reads().rename(id, &change.after.meta.id);
         self.record_new_folders(id.scope, &id.owner, new_folders);
         if !change.is_noop() {
             self.audit_change(
@@ -679,6 +686,7 @@ impl AgentSession {
         self.require_agent()?;
         self.check_write(id.scope, &id.owner)?;
         let memory = self.hub.store().delete(id, expected_version)?;
+        self.hub.reads().forget(&memory.meta.id);
         self.audit_change(
             MemoryAction::Delete,
             &memory,

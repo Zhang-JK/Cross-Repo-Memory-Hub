@@ -72,6 +72,7 @@ memhub-data/
   registry/agents/<agent>.yaml       role, description, working repos
   registry/repos/<repo>.yaml
   logs/audit-YYYY-MM-DD.jsonl
+  stats/reads.json                   read count of every memory (see Read counts)
 ```
 
 A memory file:
@@ -184,7 +185,8 @@ so configuring the header remains the most robust option.
   descriptions; folders without a description are flagged), keyword search, every memory's
   front-matter properties and content (rendered or raw file). Add memories into any folder
   (typed in or imported from a `.md` file), move or delete memories, and create, describe or
-  delete folders.
+  delete folders. Each memory shows its read count. **Ranking** ranks memories and folders by
+  agent reads, see [Read counts](#read-counts).
 - **Connections**: live instances and connections, plus rolling 7-day and 30-day counts
   (instances, distinct agents, distinct IPs, connections; see
   [Counting instances](#counting-instances)), then one row per MCP session
@@ -196,6 +198,34 @@ so configuring the header remains the most robust option.
 - **Updates**: every memory change (add, update, move, delete, grouping) and folder change
   with agent, IP, versions and body diff; filter by agent, action, or memory id / title /
   folder.
+
+#### Read counts
+
+Every memory has a read count: each successful `get_memory` by an agent counts once. Listing,
+browsing and searching don't count, and neither does viewing in the management UI or the
+`memhub-selftest` probe. Counts are kept in `stats/reads.json`, not in the memory file, so
+reading never changes a memory's version or `updated_at`. A moved or renamed memory keeps its
+count, and a deleted one loses it. Per memory the hub stores the total, the last read time and
+reader, reads per agent, and daily counts for the last 30 days. `get_memory` returns the total
+as `read_count`.
+
+The **Ranking** view (Memories, **Ranking** toggle) ranks by reads in a window: all time, the
+last 30 days or the last 7 days.
+
+- **Scope:** pick **All memories** for a global ranking, or a repo, agent or subfolder in the tree
+  for a local one.
+- **Memories table:** rank, reads in the window, all-time reads, distinct readers, and the last
+  read with its reader.
+- **Folders table:** every folder in the selection ranked by reads, subfolders included, with how
+  many of its memories were read.
+- **Unread count:** the number of memories never read in the window, useful when pruning.
+
+The API is `GET /api/admin/reads?scope=&owner=&folder=&days=&limit=`.
+
+Counts are updated in memory immediately. They are written to disk at most every 5 seconds
+when there are new reads, periodically by the server, and at shutdown. A crash can lose the
+last few seconds. Several stdio processes sharing a data directory add up their counts
+instead of overwriting each other.
 
 Changes made in the UI skip the per-agent write rules and are audited as agent `(admin)`,
 transport `admin`, with the browser's IP. Deleted memories and folders go to `trash/`.
@@ -291,7 +321,7 @@ against honest mistakes, not against an agent deliberately using another agent's
 | `browse_memory` | Folder tree of a repo or agent with descriptions, counts and titles (the newcomer's entry point) |
 | `search_memory` | Ranked keyword search with scope/owner/folder/kind/tag/group/author filters |
 | `list_memories` | Filtered listing, optionally `group_by` group/kind/tag/owner/scope/author/folder |
-| `get_memory` | Full Markdown content |
+| `get_memory` | Full Markdown content (counts as one read; returns `read_count`) |
 | `add_memory`, `update_memory`, `delete_memory` | Mutations (`folder` on add; `expected_version` for optimistic locking) |
 | `create_folder` | Create a folder with a one-line description, or change a folder's description |
 | `move_memory` | Move a memory to another folder of the same repo / agent, optionally renaming it |

@@ -117,6 +117,9 @@ label.field > textarea { font-size: 12.5px; }
 .seg button { border: 0; border-radius: 0; padding: 6px 11px; }
 .seg button + button { border-left: 1px solid var(--border); }
 .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.seg a { padding: 6px 11px; color: inherit; text-decoration: none; display: inline-flex; align-items: center; }
+.seg a + a { border-left: 1px solid var(--border); }
+.seg a.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 
 /* ---- panels ---- */
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
@@ -226,6 +229,23 @@ td.wrap { word-break: break-word; }
 .mem-layout { display: grid; grid-template-columns: 280px minmax(280px, 380px) minmax(0, 1fr); gap: 14px; height: calc(100vh - 160px); min-height: 480px; }
 @media (max-width: 1100px) { .mem-layout { grid-template-columns: 1fr; height: auto; } }
 .mem-layout > .panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.mem-layout.ranking { grid-template-columns: 280px minmax(0, 1fr); }
+@media (max-width: 1100px) { .mem-layout.ranking { grid-template-columns: 1fr; } }
+.mem-item .reads { display: inline-flex; align-items: center; gap: 3px; color: var(--accent); font-weight: 600; }
+.mem-item .reads.none { color: var(--muted); font-weight: 400; }
+.mem-item .reads svg, .rank-table svg { width: 13px; height: 13px; }
+.rank-summary { display: flex; gap: 28px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.rank-summary .metric .n { font-size: 22px; font-weight: 700; }
+.rank-summary .metric .l { color: var(--muted); font-size: 12px; }
+.rank-section { padding: 12px 16px; }
+.rank-section h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.rank-table td.rank { width: 36px; color: var(--muted); font-weight: 600; text-align: right; }
+.rank-table td.num { text-align: right; white-space: nowrap; }
+.rank-table .id { font-size: 11.5px; margin-top: 2px; }
+.rank-bar { display: flex; align-items: center; gap: 8px; min-width: 150px; }
+.rank-bar .track { flex: 1; height: 7px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+.rank-bar .fill { height: 100%; background: var(--accent); border-radius: 4px; }
+.rank-bar .num { min-width: 28px; text-align: right; font-weight: 600; }
 .scroll { overflow-y: auto; min-height: 0; flex: 1; }
 .tree-section { padding: 10px 8px 4px; }
 .tree-title { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 4px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }

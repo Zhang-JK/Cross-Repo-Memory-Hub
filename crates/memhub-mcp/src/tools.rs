@@ -383,7 +383,8 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "get_memory",
         title: "Get memory",
-        description: "Fetch the full Markdown content and properties of a memory.",
+        description: "Fetch the full Markdown content and properties of a memory. Each call \
+                      counts as one read; read_count is the memory's total.",
         schema: schema::<IdArgs>,
         read_only: true,
         destructive: false,
@@ -713,9 +714,11 @@ fn key_name(key: GroupKeyArg) -> &'static str {
 fn get_memory(session: &mut AgentSession, args: Value) -> ToolResult {
     let a: IdArgs = parse(args)?;
     let memory = session.get_memory(&memory_id(&a.id)?)?;
+    let mut structured = json!(memory);
+    structured["read_count"] = json!(session.hub().reads().get(&memory.meta.id).count);
     Ok(ToolOutput {
         text: Some(store::render_memory(&memory)?),
-        structured: json!(memory),
+        structured,
     })
 }
 

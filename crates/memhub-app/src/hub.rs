@@ -9,6 +9,7 @@ use memhub_store::{MemoryStore, Scope};
 
 use crate::{
     error::{AppError, Result},
+    reads::ReadStats,
     registry::Registry,
     session::{AgentSession, ConnInfo},
 };
@@ -33,12 +34,14 @@ impl HubConfig {
 /// <data_root>/trash/...      deleted memories
 /// <data_root>/registry/...   agent and repo profiles
 /// <data_root>/logs/...       audit log
+/// <data_root>/stats/...      read counts (see [`ReadStats`])
 /// ```
 pub struct Hub {
     config: HubConfig,
     store: MemoryStore,
     registry: Registry,
     audit: AuditLog,
+    reads: ReadStats,
 }
 
 impl Hub {
@@ -48,11 +51,13 @@ impl Hub {
         let registry = Registry::open(root)?;
         let audit = AuditLog::open(root.join("logs"))
             .map_err(|e| AppError::Internal(format!("cannot open audit log: {e}")))?;
+        let reads = ReadStats::open(root);
         Ok(Arc::new(Self {
             config,
             store,
             registry,
             audit,
+            reads,
         }))
     }
 
@@ -74,6 +79,10 @@ impl Hub {
 
     pub fn audit(&self) -> &AuditLog {
         &self.audit
+    }
+
+    pub fn reads(&self) -> &ReadStats {
+        &self.reads
     }
 
     /// Starts a new connection and records a `connect` audit event.

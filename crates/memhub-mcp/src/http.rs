@@ -232,6 +232,7 @@ impl HttpState {
 
     /// Closes every open session (on server shutdown). They stay resumable
     /// and are saved to the resume file, if one is configured.
+    /// Also writes pending read counts.
     pub fn close_all(&self, reason: &str) {
         let all: Vec<(String, SharedConnection)> = self.sessions().drain().collect();
         for (id, conn) in all {
@@ -244,6 +245,7 @@ impl HttpState {
                 tracing::warn!("cannot save resumable sessions to {}: {e}", path.display());
             }
         }
+        self.hub.reads().flush();
     }
 
     /// Number of expired sessions that can still be resumed.
@@ -349,6 +351,7 @@ pub fn spawn_reaper(state: Arc<HttpState>) -> tokio::task::JoinHandle<()> {
         loop {
             tick.tick().await;
             state.reap_idle();
+            state.hub.reads().flush();
         }
     })
 }

@@ -180,6 +180,40 @@ function mdInline(text) {
   }).join('');
 }
 
+// GitHub-style table rows: outer pipes are optional and `\|` is a literal pipe.
+function mdCells(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (s[i] === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+const MD_TABLE_DELIM = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+
+function mdTableStart(lines, i) {
+  if (!lines[i].includes('|') || i + 1 >= lines.length || !MD_TABLE_DELIM.test(lines[i + 1])) return null;
+  const head = mdCells(lines[i]);
+  const delim = mdCells(lines[i + 1]);
+  if (head.length !== delim.length) return null;
+  const align = delim.map((d) => (d.startsWith(':') && d.endsWith(':') ? 'center' : d.endsWith(':') ? 'right' : d.startsWith(':') ? 'left' : ''));
+  return { head, align };
+}
+
+function mdTable(head, align, rows) {
+  const cell = (tag, text, c) => `<${tag}${align[c] ? ` style="text-align:${align[c]}"` : ''}>${mdInline(text)}</${tag}>`;
+  const body = rows.map((r) => `<tr>${head.map((_, c) => cell('td', r[c] || '', c)).join('')}</tr>`).join('');
+  return `<div class="table-wrap"><table><thead><tr>${head.map((t, c) => cell('th', t, c)).join('')}</tr></thead>`
+    + (body ? `<tbody>${body}</tbody>` : '') + '</table></div>';
+}
+
 function renderMarkdown(src) {
   const lines = src.replace(/\r\n/g, '\n').split('\n');
   const out = [];
@@ -201,6 +235,15 @@ function renderMarkdown(src) {
     }
     let m;
     if (!line.trim()) { flush(); continue; }
+    const table = mdTableStart(lines, i);
+    if (table) {
+      flush();
+      const rows = [];
+      for (i += 2; i < lines.length && lines[i].trim() && lines[i].includes('|'); i++) rows.push(mdCells(lines[i]));
+      i--;
+      out.push(mdTable(table.head, table.align, rows));
+      continue;
+    }
     if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { flush(); out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); continue; }
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push('<hr>'); continue; }
     if ((m = line.match(/^>\s?(.*)$/))) { flush(); out.push(`<blockquote>${mdInline(m[1])}</blockquote>`); continue; }

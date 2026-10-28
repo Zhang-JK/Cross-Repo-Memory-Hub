@@ -301,6 +301,11 @@ pre.raw { background: #0f1424; color: #dfe3f0; padding: 14px 16px; border-radius
 .md blockquote { margin: .6em 0; padding: 2px 12px; border-left: 3px solid var(--border); color: var(--muted); }
 .md ul, .md ol { padding-left: 22px; margin: .4em 0; }
 .md hr { border: 0; border-top: 1px solid var(--border); margin: 1em 0; }
+.md .table-wrap { overflow-x: auto; margin: .6em 0; }
+.md table { width: auto; border-collapse: collapse; font-size: inherit; word-break: normal; }
+.md th, .md td { border: 1px solid var(--border); padding: 5px 10px; text-align: left; vertical-align: top; }
+.md th { background: var(--bg); color: inherit; font-size: inherit; font-weight: 600; text-transform: none; letter-spacing: normal; white-space: normal; }
+.md tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 50%, transparent); }
 
 /* ---- diff ---- */
 pre.diff { margin: 0; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 8px 0; overflow-x: auto; }

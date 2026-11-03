@@ -29,8 +29,9 @@ llm:
   max_prompt_chars: 60000
 
 hub:
-  # Memory Hub 2.0 MCP endpoint.
-  url: http://127.0.0.1:7880/mcp
+  # Memory Hub 2.0 MCP endpoint. The memhub2-*.sh scripts serve on port 8020
+  # (MEMHUB2_PORT) and set this for you; a bare `memhub2 serve` uses 7880.
+  url: http://127.0.0.1:8020/mcp
   # Must match the server's --curator-token / MEMHUB2_CURATOR_TOKEN. The deploy
   # script generates one in .run2/curator-token and the curate / port scripts
   # pass it on, so this can usually stay empty.
@@ -56,8 +57,9 @@ curation:
   targets: []
 
 port:
-  # Memory Hub 1.0 MCP endpoint (the old memhub server, default port 7878).
-  v1_url: http://127.0.0.1:7878/mcp
+  # Memory Hub 1.0 MCP endpoint. The 1.0 scripts (deploy-prebuilt.sh, restart.sh)
+  # serve on port 8010; a bare `memhub serve` uses 7878.
+  v1_url: http://127.0.0.1:8010/mcp
   # Agent name used to read 1.0. memhub-selftest keeps the port's reads out of
   # 1.0 read counts and management logs.
   v1_agent: memhub-selftest

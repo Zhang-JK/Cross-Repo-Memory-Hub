@@ -202,14 +202,19 @@ enum ProposalAction {
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    // Audit events always go to the audit log files; only the server echoes them.
+    let default_filter = match cli.command {
+        Command::Serve { .. } => "info",
+        _ => "info,memhub::audit=warn",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
     let open_hub = || {
         Hub::open(HubConfig::new(&cli.data_dir))
             .with_context(|| format!("cannot open data dir {}", cli.data_dir.display()))
@@ -560,6 +565,14 @@ async fn serve(
         tracing::warn!(
             "management UI at http://{bind}/admin is open to anyone who can reach this \
              server; set --admin-token / MEMHUB2_ADMIN_TOKEN to protect it"
+        );
+    }
+    if state.config().curator_token.is_some() {
+        tracing::info!("curator sessions enabled (header X-Memhub-Curator-Token)");
+    } else {
+        tracing::warn!(
+            "no curator token: `memhub2 curate` and `memhub2 port` cannot connect; set \
+             --curator-token / MEMHUB2_CURATOR_TOKEN"
         );
     }
     axum::serve(

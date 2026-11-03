@@ -190,8 +190,8 @@ mod tests {
     #[test]
     fn example_parses_and_env_wins() {
         let mut config: Config = serde_yaml::from_str(EXAMPLE).unwrap();
-        assert_eq!(config.hub.url, "http://127.0.0.1:7880/mcp");
-        assert_eq!(config.port.v1_url, "http://127.0.0.1:7878/mcp");
+        assert_eq!(config.hub.url, "http://127.0.0.1:8020/mcp");
+        assert_eq!(config.port.v1_url, "http://127.0.0.1:8010/mcp");
         assert_eq!(config.curation.review, ReviewMode::Llm);
         assert!(
             config.validate_for_curation().is_err(),

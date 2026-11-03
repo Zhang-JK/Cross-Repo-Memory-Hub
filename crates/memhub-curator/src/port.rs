@@ -30,6 +30,9 @@ pub struct PortReport {
     pub v1_url: String,
     pub v2_url: String,
     pub dry_run: bool,
+    /// Agents and repos read from 1.0 (registered in 2.0 unless `dry_run`).
+    pub agents_found: usize,
+    pub repos_found: usize,
     pub agents_created: Vec<String>,
     pub agents_updated: Vec<String>,
     pub repos_created: Vec<String>,
@@ -51,18 +54,29 @@ impl PortReport {
             .iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
+        let registry = if self.dry_run {
+            format!(
+                "{} folders, {} agents and {} repos to register",
+                self.folders, self.agents_found, self.repos_found
+            )
+        } else {
+            format!(
+                "{} folders, agents created {} / updated {}, repos created {}",
+                self.folders,
+                self.agents_created.len(),
+                self.agents_updated.len(),
+                self.repos_created.len(),
+            )
+        };
         format!(
-            "{}{} memories from {} -> {}: {} (skipped {}), {} folders, agents created {} / updated {}, repos created {}, {} flagged for reclassification, {} errors\n",
+            "{}{} memories from {} -> {}: {} (skipped {}), {}, {} flagged for reclassification, {} errors\n",
             if self.dry_run { "[dry run] " } else { "" },
             self.memories,
             self.v1_url,
             self.v2_url,
             if classes.is_empty() { "-".to_string() } else { classes.join(" ") },
             self.skipped,
-            self.folders,
-            self.agents_created.len(),
-            self.agents_updated.len(),
-            self.repos_created.len(),
+            registry,
             self.hinted.len(),
             self.errors.len(),
         )
@@ -113,6 +127,8 @@ pub fn run(
         .filter(|a| !a["name"].as_str().is_some_and(internal))
         .collect();
     let wanted = |key: String| options.only.is_empty() || options.only.contains(&key);
+    report.agents_found = agents.len();
+    report.repos_found = repos.len();
 
     if !options.dry_run {
         let imported = v2.call_tool(
@@ -176,7 +192,9 @@ fn port_owner(
         .filter(|f| !f["path"].as_str().unwrap_or("").is_empty())
         .map(|f| json!({ "path": f["path"], "description": f["description"] }))
         .collect();
-    if !options.dry_run && !folders.is_empty() {
+    if options.dry_run {
+        report.folders += folders.len();
+    } else if !folders.is_empty() {
         let written = v2.call_tool(
             "import_folders",
             json!({ "scope": scope, "owner": owner, "folders": folders }),

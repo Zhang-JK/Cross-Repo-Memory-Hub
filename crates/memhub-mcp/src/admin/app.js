@@ -357,7 +357,7 @@ function showLogin(reason) {
     h('label', { class: 'field' }, 'Token', input), err,
     h('button', { class: 'primary', type: 'submit', text: 'Sign in' }));
   const overlay = h('div', { class: 'overlay' },
-    h('div', { class: 'modal login' }, h('div', { class: 'modal-head' }, h('h2', { text: 'Memory Hub admin' })), form));
+    h('div', { class: 'modal login' }, h('div', { class: 'modal-head' }, h('h2', { text: 'Memory Hub 2.0 admin' })), form));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const res = await fetch('/api/admin/auth', { headers: { authorization: `Bearer ${input.value.trim()}` } });
@@ -399,7 +399,7 @@ function setHead(title, sub, actions) {
   $('#page-title').textContent = title;
   $('#page-sub').textContent = sub || '';
   $('#page-actions').replaceChildren(...(actions || []));
-  document.title = `${title} · Memory Hub`;
+  document.title = `${title} · Memory Hub 2.0`;
 }
 
 function every(ms, fn) {

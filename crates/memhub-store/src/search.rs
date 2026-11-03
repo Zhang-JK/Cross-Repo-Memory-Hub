@@ -54,6 +54,14 @@ pub(crate) fn score(memory: &Memory, terms: &[String]) -> Option<f64> {
         if kind.contains(term.as_str()) {
             s += 2.0;
         }
+        if meta
+            .experience
+            .applies_to
+            .iter()
+            .any(|p| p.to_lowercase().contains(term.as_str()))
+        {
+            s += 3.0;
+        }
         s += body.matches(term.as_str()).count().min(20) as f64;
         if s > 0.0 {
             matched += 1;
@@ -70,7 +78,11 @@ pub(crate) fn score(memory: &Memory, terms: &[String]) -> Option<f64> {
 
 /// First body line containing a query term, or the first prose line.
 pub(crate) fn snippet(memory: &Memory, terms: &[String]) -> String {
-    let lines = || memory.body.lines().map(str::trim).filter(|l| !l.is_empty());
+    snippet_of(&memory.body, terms)
+}
+
+pub(crate) fn snippet_of(body: &str, terms: &[String]) -> String {
+    let lines = || body.lines().map(str::trim).filter(|l| !l.is_empty());
     let line = lines()
         .find(|line| {
             let lower = line.to_lowercase();

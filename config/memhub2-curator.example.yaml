@@ -1,0 +1,65 @@
+# Memory Hub 2.0 curator configuration.
+#
+# Copy this file to config/memhub2-curator.yaml (git-ignored) and fill in the
+# LLM endpoint. Used by `memhub2 curate` (daily evidence -> experience run) and
+# `memhub2 port` (Memory Hub 1.0 -> 2.0 migration).
+#
+# Every value can also come from the environment, which wins over this file:
+#   MEMHUB2_LLM_BASE_URL, MEMHUB2_LLM_MODEL, MEMHUB2_LLM_API_KEY,
+#   MEMHUB2_URL, MEMHUB2_CURATOR_TOKEN, MEMHUB1_URL
+
+llm:
+  # OpenAI-compatible endpoint, without the trailing /chat/completions.
+  # Examples: Ollama http://127.0.0.1:11434/v1, vLLM / llama.cpp server /
+  # LM Studio http://127.0.0.1:8000/v1, OpenAI https://api.openai.com/v1
+  base_url: http://127.0.0.1:11434/v1
+  # Model name as the endpoint knows it, e.g. qwen2.5:32b-instruct, llama3.3:70b.
+  model: your-model-name
+  # Sent as "Authorization: Bearer <api_key>". Leave empty if the endpoint needs none.
+  api_key: ""
+  temperature: 0.1
+  # Upper bound for one completion.
+  max_tokens: 4096
+  timeout_secs: 300
+  # Ask for JSON output (response_format: json_object). Set false if the
+  # endpoint rejects it; the curator then extracts JSON from plain text.
+  json_mode: true
+  # Prompts are cut to about this many characters; lower it for small context windows
+  # (roughly 3-4 characters per token).
+  max_prompt_chars: 60000
+
+hub:
+  # Memory Hub 2.0 MCP endpoint. The memhub2-*.sh scripts serve on port 8020
+  # (MEMHUB2_PORT) and set this for you; a bare `memhub2 serve` uses 7880.
+  url: http://127.0.0.1:8020/mcp
+  # Must match the server's --curator-token / MEMHUB2_CURATOR_TOKEN. The deploy
+  # script generates one in .run2/curator-token and the curate / port scripts
+  # pass it on, so this can usually stay empty.
+  curator_token: ""
+  # Name the curator connects as; it becomes the author of curated memories.
+  agent: memhub-curator
+
+curation:
+  # Evidence records per LLM call.
+  batch_size: 10
+  # Stop a target after this many batches in one run (the rest waits for the next run).
+  max_batches_per_target: 20
+  # Who approves proposed changes:
+  #   llm   - a second LLM pass checks each change against its evidence (recommended)
+  #   auto  - every change that passes the deterministic checks is applied
+  #   human - nothing is applied; review with `memhub2 proposals list/show/approve`
+  # Large rewrites and retiring established memories always wait for a human.
+  review: llm
+  # Also review memories ported from 1.0 that the curator has not looked at yet.
+  backfill: true
+  backfill_batch_size: 5
+  # Curate only these targets ("repo:<id>", "agent:<name>"); empty means all.
+  targets: []
+
+port:
+  # Memory Hub 1.0 MCP endpoint. The 1.0 scripts (deploy-prebuilt.sh, restart.sh)
+  # serve on port 8010; a bare `memhub serve` uses 7878.
+  v1_url: http://127.0.0.1:8010/mcp
+  # Agent name used to read 1.0. memhub-selftest keeps the port's reads out of
+  # 1.0 read counts and management logs.
+  v1_agent: memhub-selftest

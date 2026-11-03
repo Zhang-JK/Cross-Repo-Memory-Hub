@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::{Result, StoreError};
+use crate::{
+    error::{Result, StoreError},
+    experience::{ExperienceMeta, Status},
+};
 
 /// Which memory space a memory lives in.
 #[derive(
@@ -219,7 +222,16 @@ impl MemoryId {
     pub fn is_under(&self, folder: &str) -> bool {
         is_under(&self.folder, folder)
     }
+
+    /// `true` for notes in an agent's work area (`agent/<name>/working/...`).
+    pub fn is_work_note(&self) -> bool {
+        self.scope == Scope::Agent && is_under(&self.folder, WORK_FOLDER)
+    }
 }
+
+/// Folder of an agent's space holding its mutable work notes (to-dos,
+/// progress, scratch). Everything else in the space is curated experience.
+pub const WORK_FOLDER: &str = "working";
 
 /// `true` if `path` equals `folder` or is nested inside it. Every path is
 /// under the root folder (`""`).
@@ -314,6 +326,9 @@ pub struct MemoryMeta {
     pub updated_at: DateTime<Utc>,
     #[serde(default = "default_version")]
     pub version: u64,
+    /// Status, citations and validity of curated experience memories.
+    #[serde(flatten, default)]
+    pub experience: ExperienceMeta,
     /// Unknown front-matter keys are preserved round-trip.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, serde_yaml::Value>,
@@ -338,6 +353,15 @@ impl MemoryMeta {
 
     pub fn in_group(&self, group: &str) -> bool {
         self.groups.iter().any(|g| g.eq_ignore_ascii_case(group))
+    }
+
+    pub fn status(&self) -> Option<Status> {
+        self.experience.status
+    }
+
+    /// `true` for notes in an agent's work area (`agent/<name>/working/...`).
+    pub fn is_work_note(&self) -> bool {
+        self.id.is_work_note()
     }
 }
 
@@ -371,6 +395,7 @@ pub struct NewMemory {
     /// Preferred slug; derived from the title when absent. A numeric suffix
     /// is appended if the slug is already taken.
     pub slug: Option<String>,
+    pub experience: ExperienceMeta,
 }
 
 /// Partial update. `None` fields are left untouched.
@@ -384,6 +409,8 @@ pub struct MemoryPatch {
     pub body: Option<String>,
     /// Appended to the body (after `body` replacement, if both are given).
     pub append: Option<String>,
+    /// Replaces all experience properties.
+    pub experience: Option<ExperienceMeta>,
     /// Optimistic concurrency guard.
     pub expected_version: Option<u64>,
 }
@@ -414,10 +441,14 @@ pub struct Filter {
     pub tags: Vec<String>,
     pub group: Option<String>,
     pub author: Option<String>,
+    pub status: Option<Status>,
 }
 
 impl Filter {
     pub fn matches(&self, meta: &MemoryMeta) -> bool {
+        if self.status.is_some_and(|s| meta.status() != Some(s)) {
+            return false;
+        }
         if self.scope.is_some_and(|s| s != meta.scope()) {
             return false;
         }

@@ -3,8 +3,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use chrono::{DateTime, Utc};
 use memhub_audit::{Actor, AuditEvent, MemoryAction};
 use memhub_store::{
-    normalize_folder, validate_label, validate_name, Change, Filter, FolderInfo, GroupKey, Memory,
-    MemoryId, MemoryMeta, MemoryPatch, NewMemory, Scope, SearchHit, SearchQuery, StoreError,
+    is_under, normalize_folder, validate_label, validate_name, Change, Evidence, EvidenceHit,
+    EvidenceId, EvidenceQuery, ExperienceMeta, Filter, FolderInfo, GroupKey, Memory, MemoryId,
+    MemoryMeta, MemoryPatch, NewEvidence, NewMemory, Outcome, Scope, SearchHit, SearchQuery,
+    Source, Status, StoreError, WORK_FOLDER,
 };
 use serde::Serialize;
 
@@ -12,9 +14,15 @@ use crate::{
     admin::is_internal_agent,
     diff::unified_diff,
     error::{AppError, Result},
+    feedback::{Feedback, Rating},
     hub::Hub,
     registry::{AgentProfile, RepoProfile},
 };
+
+/// Longest evidence search window, in days.
+pub const MAX_EVIDENCE_WINDOW_DAYS: i64 = 366;
+/// Evidence search window when none is given, in days.
+pub const DEFAULT_EVIDENCE_WINDOW_DAYS: i64 = 30;
 
 /// Transport-level facts about a connection.
 #[derive(Debug, Clone)]
@@ -90,8 +98,11 @@ pub struct RepoSummary {
 pub struct AddMemory {
     pub scope: Scope,
     /// Required for `Scope::Repo`; ignored for `Scope::Agent` (the caller's
-    /// own space is always used).
+    /// own space is used, except that a curator may name another agent in
+    /// `owner`).
     pub repo: Option<String>,
+    /// Agent space to write for `Scope::Agent` (curators only).
+    pub owner: Option<String>,
     /// Folder below the repo / agent space, e.g. `modules/auth`. Empty for
     /// the root folder; missing folders are created.
     pub folder: String,
@@ -101,6 +112,72 @@ pub struct AddMemory {
     pub groups: Vec<String>,
     pub body: String,
     pub slug: Option<String>,
+    /// Experience properties; curators only (ignored for work notes).
+    pub experience: ExperienceMeta,
+}
+
+/// Input for [`AgentSession::record_evidence`].
+#[derive(Debug, Clone, Default)]
+pub struct RecordEvidence {
+    pub title: String,
+    pub body: String,
+    pub kind: Option<String>,
+    pub repos: Vec<String>,
+    pub task: Option<String>,
+    pub outcome: Outcome,
+    /// Defaults to `from_memory` when `derived_from` is given, else `observed`.
+    pub source: Option<Source>,
+    pub derived_from: Vec<String>,
+    pub code_refs: Vec<String>,
+    pub reason: Option<String>,
+    pub importance: Option<u8>,
+    pub candidate_lesson: Option<String>,
+    pub supersedes: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Input for [`AgentSession::search_evidence`].
+#[derive(Debug, Clone, Default)]
+pub struct EvidenceSearch {
+    pub text: Option<String>,
+    pub repo: Option<String>,
+    pub author: Option<String>,
+    pub kind: Option<String>,
+    /// Defaults to [`DEFAULT_EVIDENCE_WINDOW_DAYS`] days before `until`.
+    pub since: Option<DateTime<Utc>>,
+    /// Defaults to now.
+    pub until: Option<DateTime<Utc>>,
+    pub include_legacy: bool,
+    pub limit: Option<usize>,
+}
+
+/// Options of [`AgentSession::search_experience`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions {
+    /// Include memories replaced by newer ones.
+    pub include_superseded: bool,
+}
+
+/// An experience search hit with the feedback agents gave on it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperienceHit {
+    #[serde(flatten)]
+    pub hit: SearchHit,
+    pub feedback: Feedback,
+}
+
+/// A memory or evidence record fetched by id, see [`AgentSession::fetch`].
+#[derive(Debug, Clone)]
+pub enum Fetched {
+    Memory {
+        memory: Memory,
+        /// The requested id, when it was redirected to `memory`.
+        redirected_from: Option<String>,
+    },
+    Evidence {
+        evidence: Evidence,
+        redirected_from: Option<String>,
+    },
 }
 
 /// One owner's memory tree (or a subtree of it), as returned by
@@ -149,6 +226,8 @@ pub struct AgentSession {
     id: String,
     conn: ConnInfo,
     agent: Option<String>,
+    /// Presented the curator token: may write experience memories.
+    curator: bool,
     opened: Instant,
     started_at: DateTime<Utc>,
     closed: bool,
@@ -170,6 +249,7 @@ impl AgentSession {
             id,
             conn,
             agent: None,
+            curator: false,
             opened: Instant::now(),
             started_at: Utc::now(),
             closed: false,
@@ -189,6 +269,16 @@ impl AgentSession {
 
     pub fn agent(&self) -> Option<&str> {
         self.agent.as_deref()
+    }
+
+    /// Lets this session write curated experience (repo memory and agent
+    /// experience). The transport grants it after checking the curator token.
+    pub fn grant_curator(&mut self) {
+        self.curator = true;
+    }
+
+    pub fn is_curator(&self) -> bool {
+        self.curator
     }
 
     pub fn conn(&self) -> &ConnInfo {
@@ -426,15 +516,383 @@ impl AgentSession {
     pub fn get_memory(&self, id: &MemoryId) -> Result<Memory> {
         let me = self.require_agent()?;
         let memory = self.hub.store().get(id)?;
-        if !is_internal_agent(me) {
+        if !is_internal_agent(me) && !self.curator {
             self.hub.reads().record(&memory.meta.id, me);
         }
         Ok(memory)
     }
 
-    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>> {
+    /// Fetches a memory or evidence record by id, following redirects left
+    /// by moves and by the 1.0 port.
+    pub fn fetch(&self, id: &str) -> Result<Fetched> {
         self.require_agent()?;
-        Ok(self.hub.store().search(query)?)
+        let id = id.trim().trim_end_matches(".md");
+        match self.fetch_direct(id) {
+            Err(AppError::Store(StoreError::NotFound(_))) => {
+                let Some(target) = self.hub.redirects().resolve(id) else {
+                    return self.fetch_direct(id);
+                };
+                Ok(match self.fetch_direct(&target)? {
+                    Fetched::Memory { memory, .. } => Fetched::Memory {
+                        memory,
+                        redirected_from: Some(id.to_string()),
+                    },
+                    Fetched::Evidence { evidence, .. } => Fetched::Evidence {
+                        evidence,
+                        redirected_from: Some(id.to_string()),
+                    },
+                })
+            }
+            other => other,
+        }
+    }
+
+    fn fetch_direct(&self, id: &str) -> Result<Fetched> {
+        if EvidenceId::looks_like(id) {
+            let evidence = self.hub.evidence().get(&id.parse()?)?;
+            return Ok(Fetched::Evidence {
+                evidence,
+                redirected_from: None,
+            });
+        }
+        Ok(Fetched::Memory {
+            memory: self.get_memory(&id.parse()?)?,
+            redirected_from: None,
+        })
+    }
+
+    pub fn get_evidence(&self, id: &EvidenceId) -> Result<Evidence> {
+        self.require_agent()?;
+        Ok(self.hub.evidence().get(id)?)
+    }
+
+    /// Experience search with default options, see [`Self::search_experience`].
+    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>> {
+        Ok(self
+            .search_experience(query, SearchOptions::default())?
+            .into_iter()
+            .map(|h| h.hit)
+            .collect())
+    }
+
+    /// Searches the experience layer: repo memory, plus the caller's own
+    /// agent space (work area included). Another agent's experience is
+    /// searched only when the filter names that agent; other agents' work
+    /// areas and evidence are never searched. Superseded memories are left
+    /// out unless asked for. Hits are ranked by keyword relevance weighted by
+    /// status and by the feedback agents gave.
+    pub fn search_experience(
+        &self,
+        query: &SearchQuery,
+        options: SearchOptions,
+    ) -> Result<Vec<ExperienceHit>> {
+        let me = self.require_agent()?.to_string();
+        let limit = query.limit.unwrap_or(20).max(1);
+        let named_agent = match query.filter.scope {
+            Some(Scope::Agent) | None => query.filter.owner.clone(),
+            Some(Scope::Repo) => None,
+        };
+        let want_superseded =
+            options.include_superseded || query.filter.status == Some(Status::Superseded);
+        let hits = self.hub.store().search(&SearchQuery {
+            limit: Some(usize::MAX),
+            ..query.clone()
+        })?;
+        let feedback = self.hub.feedback().all();
+        let ranked = query.text.as_deref().is_some_and(|t| !t.trim().is_empty());
+        let mut out: Vec<ExperienceHit> = hits
+            .into_iter()
+            .filter(|h| {
+                let m = &h.meta;
+                let foreign = m.scope() == Scope::Agent && m.owner() != me;
+                if foreign && (named_agent.as_deref() != Some(m.owner()) || m.is_work_note()) {
+                    return false;
+                }
+                want_superseded || !m.experience.is_superseded()
+            })
+            .map(|mut hit| {
+                let fb = feedback.get(&hit.meta.id.to_string()).cloned().unwrap_or_default();
+                if ranked {
+                    let status = hit.meta.status().map_or(1.0, Status::search_weight);
+                    hit.score *= status * fb.search_weight();
+                }
+                ExperienceHit { hit, feedback: fb }
+            })
+            .collect();
+        if ranked {
+            out.sort_by(|a, b| b.hit.score.total_cmp(&a.hit.score));
+        }
+        out.truncate(limit);
+        if let Some(text) = query.text.as_deref().filter(|t| !t.trim().is_empty()) {
+            self.log_search("experience", text, &query.filter, out.iter().map(|h| h.hit.meta.id.to_string()));
+        }
+        Ok(out)
+    }
+
+    fn log_search(
+        &self,
+        layer: &str,
+        text: &str,
+        filter: &Filter,
+        ids: impl Iterator<Item = String>,
+    ) {
+        if self.curator {
+            return;
+        }
+        let ids: Vec<String> = ids.collect();
+        self.hub.audit().record(AuditEvent::MemorySearched {
+            actor: self.actor(),
+            layer: layer.to_string(),
+            query: text.trim().chars().take(300).collect(),
+            scope: filter.scope.map(|s| s.to_string()),
+            owner: filter.owner.clone(),
+            hits: ids.len(),
+            top: ids.into_iter().take(5).collect(),
+        });
+    }
+
+    /// Searches evidence records inside a time window (default: the last
+    /// [`DEFAULT_EVIDENCE_WINDOW_DAYS`] days, at most
+    /// [`MAX_EVIDENCE_WINDOW_DAYS`]).
+    pub fn search_evidence(&self, search: &EvidenceSearch) -> Result<Vec<EvidenceHit>> {
+        self.require_agent()?;
+        let until = search.until.unwrap_or_else(Utc::now);
+        let since = search
+            .since
+            .unwrap_or(until - chrono::Duration::days(DEFAULT_EVIDENCE_WINDOW_DAYS));
+        if since > until {
+            return Err(AppError::Invalid("'since' must be before 'until'".into()));
+        }
+        if until - since > chrono::Duration::days(MAX_EVIDENCE_WINDOW_DAYS) {
+            return Err(AppError::Invalid(format!(
+                "evidence search window is limited to {MAX_EVIDENCE_WINDOW_DAYS} days; narrow since/until"
+            )));
+        }
+        let non_empty = |v: &Option<String>| v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let text = non_empty(&search.text);
+        let hits = self.hub.evidence().search(&EvidenceQuery {
+            since: Some(since),
+            until: Some(until),
+            author: non_empty(&search.author),
+            repo: non_empty(&search.repo),
+            kind: non_empty(&search.kind),
+            text: text.clone(),
+            include_legacy: search.include_legacy,
+            after: None,
+            limit: search.limit,
+        })?;
+        if let Some(text) = text {
+            let filter = Filter {
+                owner: non_empty(&search.repo),
+                ..Default::default()
+            };
+            self.log_search("evidence", &text, &filter, hits.iter().map(|h| h.meta.id.to_string()));
+        }
+        Ok(hits)
+    }
+
+    // ---- evidence and feedback -----------------------------------------------
+
+    /// Appends an evidence record: what the caller observed, with enough
+    /// context (task, outcome, reason, code refs) for the curator to judge it.
+    pub fn record_evidence(&self, input: RecordEvidence) -> Result<Evidence> {
+        let me = self.profile()?;
+        let mut repos: Vec<String> = Vec::new();
+        for repo in input.repos.iter().map(|r| r.trim()).filter(|r| !r.is_empty()) {
+            validate_name("repo id", repo)?;
+            if self.hub.registry().repo(repo)?.is_none() {
+                return Err(AppError::UnknownRepo(repo.to_string()));
+            }
+            if !me.works_on(repo) && !self.curator {
+                return Err(AppError::Forbidden(format!(
+                    "repo '{repo}' is not in your working repos; call add_repo first"
+                )));
+            }
+            if !repos.iter().any(|r| r == repo) {
+                repos.push(repo.to_string());
+            }
+        }
+        let mut derived_from = Vec::new();
+        for d in input.derived_from.iter().map(|d| d.trim()).filter(|d| !d.is_empty()) {
+            let id = self.resolve_reference(d)?;
+            if !derived_from.contains(&id) {
+                derived_from.push(id);
+            }
+        }
+        if let Some(s) = input.supersedes.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let id: EvidenceId = s.parse()?;
+            if !self.hub.evidence().exists(&id) {
+                return Err(StoreError::NotFound(id.to_string()).into());
+            }
+        }
+        let source = match input.source {
+            Some(Source::Legacy) => {
+                return Err(AppError::Invalid("source 'legacy' is reserved for the 1.0 port".into()))
+            }
+            Some(s) => s,
+            None if derived_from.is_empty() => Source::Observed,
+            None => Source::FromMemory,
+        };
+        let evidence = self.hub.evidence().add(NewEvidence {
+            author: me.name.clone(),
+            title: input.title,
+            kind: input.kind,
+            body: input.body,
+            repos,
+            task: input.task,
+            outcome: input.outcome,
+            source,
+            derived_from,
+            code_refs: input.code_refs.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect(),
+            reason: input.reason,
+            importance: input.importance,
+            candidate_lesson: input.candidate_lesson,
+            supersedes: input.supersedes.filter(|s| !s.trim().is_empty()),
+            tags: input.tags,
+            ..Default::default()
+        })?;
+        self.audit_evidence(&evidence);
+        Ok(evidence)
+    }
+
+    pub(crate) fn audit_evidence(&self, evidence: &Evidence) {
+        let m = &evidence.meta;
+        self.hub.audit().record(AuditEvent::EvidenceRecorded {
+            actor: self.actor(),
+            evidence_id: m.id.to_string(),
+            title: m.title.clone(),
+            kind: m.kind.clone(),
+            repos: m.repos.clone(),
+            source: serde_json::to_value(m.source)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            importance: m.importance,
+        });
+    }
+
+    /// The current id of an existing memory, following redirects.
+    fn resolve_reference(&self, id: &str) -> Result<String> {
+        let parsed: MemoryId = id.parse()?;
+        if self.hub.store().exists(&parsed) {
+            return Ok(parsed.to_string());
+        }
+        match self.hub.redirects().resolve(id) {
+            Some(target) if target.parse::<MemoryId>().is_ok_and(|t| self.hub.store().exists(&t)) => {
+                Ok(target)
+            }
+            _ => Err(StoreError::NotFound(id.to_string()).into()),
+        }
+    }
+
+    /// Records whether a memory helped. Ratings steer search ranking and
+    /// tell the curator which memories to revise.
+    pub fn rate_memory(&self, id: &MemoryId, rating: Rating, note: Option<&str>) -> Result<Feedback> {
+        let me = self.require_agent()?.to_string();
+        let memory = self.hub.store().get(id)?;
+        if memory.meta.is_work_note() {
+            return Err(AppError::Invalid("work notes are not rated; rate experience memories".into()));
+        }
+        let note = note.map(|n| n.trim().chars().take(1000).collect::<String>()).filter(|n| !n.is_empty());
+        let feedback = self.hub.feedback().rate(id, &me, rating, note.clone());
+        self.hub.audit().record(AuditEvent::MemoryRated {
+            actor: self.actor(),
+            memory_id: id.to_string(),
+            rating: rating.to_string(),
+            note,
+        });
+        Ok(feedback)
+    }
+
+    /// Reports that a memory contradicts what the caller observed: records
+    /// the observation as evidence and marks the memory `disputed` until the
+    /// curator resolves it.
+    pub fn dispute_memory(
+        &self,
+        id: &MemoryId,
+        reason: &str,
+        details: Option<&str>,
+        code_refs: Vec<String>,
+    ) -> Result<(Evidence, Memory)> {
+        let me = self.profile()?;
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(AppError::Invalid("'reason' must say what you observed instead".into()));
+        }
+        let memory = self.hub.store().get(id)?;
+        if memory.meta.is_work_note() {
+            return Err(AppError::Invalid("work notes cannot be disputed; only experience memories".into()));
+        }
+        let repos = match id.scope {
+            Scope::Repo => vec![id.owner.clone()],
+            Scope::Agent => Vec::new(),
+        };
+        let evidence = self.hub.evidence().add(NewEvidence {
+            author: me.name.clone(),
+            title: format!("Dispute: {}", memory.meta.title),
+            kind: Some("dispute".into()),
+            body: details.unwrap_or(reason).to_string(),
+            repos,
+            source: Source::Observed,
+            derived_from: vec![id.to_string()],
+            code_refs,
+            reason: Some(reason.to_string()),
+            importance: Some(4),
+            ..Default::default()
+        })?;
+        self.audit_evidence(&evidence);
+        let mut current = memory;
+        if !current.meta.experience.is_superseded() {
+            let mut experience = current.meta.experience.clone();
+            experience.status = Some(Status::Disputed);
+            experience.cites.merge(&memhub_store::Cites {
+                evidence: vec![evidence.meta.id.to_string()],
+                code: Vec::new(),
+            });
+            let change = self.hub.store().update(
+                id,
+                MemoryPatch {
+                    experience: Some(experience),
+                    ..Default::default()
+                },
+                &me.name,
+            )?;
+            if !change.is_noop() {
+                self.audit_change(
+                    MemoryAction::Update,
+                    &change.after,
+                    Some(change.before.meta.version),
+                    Some(change.after.meta.version),
+                    change.changed_fields.iter().map(|f| f.to_string()).collect(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            current = change.after;
+        }
+        self.hub.feedback().dispute(id, &me.name, reason);
+        self.hub.audit().record(AuditEvent::MemoryDisputed {
+            actor: self.actor(),
+            memory_id: id.to_string(),
+            evidence_id: evidence.meta.id.to_string(),
+            reason: reason.chars().take(500).collect(),
+        });
+        Ok((evidence, current))
+    }
+
+    /// Deletes an evidence record. Evidence is append-only: only the
+    /// self-test agent (for its own records) and curators may do this.
+    pub fn delete_evidence(&self, id: &EvidenceId) -> Result<Evidence> {
+        let me = self.require_agent()?.to_string();
+        let evidence = self.hub.evidence().get(id)?;
+        let own_selftest = is_internal_agent(&me) && evidence.meta.author == me;
+        if !own_selftest && !self.curator {
+            return Err(AppError::Forbidden(
+                "evidence is append-only; record a new evidence with 'supersedes' to correct it".into(),
+            ));
+        }
+        Ok(self.hub.evidence().delete(id)?)
     }
 
     pub fn list(&self, filter: &Filter) -> Result<Vec<MemoryMeta>> {
@@ -554,9 +1012,12 @@ impl AgentSession {
         description: Option<&str>,
     ) -> Result<FolderResult> {
         let me = self.require_agent()?.to_string();
-        let owner = self.resolve_owner(scope, repo, &me, true)?;
-        self.check_write(scope, &owner)?;
+        let owner = match scope {
+            Scope::Agent if self.curator => repo.map(str::trim).filter(|o| !o.is_empty()).unwrap_or(&me).to_string(),
+            _ => self.resolve_owner(scope, repo, &me, true)?,
+        };
         let folder = normalize_folder(folder)?;
+        self.check_write(scope, &owner, &folder)?;
         let store = self.hub.store();
         let before = store.folder_description(scope, &owner, &folder)?;
         let missing = self.missing_folders(scope, &owner, &folder)?;
@@ -599,13 +1060,20 @@ impl AgentSession {
         expected_version: Option<u64>,
     ) -> Result<Change> {
         let me = self.require_agent()?.to_string();
-        self.check_write(id.scope, &id.owner)?;
+        self.check_write(id.scope, &id.owner, &id.folder)?;
+        self.check_write(id.scope, &id.owner, &normalize_folder(folder)?)?;
         let new_folders = self.missing_folders(id.scope, &id.owner, folder)?;
         let change = self
             .hub
             .store()
             .move_memory(id, folder, slug, expected_version, &me)?;
         self.hub.reads().rename(id, &change.after.meta.id);
+        self.hub.feedback().rename(id, &change.after.meta.id);
+        if !change.is_noop() {
+            self.hub
+                .redirects()
+                .set(&id.to_string(), &change.after.meta.id.to_string());
+        }
         self.record_new_folders(id.scope, &id.owner, new_folders);
         if !change.is_noop() {
             self.audit_change(
@@ -628,9 +1096,13 @@ impl AgentSession {
 
     pub fn add_memory(&self, input: AddMemory) -> Result<Memory> {
         let me = self.require_agent()?.to_string();
-        let owner = self.resolve_owner(input.scope, input.repo.as_deref(), &me, true)?;
-        self.check_write(input.scope, &owner)?;
+        let owner = match input.scope {
+            Scope::Agent if self.curator => input.owner.clone().filter(|o| !o.trim().is_empty()).unwrap_or(me.clone()),
+            _ => self.resolve_owner(input.scope, input.repo.as_deref().or(input.owner.as_deref()), &me, true)?,
+        };
         let folder = normalize_folder(&input.folder)?;
+        self.check_write(input.scope, &owner, &folder)?;
+        let work_note = input.scope == Scope::Agent && is_under(&folder, WORK_FOLDER);
         let new_folders = self.missing_folders(input.scope, &owner, &folder)?;
 
         let memory = self.hub.store().add(NewMemory {
@@ -644,6 +1116,11 @@ impl AgentSession {
             body: input.body,
             author: me,
             slug: input.slug,
+            experience: if work_note || !self.curator {
+                ExperienceMeta::default()
+            } else {
+                input.experience
+            },
         })?;
         self.record_new_folders(input.scope, &owner, new_folders);
         self.audit_change(
@@ -659,9 +1136,12 @@ impl AgentSession {
         Ok(memory)
     }
 
-    pub fn update_memory(&self, id: &MemoryId, patch: MemoryPatch) -> Result<Change> {
+    pub fn update_memory(&self, id: &MemoryId, mut patch: MemoryPatch) -> Result<Change> {
         let me = self.require_agent()?.to_string();
-        self.check_write(id.scope, &id.owner)?;
+        self.check_write(id.scope, &id.owner, &id.folder)?;
+        if !self.curator || id.is_work_note() {
+            patch.experience = None;
+        }
         let change = self.hub.store().update(id, patch, &me)?;
         if !change.is_noop() {
             self.audit_change(
@@ -684,9 +1164,10 @@ impl AgentSession {
 
     pub fn delete_memory(&self, id: &MemoryId, expected_version: Option<u64>) -> Result<Memory> {
         self.require_agent()?;
-        self.check_write(id.scope, &id.owner)?;
+        self.check_write(id.scope, &id.owner, &id.folder)?;
         let memory = self.hub.store().delete(id, expected_version)?;
         self.hub.reads().forget(&memory.meta.id);
+        self.hub.feedback().forget(&memory.meta.id);
         self.audit_change(
             MemoryAction::Delete,
             &memory,
@@ -708,7 +1189,7 @@ impl AgentSession {
             return Err(AppError::Invalid("'ids' must not be empty".into()));
         }
         for id in ids {
-            self.check_write(id.scope, &id.owner)?;
+            self.check_write(id.scope, &id.owner, &id.folder)?;
         }
         let changes = self.hub.store().set_group(ids, group, add, &me)?;
         let action = if add {
@@ -749,12 +1230,25 @@ impl AgentSession {
         }
     }
 
-    /// Agent memory: only its owner may write. Repo memory: any agent that
-    /// has joined the repo.
-    fn check_write(&self, scope: Scope, owner: &str) -> Result<()> {
+    /// Write rules of the layered memory:
+    /// - an agent's work area (`agent/<me>/working/...`) is writable by that
+    ///   agent only;
+    /// - experience (repo memory, and agent memory outside the work area) is
+    ///   written by curators only; agents contribute through evidence.
+    fn check_write(&self, scope: Scope, owner: &str, folder: &str) -> Result<()> {
         let me = self.profile()?;
+        let work = is_under(folder, WORK_FOLDER);
         match scope {
-            Scope::Agent if owner == me.name => Ok(()),
+            Scope::Agent if work && owner == me.name => Ok(()),
+            Scope::Agent if work => Err(AppError::Forbidden(format!(
+                "the work area of agent '{owner}' is writable only by that agent"
+            ))),
+            Scope::Agent if self.curator => Ok(()),
+            Scope::Agent if owner == me.name => Err(AppError::Forbidden(format!(
+                "agent/{owner}/{folder} is curated experience, written only by the curator. \
+                 Record what you learned with record_evidence (it is distilled into your agent \
+                 experience), or keep task notes in your work area: folder \"{WORK_FOLDER}/...\""
+            ))),
             Scope::Agent => Err(AppError::Forbidden(format!(
                 "memory of agent '{owner}' is read-only for other agents"
             ))),
@@ -763,19 +1257,26 @@ impl AgentSession {
                 if self.hub.registry().repo(owner)?.is_none() {
                     return Err(AppError::UnknownRepo(owner.to_string()));
                 }
-                if me.works_on(owner) {
+                if self.curator {
                     Ok(())
                 } else {
                     Err(AppError::Forbidden(format!(
-                        "repo '{owner}' is not in your working repos; call add_repo first"
+                        "repo memory of '{owner}' is curated experience, written only by the \
+                         curator. Record what you observed with record_evidence(repos=[\"{owner}\"], \
+                         ...); the curator distills evidence into repo memory. To correct a wrong \
+                         memory use dispute_memory"
                     )))
                 }
             }
         }
     }
 
+    pub(crate) fn actor_name(&self) -> Result<String> {
+        Ok(self.require_agent()?.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn audit_change(
+    pub(crate) fn audit_change(
         &self,
         action: MemoryAction,
         memory: &Memory,

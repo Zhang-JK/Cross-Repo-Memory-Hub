@@ -46,17 +46,18 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build static binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p memhub-mcp --bin memhub
+        run: cargo build --release --locked --target ${{ matrix.target }} -p memhub-mcp --bin memhub2
 
       - name: Package
         id: package
         run: |
-          name="memhub-${{ matrix.target }}"
+          name="memhub2-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/memhub" "dist/$name/"
-          strip "dist/$name/memhub" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/memhub2" "dist/$name/"
+          strip "dist/$name/memhub2" 2>/dev/null || true
           cp README.md "dist/$name/"
-          mkdir -p "dist/$name/scripts" && cp scripts/*.sh "dist/$name/scripts/"
+          mkdir -p "dist/$name/scripts" && cp scripts/memhub2-*.sh "dist/$name/scripts/"
+          mkdir -p "dist/$name/config" && cp config/memhub2-curator.example.yaml "dist/$name/config/"
           echo "${GITHUB_SHA}" > "dist/$name/COMMIT"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -70,8 +71,10 @@ jobs:
             dist/*.sha256
           retention-days: 30
 
-  # Rolling prerelease with a stable, login-free download URL:
-  # https://github.com/<owner>/<repo>/releases/download/nightly/memhub-<target>.tar.gz
+  # Rolling prerelease of Memory Hub 2.0 with a stable, login-free download URL:
+  # https://github.com/<owner>/<repo>/releases/download/nightly2/memhub2-<target>.tar.gz
+  # (scripts/memhub2-deploy.sh). The 1.0 release "nightly" is no longer updated, so
+  # 1.0 servers deployed with scripts/deploy-prebuilt.sh stay on 1.0.
   nightly:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
@@ -79,7 +82,7 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: nightly-release
+      group: nightly2-release
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -87,24 +90,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Publish nightly release
+      - name: Publish nightly2 release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git fetch --quiet origin main
           if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
-            echo "main has moved on since this build; leaving nightly to the newer run"
+            echo "main has moved on since this build; leaving nightly2 to the newer run"
             exit 0
           fi
-          git tag -f nightly "$GITHUB_SHA"
-          git push -f origin refs/tags/nightly
-          title="nightly ($(git rev-parse --short "$GITHUB_SHA"))"
-          notes="Rolling build of main at ${GITHUB_SHA}. Replaced on every push to main."
-          if gh release view nightly >/dev/null 2>&1; then
-            gh release edit nightly --prerelease --title "$title" --notes "$notes"
-            gh release upload nightly dist/* --clobber
+          git tag -f nightly2 "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly2
+          title="nightly2 - Memory Hub 2.0 ($(git rev-parse --short "$GITHUB_SHA"))"
+          notes="Rolling Memory Hub 2.0 (memhub2) build of main at ${GITHUB_SHA}. Replaced on every push to main."
+          if gh release view nightly2 >/dev/null 2>&1; then
+            gh release edit nightly2 --prerelease --title "$title" --notes "$notes"
+            gh release upload nightly2 dist/* --clobber
           else
-            gh release create nightly dist/* --prerelease --title "$title" --notes "$notes" --verify-tag
+            gh release create nightly2 dist/* --prerelease --title "$title" --notes "$notes" --verify-tag
           fi
 
   release:

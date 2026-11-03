@@ -63,9 +63,13 @@ pub(crate) fn normalize_body(body: &str) -> String {
 }
 
 pub fn render(memory: &Memory) -> Result<String> {
-    let yaml = serde_yaml::to_string(&memory.meta)
+    render_parts(&memory.meta, &memory.body)
+}
+
+pub(crate) fn render_parts(meta: &impl serde::Serialize, body: &str) -> Result<String> {
+    let yaml = serde_yaml::to_string(meta)
         .map_err(|e| StoreError::Invalid(format!("cannot serialize front matter: {e}")))?;
-    let mut out = String::with_capacity(yaml.len() + memory.body.len() + 16);
+    let mut out = String::with_capacity(yaml.len() + body.len() + 16);
     out.push_str(FENCE);
     out.push('\n');
     out.push_str(&yaml);
@@ -74,11 +78,11 @@ pub fn render(memory: &Memory) -> Result<String> {
     }
     out.push_str(FENCE);
     out.push_str("\n\n");
-    out.push_str(&normalize_body(&memory.body));
+    out.push_str(&normalize_body(body));
     Ok(out)
 }
 
-fn split(text: &str) -> (Option<&str>, &str) {
+pub(crate) fn split(text: &str) -> (Option<&str>, &str) {
     let Some(rest) = text
         .strip_prefix("---\r\n")
         .or_else(|| text.strip_prefix("---\n"))
@@ -140,5 +144,26 @@ mod tests {
     fn malformed_yaml_is_reported() {
         let err = parse("---\ntags: [unclosed\n---\n", id(), Path::new("x.md")).unwrap_err();
         assert!(matches!(err, StoreError::Malformed { .. }));
+    }
+}
+
+#[cfg(test)]
+mod experience_tests {
+    use super::*;
+    use crate::{experience::Status, model::Scope};
+
+    #[test]
+    fn experience_fields_round_trip_next_to_unknown_keys() {
+        let id = MemoryId::new(Scope::Repo, "demo", "note").unwrap();
+        let text = "---\ntitle: T\nstatus: established\ncites:\n  evidence: [evidence/2026-11-03/bot/x]\n  code: ['src/a.rs:3@abc']\nsupport: 2\ncustom: keep\n---\n\nBody\n";
+        let mem = parse(text, id.clone(), Path::new("x.md")).unwrap();
+        assert_eq!(mem.meta.experience.status, Some(Status::Established));
+        assert_eq!(mem.meta.experience.support, 2);
+        assert_eq!(mem.meta.experience.cites.code, vec!["src/a.rs:3@abc"]);
+        assert_eq!(mem.meta.extra.len(), 1, "{:?}", mem.meta.extra);
+        let again = parse(&render(&mem).unwrap(), id, Path::new("x.md")).unwrap();
+        assert_eq!(again, mem);
+        let plain = render(&parse("---\ntitle: P\n---\nx", MemoryId::new(Scope::Repo, "d", "p").unwrap(), Path::new("p.md")).unwrap()).unwrap();
+        assert!(!plain.contains("status") && !plain.contains("cites"), "{plain}");
     }
 }

@@ -22,6 +22,9 @@ pub struct StdioLogin {
     pub role: Option<String>,
     /// Label of this running copy, recorded with the connection.
     pub instance: Option<String>,
+    /// Make the session a curator. Anyone who can start the stdio server can
+    /// read and write the data directory anyway.
+    pub curator: bool,
 }
 
 pub fn run(hub: Arc<Hub>, login: StdioLogin) -> io::Result<()> {
@@ -87,7 +90,7 @@ fn handle(
                 client: None,
                 instance: login.instance.as_deref().and_then(clean_instance),
             };
-            let (mut c, response) = McpConnection::initialize(hub, info, &msg);
+            let (mut c, response) = McpConnection::initialize(hub, info, &msg, login.curator);
             if let Some(agent) = &login.agent {
                 if let Err(e) = c.session_mut().connect(agent, login.role.as_deref(), None) {
                     tracing::warn!("automatic connect as '{agent}' failed: {e}");

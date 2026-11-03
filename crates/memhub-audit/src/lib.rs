@@ -134,6 +134,84 @@ pub enum AuditEvent {
         folder: String,
         memory_count: usize,
     },
+    /// An agent appended an evidence record.
+    EvidenceRecorded {
+        #[serde(flatten)]
+        actor: Actor,
+        evidence_id: String,
+        title: String,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        repos: Vec<String>,
+        source: String,
+        importance: u8,
+    },
+    /// A search, kept so the curator can see what agents looked for and
+    /// did not find (`hits == 0`).
+    MemorySearched {
+        #[serde(flatten)]
+        actor: Actor,
+        /// `experience` or `evidence`.
+        layer: String,
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        hits: usize,
+        /// Ids of the first few hits.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        top: Vec<String>,
+    },
+    /// Feedback on a memory after using it: `helpful`, `harmful` or `outdated`.
+    MemoryRated {
+        #[serde(flatten)]
+        actor: Actor,
+        memory_id: String,
+        rating: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// An agent reported that a memory contradicts what it observed.
+    MemoryDisputed {
+        #[serde(flatten)]
+        actor: Actor,
+        memory_id: String,
+        evidence_id: String,
+        reason: String,
+    },
+    CurationProposed {
+        #[serde(flatten)]
+        actor: Actor,
+        proposal_id: String,
+        target: String,
+        ops: usize,
+        valid: usize,
+        needs_human: usize,
+    },
+    CurationReviewed {
+        #[serde(flatten)]
+        actor: Actor,
+        proposal_id: String,
+        target: String,
+        approved: usize,
+        rejected: usize,
+        /// Memory ids written by the approved operations.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        applied: Vec<String>,
+    },
+    /// A memory was ported from Memory Hub 1.0.
+    MemoryImported {
+        #[serde(flatten)]
+        actor: Actor,
+        /// Id in 1.0.
+        source_id: String,
+        /// `experience`, `work_note` or `evidence_only`.
+        class: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_id: Option<String>,
+        evidence_id: String,
+    },
 }
 
 impl AuditEvent {
@@ -149,6 +227,13 @@ impl AuditEvent {
             AuditEvent::FolderCreated { .. } => "folder_created",
             AuditEvent::FolderDescribed { .. } => "folder_described",
             AuditEvent::FolderDeleted { .. } => "folder_deleted",
+            AuditEvent::EvidenceRecorded { .. } => "evidence_recorded",
+            AuditEvent::MemorySearched { .. } => "memory_searched",
+            AuditEvent::MemoryRated { .. } => "memory_rated",
+            AuditEvent::MemoryDisputed { .. } => "memory_disputed",
+            AuditEvent::CurationProposed { .. } => "curation_proposed",
+            AuditEvent::CurationReviewed { .. } => "curation_reviewed",
+            AuditEvent::MemoryImported { .. } => "memory_imported",
         }
     }
 }

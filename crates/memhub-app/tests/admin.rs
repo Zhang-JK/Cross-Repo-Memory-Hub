@@ -117,8 +117,8 @@ fn markdown_import_fills_properties_from_front_matter() {
 #[test]
 fn folders_create_list_and_delete() {
     let (_dir, hub) = hub();
-    let s = agent(&hub, "perf-bot", "10.0.0.2");
-    let mut s = s;
+    let mut s = agent(&hub, "perf-bot", "10.0.0.2");
+    s.grant_curator();
     s.add_repo("engine", Some("game engine"), None).unwrap();
     s.add_memory(AddMemory {
         scope: Scope::Repo,
@@ -316,6 +316,7 @@ fn connections_are_reconstructed_per_session() {
     a.add_repo("engine", None, None).unwrap();
     a.add_memory(AddMemory {
         scope: Scope::Agent,
+        folder: "working".into(),
         title: "note".into(),
         body: "b".into(),
         ..Default::default()
@@ -377,6 +378,7 @@ fn connections_are_reconstructed_per_session() {
 fn stats_summarize_memories_and_activity() {
     let (_dir, hub) = hub();
     let mut a = agent(&hub, "crash-bot", "10.0.0.1");
+    a.grant_curator();
     a.add_repo("engine", None, None).unwrap();
     for title in ["one", "two"] {
         a.add_memory(AddMemory {
@@ -545,6 +547,7 @@ fn selftest_traffic_is_hidden_from_the_management_logs() {
     probe
         .add_memory(AddMemory {
             scope: Scope::Agent,
+            folder: "working".into(),
             title: "probe".into(),
             body: "b".into(),
             ..Default::default()
@@ -554,6 +557,7 @@ fn selftest_traffic_is_hidden_from_the_management_logs() {
     let real = agent(&hub, "feature-builder", "10.1.1.1");
     real.add_memory(AddMemory {
         scope: Scope::Agent,
+        folder: "working".into(),
         title: "real".into(),
         body: "b".into(),
         ..Default::default()
@@ -572,7 +576,7 @@ fn selftest_traffic_is_hidden_from_the_management_logs() {
 
     let updates = admin.updates(&logs(50)).unwrap();
     assert!(updates.iter().all(|u| u["agent"] != "memhub-selftest"));
-    assert_eq!(updates.len(), 1);
+    assert_eq!(updates.len(), 2, "the note and its new work folder");
 
     let summary = admin.connection_summary().unwrap();
     assert_eq!(

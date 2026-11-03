@@ -645,7 +645,7 @@ async fn connection_summary_and_year_export() {
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
     let disposition = res.headers()["content-disposition"].to_str().unwrap();
-    assert!(disposition.contains("memhub-connections-"));
+    assert!(disposition.contains("memhub2-connections-"));
     assert!(disposition.ends_with(".xlsx\""));
     assert!(res.headers().get("x-export-truncated").is_none());
     let bytes = res.into_body().collect().await.unwrap().to_bytes();

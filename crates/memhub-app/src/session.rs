@@ -604,10 +604,9 @@ impl AgentSession {
             .into_iter()
             .filter(|h| {
                 let m = &h.meta;
-                if m.scope() == Scope::Agent && m.owner() != me {
-                    if named_agent.as_deref() != Some(m.owner()) || m.is_work_note() {
-                        return false;
-                    }
+                let foreign = m.scope() == Scope::Agent && m.owner() != me;
+                if foreign && (named_agent.as_deref() != Some(m.owner()) || m.is_work_note()) {
+                    return false;
                 }
                 want_superseded || !m.experience.is_superseded()
             })

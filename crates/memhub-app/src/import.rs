@@ -98,6 +98,42 @@ pub struct RegistryImport {
     pub repos_created: Vec<String>,
 }
 
+/// Front-matter keys that 2.0 reserves for experience properties. A 1.0
+/// memory may use them freely (e.g. `status: done`); they are kept as
+/// `v1_<key>` instead.
+const RESERVED_KEYS: &[&str] = &[
+    "status",
+    "cites",
+    "support",
+    "applies_to",
+    "valid_from",
+    "invalid_at",
+    "superseded_by",
+    "last_verified",
+    "origin",
+    "curated_at",
+];
+
+/// Parses a 1.0 `get_memory` result (its `structuredContent`) into the
+/// memory and its 1.0 read count.
+pub fn v1_memory_from_json(mut value: serde_json::Value) -> Result<(Memory, u64)> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Invalid("a 1.0 memory must be a JSON object".into()))?;
+    let read_count = obj
+        .remove("read_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    for key in RESERVED_KEYS {
+        if let Some(v) = obj.remove(*key) {
+            obj.insert(format!("v1_{key}"), v);
+        }
+    }
+    let memory: Memory = serde_json::from_value(value)
+        .map_err(|e| AppError::Invalid(format!("not a 1.0 memory: {e}")))?;
+    Ok((memory, read_count))
+}
+
 fn kind_in(kind: &str, list: &[&str]) -> bool {
     list.iter().any(|k| k.eq_ignore_ascii_case(kind.trim()))
 }
@@ -397,6 +433,31 @@ mod tests {
         assert_eq!(p.class, ImportClass::Experience);
         let p = place(&id("agent/bot/retry-gotcha"), "pitfall").unwrap();
         assert_eq!(p.hints, vec!["reclassify"]);
+    }
+
+    #[test]
+    fn v1_json_keeps_reserved_keys_aside() {
+        let json = serde_json::json!({
+            "id": "agent/bot/todo/next",
+            "title": "Next",
+            "kind": "todo",
+            "author": "bot",
+            "updated_by": "bot",
+            "created_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-01-02T03:04:05Z",
+            "version": 3,
+            "status": "done",
+            "priority": "high",
+            "read_count": 9,
+            "body": "ship it\n",
+        });
+        let (memory, reads) = v1_memory_from_json(json).unwrap();
+        assert_eq!(reads, 9);
+        assert_eq!(memory.meta.id.to_string(), "agent/bot/todo/next");
+        assert!(memory.meta.experience.is_empty());
+        assert_eq!(memory.meta.extra.get("v1_status").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(memory.meta.extra.get("priority").and_then(|v| v.as_str()), Some("high"));
+        assert!(!memory.meta.extra.contains_key("read_count"));
     }
 
     #[test]

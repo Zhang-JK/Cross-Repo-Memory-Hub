@@ -883,6 +883,14 @@ impl AgentSession {
         Ok(proposal)
     }
 
+    /// Runs the checks of [`Self::propose_changes`] without storing anything
+    /// or moving the watermark.
+    pub fn check_changes(&self, target: &Target, ops: &[CurationOp]) -> Result<Vec<OpCheck>> {
+        self.require_curator()?;
+        self.target_description(target)?;
+        Ok(self.check_ops(target, ops))
+    }
+
     pub fn get_proposal(&self, id: &str) -> Result<Proposal> {
         self.require_curator()?;
         self.load_proposal(id)
@@ -1449,7 +1457,20 @@ impl AgentSession {
             CurationOp::Retire { id, .. } => self.end_memory(id, None, now).map(Some),
             CurationOp::Move { id, folder } => {
                 let change = self.move_memory(&id.parse()?, folder, None, None)?;
-                Ok(Some(change.after.meta.id.to_string()))
+                let moved = change.after;
+                if moved.meta.experience.curated_at.is_none() && !moved.meta.is_work_note() {
+                    let mut experience = moved.meta.experience.clone();
+                    experience.curated_at = Some(now);
+                    self.update_memory(
+                        &moved.meta.id,
+                        MemoryPatch {
+                            experience: Some(experience),
+                            expected_version: Some(moved.meta.version),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                Ok(Some(moved.meta.id.to_string()))
             }
             CurationOp::DescribeFolder {
                 scope,

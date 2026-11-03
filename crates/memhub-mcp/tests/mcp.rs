@@ -15,6 +15,8 @@ use memhub_mcp::{
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+const CURATOR_TOKEN: &str = "test-curator-token";
+
 struct Client {
     app: Router,
     session: Option<String>,
@@ -43,7 +45,10 @@ impl Client {
             self.session = Some(id.to_str().unwrap().to_string());
         }
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        let value = (!bytes.is_empty()).then(|| serde_json::from_slice(&bytes).unwrap());
+        let value = (!bytes.is_empty()).then(|| {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        });
         (status, value)
     }
 
@@ -96,6 +101,36 @@ impl Client {
         (is_error, payload)
     }
 
+    /// Calls a tool that must succeed and returns its structuredContent.
+    async fn ok(&mut self, name: &str, args: Value) -> Value {
+        let (err, out) = self.tool(name, args).await;
+        assert!(!err, "{name}: {out}");
+        out
+    }
+
+    /// Calls a tool that must fail and returns the error text.
+    async fn fails(&mut self, name: &str, args: Value) -> String {
+        let (err, out) = self.tool(name, args).await;
+        assert!(err, "{name} should fail: {out}");
+        out.as_str().unwrap().to_string()
+    }
+
+    async fn tool_names(&mut self) -> Vec<String> {
+        self.next_id += 1;
+        let (_, list) = self
+            .send(
+                json!({ "jsonrpc": "2.0", "id": self.next_id, "method": "tools/list" }),
+                &[],
+            )
+            .await;
+        list.unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     async fn delete(&mut self) -> StatusCode {
         let req = Request::delete("/mcp")
             .header("mcp-session-id", self.session.as_deref().unwrap())
@@ -112,6 +147,7 @@ fn setup(idle: Duration) -> (tempfile::TempDir, Arc<Hub>, Arc<HttpState>) {
         hub.clone(),
         HttpConfig {
             idle_timeout: idle,
+            curator_token: Some(CURATOR_TOKEN.into()),
             ..Default::default()
         },
     );
@@ -125,6 +161,20 @@ fn client(state: &Arc<HttpState>, ip: &str) -> Client {
         session: None,
         next_id: 0,
     }
+}
+
+/// A curator session (the hub's LLM curator, or a test standing in for it).
+async fn curator(state: &Arc<HttpState>, ip: &str) -> (Client, Value) {
+    let mut c = client(state, ip);
+    let (status, init) = c
+        .initialize(&[
+            ("x-memhub-agent", "memhub-curator"),
+            ("x-memhub-role", "curator"),
+            ("x-memhub-curator-token", CURATOR_TOKEN),
+        ])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{init:?}");
+    (c, init.unwrap())
 }
 
 impl Client {
@@ -145,126 +195,161 @@ impl Client {
 }
 
 #[tokio::test]
-async fn folder_hierarchy_workflow() {
-    let (_dir, hub, state) = setup(Duration::from_secs(600));
-    let mut a = client(&state, "10.2.0.1");
+async fn instructions_describe_the_layers() {
+    let (_dir, _hub, state) = setup(Duration::from_secs(600));
+    let mut a = client(&state, "10.2.0.9");
     let (_, init) = a
         .initialize(&[("x-memhub-agent", "doc-bot"), ("x-memhub-role", "docs")])
         .await;
-    let instructions = init.unwrap()["result"]["instructions"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let result = init.unwrap()["result"].clone();
+    assert_eq!(result["serverInfo"]["name"], "memhub2");
+    let instructions = result["instructions"].as_str().unwrap();
     for needle in [
-        "browse_memory",
-        "modules/<name>/",
-        "pitfalls/",
-        "move_memory",
-        "overview",
-        "Repo memory vs agent memory",
-        "Rule of thumb",
-        "Never put task logs",
+        "THE THREE LAYERS",
+        "Experience (what you search and read)",
+        "Evidence (what you write)",
+        "Work area (your scratch space)",
+        "record_evidence",
+        "search_evidence",
+        "rate_memory",
+        "dispute_memory",
+        "established",
+        "provisional",
+        "derived_from",
+        "candidate_lesson",
+        "agent/<you>/working/",
+        "accept any Unicode",
     ] {
-        assert!(
-            instructions.contains(needle),
-            "instructions mention {needle}"
-        );
+        assert!(instructions.contains(needle), "instructions mention {needle}");
     }
+    assert!(!instructions.contains("CURATOR SESSION"));
 
-    let (err, join) = a
-        .tool(
-            "add_repo",
-            json!({ "repo": "shop", "description": "Online shop" }),
-        )
+    let (_, init) = curator(&state, "10.2.0.10").await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("CURATOR SESSION"));
+    assert!(instructions.contains("curation_batch"));
+}
+
+#[tokio::test]
+async fn curator_token_gates_curation_tools() {
+    let (_dir, hub, state) = setup(Duration::from_secs(600));
+
+    let mut agent = client(&state, "10.3.0.1");
+    agent
+        .initialize(&[("x-memhub-agent", "dev-bot"), ("x-memhub-role", "dev")])
         .await;
-    assert!(!err, "{join}");
-    assert!(join["next_step"].as_str().unwrap().contains("overview"));
+    let names = agent.tool_names().await;
+    for name in ["record_evidence", "search_evidence", "rate_memory", "dispute_memory", "add_memory"] {
+        assert!(names.contains(&name.to_string()), "{name}");
+    }
+    for name in ["curation_batch", "propose_changes", "review_changes", "import_memory"] {
+        assert!(!names.contains(&name.to_string()), "{name}");
+    }
+    let msg = agent
+        .fails("curation_status", json!({}))
+        .await;
+    assert!(msg.contains("forbidden") || msg.contains("curator"), "{msg}");
 
-    // overview at the root, everything else in folders
-    let (err, added) = a
-        .tool(
+    let (mut cur, _) = curator(&state, "10.3.0.2").await;
+    let names = cur.tool_names().await;
+    for name in ["curation_status", "curation_batch", "curation_backfill", "propose_changes",
+                 "review_changes", "list_proposals", "get_proposal", "import_memory"] {
+        assert!(names.contains(&name.to_string()), "{name}");
+    }
+    let me = cur.ok("whoami", json!({})).await;
+    assert_eq!(me["agent"]["name"], "memhub-curator");
+
+    // A wrong token is refused outright instead of silently giving an agent session.
+    let mut bad = client(&state, "10.3.0.3");
+    let (status, _) = bad
+        .initialize(&[
+            ("x-memhub-agent", "memhub-curator"),
+            ("x-memhub-role", "curator"),
+            ("x-memhub-curator-token", "guess"),
+        ])
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Without a configured token there are no curator sessions at all.
+    let closed = HttpState::new(hub, HttpConfig::default());
+    let mut c = client(&closed, "10.3.0.4");
+    let (status, _) = c
+        .initialize(&[("x-memhub-agent", "x"), ("x-memhub-role", "y"), ("x-memhub-curator-token", CURATOR_TOKEN)])
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn folder_hierarchy_workflow() {
+    let (_dir, hub, state) = setup(Duration::from_secs(600));
+    let mut a = client(&state, "10.2.0.1");
+    a.initialize(&[("x-memhub-agent", "doc-bot"), ("x-memhub-role", "docs")])
+        .await;
+    let join = a
+        .ok("add_repo", json!({ "repo": "shop", "description": "Online shop" }))
+        .await;
+    assert!(join["next_step"].as_str().unwrap().contains("record_evidence"), "{join}");
+
+    // The curator builds the repo tree: overview at the root, the rest in folders.
+    let (mut c, _) = curator(&state, "10.2.0.2").await;
+    let added = c
+        .ok(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "title": "Shop overview", "kind": "overview",
                     "body": "Start here." }),
         )
         .await;
-    assert!(!err, "{added}");
     assert!(added.get("hints").is_none(), "{added}");
-
-    let (err, folder) = a
-        .tool(
+    let folder = c
+        .ok(
             "create_folder",
             json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
                     "description": "Cart, payment and order placement" }),
         )
         .await;
-    assert!(!err, "{folder}");
     assert_eq!(folder["created"], true);
-
-    let (err, added) = a
-        .tool(
+    let added = c
+        .ok(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
                     "title": "Payment retries", "kind": "implementation", "body": "Retries 3x." }),
         )
         .await;
-    assert!(!err, "{added}");
-    assert_eq!(
-        added["created"]["id"],
-        "repo/shop/modules/checkout/payment-retries"
-    );
+    assert_eq!(added["created"]["id"], "repo/shop/modules/checkout/payment-retries");
     assert_eq!(added["created"]["folder"], "modules/checkout");
-    assert!(added.get("hints").is_none(), "{added}");
-
-    let (err, added) = a
-        .tool(
+    let added = c
+        .ok(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "folder": "pitfalls",
                     "title": "Double charge", "kind": "pitfall", "body": "Idempotency keys!" }),
         )
         .await;
-    assert!(!err, "{added}");
     let hints = added["hints"].to_string();
     assert!(hints.contains("Created folder 'pitfalls'"), "{hints}");
-
-    // dumping into the root is flagged once it gets crowded
-    let mut last = Value::Null;
-    for i in 0..4 {
-        let (err, added) = a
-            .tool(
-                "add_memory",
-                json!({ "scope": "repo", "repo": "shop", "title": format!("Loose note {i}"),
-                        "kind": "pitfall", "body": "x" }),
-            )
-            .await;
-        assert!(!err, "{added}");
-        last = added;
-    }
-    let hints = last["hints"].to_string();
-    assert!(hints.contains("Keep only the overview there"), "{hints}");
-    assert!(hints.contains("pitfalls/"), "{hints}");
-    assert!(hints.contains("move_memory"), "{hints}");
-
-    let (err, moved) = a
-        .tool(
+    assert!(hints.contains(r#"scope=\"repo\", repo=\"shop\""#), "{hints}");
+    c.ok(
+        "add_memory",
+        json!({ "scope": "repo", "repo": "shop", "title": "Loose note", "kind": "pitfall", "body": "x" }),
+    )
+    .await;
+    let moved = c
+        .ok(
             "move_memory",
-            json!({ "id": "repo/shop/loose-note-0", "folder": "pitfalls", "expected_version": 1 }),
+            json!({ "id": "repo/shop/loose-note", "folder": "pitfalls", "expected_version": 1 }),
         )
         .await;
-    assert!(!err, "{moved}");
-    assert_eq!(moved["moved"]["id"], "repo/shop/pitfalls/loose-note-0");
-    assert_eq!(moved["previous_id"], "repo/shop/loose-note-0");
+    assert_eq!(moved["moved"]["id"], "repo/shop/pitfalls/loose-note");
+    assert_eq!(moved["previous_id"], "repo/shop/loose-note");
     assert_eq!(moved["moved"]["version"], 2);
 
-    // the tree is the newcomer's map
+    // The tree is the newcomer's map.
     let tree = a
         .tool_text("browse_memory", json!({ "scope": "repo", "owner": "shop" }))
         .await;
     assert!(
-        tree.starts_with("repo/shop: Online shop (7 memories)\n"),
+        tree.starts_with("repo/shop: Online shop (4 memories)\n  shop-overview  Shop overview [overview]\n"),
         "{tree}"
     );
-    assert!(tree.contains("repo/shop: Online shop (7 memories)\n  shop-overview  Shop overview [overview]\n  loose-note-1"), "{tree}");
     assert!(tree.contains("\n  modules/ (1)\n    checkout/  Cart, payment and order placement (1)\n      payment-retries  Payment retries [implementation]\n"), "{tree}");
     assert!(tree.contains("\n  pitfalls/ (2)\n"), "{tree}");
     let outline = a
@@ -277,256 +362,282 @@ async fn folder_hierarchy_workflow() {
         outline,
         "repo/shop/modules (1 memory)\n  checkout/  Cart, payment and order placement (1)\n"
     );
-    let (err, msg) = a
-        .tool(
-            "browse_memory",
-            json!({ "owner": "shop", "folder": "nope" }),
-        )
+    let msg = a
+        .fails("browse_memory", json!({ "owner": "shop", "folder": "nope" }))
         .await;
-    assert!(err && msg.as_str().unwrap().contains("not_found"), "{msg}");
+    assert!(msg.contains("not_found"), "{msg}");
+    // The old id of a moved memory redirects.
+    let text = a
+        .tool_text("get_memory", json!({ "id": "repo/shop/loose-note" }))
+        .await;
+    assert!(text.starts_with("[memhub] repo/shop/loose-note now lives at repo/shop/pitfalls/loose-note."), "{text}");
 
-    // folder filters and grouping
-    let (_, listed) = a
-        .tool(
-            "list_memories",
-            json!({ "scope": "repo", "owner": "shop", "folder": "pitfalls" }),
-        )
+    // Folder filters and grouping.
+    let listed = a
+        .ok("list_memories", json!({ "scope": "repo", "owner": "shop", "folder": "pitfalls" }))
         .await;
     assert_eq!(listed["count"], 2);
-    let (_, hits) = a
-        .tool("search_memory", json!({ "query": "checkout" }))
+    let hits = a.ok("search_memory", json!({ "query": "checkout" })).await;
+    assert_eq!(hits["hits"][0]["id"], "repo/shop/modules/checkout/payment-retries");
+    let grouped = a
+        .ok("list_memories", json!({ "owner": "shop", "group_by": "folder" }))
         .await;
-    assert_eq!(
-        hits["hits"][0]["id"],
-        "repo/shop/modules/checkout/payment-retries"
-    );
-    let (_, grouped) = a
-        .tool(
-            "list_memories",
-            json!({ "owner": "shop", "group_by": "folder" }),
-        )
-        .await;
-    assert_eq!(
-        grouped["groups"]["repo/shop/pitfalls"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
+    assert_eq!(grouped["groups"]["repo/shop/pitfalls"].as_array().unwrap().len(), 2);
 
-    // agent space folders; other agents' spaces are read-only
-    let (err, added) = a
-        .tool(
-            "add_memory",
-            json!({ "scope": "agent", "folder": "task-logs/2026", "title": "Docs pass",
-                    "kind": "task-log", "body": "done" }),
+    // Agents cannot reshape curated memory.
+    let msg = a
+        .fails("create_folder", json!({ "scope": "repo", "repo": "shop", "folder": "x" }))
+        .await;
+    assert!(msg.contains("forbidden") && msg.contains("record_evidence"), "{msg}");
+    let msg = a
+        .fails("move_memory", json!({ "id": "repo/shop/pitfalls/double-charge", "folder": "" }))
+        .await;
+    assert!(msg.contains("forbidden"), "{msg}");
+    let msg = a
+        .fails(
+            "group_memories",
+            json!({ "group": "payments", "ids": ["repo/shop/pitfalls/double-charge"] }),
         )
         .await;
-    assert!(!err, "{added}");
-    assert_eq!(
-        added["created"]["id"],
-        "agent/doc-bot/task-logs/2026/docs-pass"
-    );
-    let mine = a
-        .tool_text("browse_memory", json!({ "scope": "agent" }))
-        .await;
-    assert!(mine.starts_with("agent/doc-bot: docs (1 memory)"), "{mine}");
-    assert!(!added["hints"].to_string().contains("scope="), "{added}");
-
-    // memories filed in the wrong scope are flagged
-    let (err, added) = a
-        .tool(
-            "add_memory",
-            json!({ "scope": "repo", "repo": "shop", "title": "Sprint 12 progress",
-                    "kind": "task-log", "body": "half done" }),
-        )
-        .await;
-    assert!(!err, "{added}");
-    let hints = added["hints"].to_string();
-    assert!(hints.contains("belong in your agent notebook"), "{hints}");
-    assert!(hints.contains("scope=agent"), "{hints}");
-    let (err, added) = a
-        .tool(
-            "add_memory",
-            json!({ "scope": "agent", "title": "Webhook replay gotcha",
-                    "kind": "pitfall", "body": "replays are not signed" }),
-        )
-        .await;
-    assert!(!err, "{added}");
-    let hints = added["hints"].to_string();
-    assert!(hints.contains("scope=repo, 'pitfalls/'"), "{hints}");
-    let (err, added) = a
-        .tool(
-            "add_memory",
-            json!({ "scope": "agent", "folder": "insights", "title": "Fast test loop",
-                    "kind": "insight", "body": "-run Billing" }),
-        )
-        .await;
-    assert!(!err, "{added}");
-    assert!(!added["hints"].to_string().contains("scope="), "{added}");
-
-    let mut b = client(&state, "10.2.0.2");
-    b.initialize(&[("x-memhub-agent", "other-bot"), ("x-memhub-role", "qa")])
-        .await;
-    let (err, msg) = b
-        .tool(
-            "move_memory",
-            json!({ "id": "repo/shop/pitfalls/double-charge", "folder": "" }),
-        )
-        .await;
-    assert!(err && msg.as_str().unwrap().contains("add_repo"), "{msg}");
-    let (err, msg) = b
-        .tool(
-            "create_folder",
-            json!({ "scope": "repo", "repo": "shop", "folder": "x" }),
-        )
-        .await;
-    assert!(err && msg.as_str().unwrap().contains("forbidden"), "{msg}");
-    let (err, msg) = b
-        .tool(
+    assert!(msg.contains("forbidden"), "{msg}");
+    let msg = a
+        .fails(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "folder": "../escape", "title": "t", "body": "b" }),
         )
         .await;
-    assert!(err && msg.as_str().unwrap().contains("invalid"), "{msg}");
-    let (err, join) = b.tool("add_repo", json!({ "repo": "shop" })).await;
-    assert!(!err);
-    assert!(
-        join["next_step"]
-            .as_str()
-            .unwrap()
-            .contains("browse_memory"),
-        "{join}"
-    );
-    let (err, moved) = b
-        .tool(
-            "move_memory",
-            json!({ "id": "repo/shop/loose-note-3", "folder": "archive/2026" }),
+    assert!(msg.contains("invalid"), "{msg}");
+
+    // The work area: agent notes default to working/, subfolders per task.
+    let note = a
+        .ok("add_memory", json!({ "scope": "agent", "title": "Docs plan", "kind": "plan", "body": "1. api" }))
+        .await;
+    assert_eq!(note["created"]["id"], "agent/doc-bot/working/docs-plan");
+    assert_eq!(note["created"]["work_note"], true);
+    let note = a
+        .ok(
+            "add_memory",
+            json!({ "scope": "agent", "folder": "working/api-docs", "title": "Open questions",
+                    "kind": "notes", "body": "auth?" }),
         )
         .await;
-    assert!(!err, "{moved}");
+    let hints = note["hints"].to_string();
+    assert!(hints.contains(r#"create_folder(scope=\"agent\", folder=\"working/api-docs\""#), "{hints}");
+    a.ok(
+        "create_folder",
+        json!({ "scope": "agent", "folder": "working/api-docs", "description": "API docs pass" }),
+    )
+    .await;
+    a.ok(
+        "move_memory",
+        json!({ "id": "agent/doc-bot/working/docs-plan", "folder": "working/api-docs" }),
+    )
+    .await;
+    let mine = a.tool_text("browse_memory", json!({ "scope": "agent" })).await;
+    assert!(mine.starts_with("agent/doc-bot: docs (2 memories)"), "{mine}");
+    assert!(mine.contains("api-docs/  API docs pass (2)"), "{mine}");
+
+    // Another agent can read the work area but not change it, and does not
+    // find it by searching.
+    let mut b = client(&state, "10.2.0.3");
+    b.initialize(&[("x-memhub-agent", "other-bot"), ("x-memhub-role", "qa")])
+        .await;
+    let msg = b
+        .fails(
+            "update_memory",
+            json!({ "id": "agent/doc-bot/working/api-docs/open-questions", "append": "hijack" }),
+        )
+        .await;
+    assert!(msg.contains("writable only by that agent"), "{msg}");
+    let hits = b
+        .ok("search_memory", json!({ "query": "questions", "owner": "doc-bot" }))
+        .await;
+    assert_eq!(hits["count"], 0, "{hits}");
+
+    // Retired memories drop out of the tree unless asked for.
+    let proposal = c
+        .ok(
+            "propose_changes",
+            json!({ "target": "repo:shop", "ops": [
+                { "op": "retire", "id": "repo/shop/pitfalls/loose-note", "reason": "no content" }
+            ] }),
+        )
+        .await;
+    let reviewed = c
+        .ok(
+            "review_changes",
+            json!({ "proposal_id": proposal["id"], "verdicts": [{ "index": 0, "approve": true }] }),
+        )
+        .await;
+    assert_eq!(reviewed["state"], "applied", "{reviewed}");
+    let tree = a
+        .tool_text("browse_memory", json!({ "owner": "shop", "folder": "pitfalls" }))
+        .await;
+    assert_eq!(
+        tree,
+        "repo/shop/pitfalls (1 memory)\n  double-charge  Double charge [pitfall]\n\
+         (1 superseded memory hidden; include_superseded=true shows them)\n"
+    );
+    let tree = a
+        .tool_text(
+            "browse_memory",
+            json!({ "owner": "shop", "folder": "pitfalls", "include_superseded": true }),
+        )
+        .await;
+    assert!(tree.contains("loose-note  Loose note [pitfall, superseded]"), "{tree}");
 
     let events: Vec<String> = hub
         .audit()
         .read(&LogQuery::default())
         .unwrap()
         .iter()
-        .filter(|r| r["event"].as_str().unwrap().starts_with("folder_") || r["action"] == "move")
-        .map(|r| {
-            format!(
-                "{} {}",
-                r["event"].as_str().unwrap(),
-                r["folder"].as_str().unwrap_or("")
-            )
-        })
+        .filter(|r| r["event"] == "folder_created")
+        .map(|r| format!("{} {}", r["owner"].as_str().unwrap(), r["folder"].as_str().unwrap()))
         .collect();
     assert_eq!(
         events,
         vec![
-            "folder_created modules",
-            "folder_created modules/checkout",
-            "folder_created pitfalls",
-            "memory_changed ",
-            "folder_created task-logs",
-            "folder_created task-logs/2026",
-            "folder_created insights",
-            "folder_created archive",
-            "folder_created archive/2026",
-            "memory_changed ",
+            "shop modules",
+            "shop modules/checkout",
+            "shop pitfalls",
+            "doc-bot working",
+            "doc-bot working/api-docs",
         ]
     );
+}
+
+#[tokio::test]
+async fn agent_writes_outside_the_work_area_become_evidence() {
+    let (_dir, hub, state) = setup(Duration::from_secs(600));
+    let mut a = client(&state, "10.2.0.5");
+    a.initialize(&[("x-memhub-agent", "old-habits"), ("x-memhub-role", "dev")])
+        .await;
+    a.ok("add_repo", json!({ "repo": "shop" })).await;
+
+    let out = a
+        .ok(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": "pitfalls", "title": "Refund webhook twice",
+                    "kind": "pitfall", "body": "Deduplicate by event id.", "tags": ["refund"] }),
+        )
+        .await;
+    assert_eq!(out["layer"], "evidence");
+    let id = out["recorded"]["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("evidence/") && id.contains("/old-habits/"), "{id}");
+    assert_eq!(out["recorded"]["repos"], json!(["shop"]));
+    let hints = out["hints"].to_string();
+    assert!(hints.contains("record_evidence"), "{hints}");
+    let out = a
+        .ok(
+            "add_memory",
+            json!({ "scope": "agent", "folder": "insights", "title": "Fast test loop", "body": "-run Billing" }),
+        )
+        .await;
+    assert_eq!(out["layer"], "evidence");
+    assert!(out["recorded"].get("repos").is_none(), "{out}");
+
+    let ev = a.ok("get_memory", json!({ "id": id })).await;
+    assert_eq!(ev["layer"], "evidence");
+    let tags = ev["tags"].to_string();
+    assert!(tags.contains("folder:pitfalls"), "{ev}");
+
+    // Nothing reached curated memory; evidence is not in search_memory.
+    let hits = a.ok("search_memory", json!({ "query": "refund" })).await;
+    assert_eq!(hits["count"], 0);
+    let found = a
+        .ok("search_evidence", json!({ "query": "refund", "repo": "shop" }))
+        .await;
+    assert_eq!(found["count"], 1);
+    assert!(hub.store().list(&Default::default()).unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn unicode_content_and_ascii_titles() {
     let (_dir, _hub, state) = setup(Duration::from_secs(600));
     let mut a = client(&state, "10.2.0.3");
-    let (_, init) = a
-        .initialize(&[("x-memhub-agent", "i18n-bot"), ("x-memhub-role", "docs")])
+    a.initialize(&[("x-memhub-agent", "i18n-bot"), ("x-memhub-role", "docs")])
         .await;
-    let instructions = init.unwrap()["result"]["instructions"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        instructions.contains("accept any Unicode"),
-        "{instructions}"
-    );
-    let (err, _) = a.tool("add_repo", json!({ "repo": "shop" })).await;
-    assert!(!err);
+    a.ok("add_repo", json!({ "repo": "shop" })).await;
+    let (mut c, _) = curator(&state, "10.2.0.4").await;
 
     let body = "结账流程 🛒\nリトライは 3 回まで ✅\n→ ≥ € 👨‍👩‍👧";
-    let (err, added) = a
-        .tool(
+    let added = c
+        .ok(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "folder": "modules/checkout",
                     "title": "Checkout flow", "body": body, "tags": ["结账", "🛒"] }),
         )
         .await;
-    assert!(!err, "{added}");
     let id = added["created"]["id"].as_str().unwrap().to_string();
     assert_eq!(id, "repo/shop/modules/checkout/checkout-flow");
     assert_eq!(added["created"]["tags"], json!(["结账", "🛒"]));
 
     let text = a.tool_text("get_memory", json!({ "id": id })).await;
     assert!(text.contains(body), "{text}");
-    let (_, hits) = a
-        .tool("search_memory", json!({ "query": "リトライ" }))
-        .await;
+    let hits = a.ok("search_memory", json!({ "query": "リトライ" })).await;
     assert_eq!(hits["hits"][0]["id"], id.as_str());
-    let (err, _) = a
-        .tool("update_memory", json!({ "id": id, "append": "追加 🎉" }))
-        .await;
-    assert!(!err);
+    c.ok("update_memory", json!({ "id": id, "append": "追加 🎉" })).await;
 
-    let (err, msg) = a
-        .tool(
+    let msg = c
+        .fails(
             "add_memory",
             json!({ "scope": "repo", "repo": "shop", "title": "结账流程", "body": "x" }),
         )
         .await;
-    assert!(err);
-    let msg = msg.as_str().unwrap();
     assert!(msg.contains("title must be ASCII"), "{msg}");
     assert!(msg.contains("put Chinese, Japanese, emoji"), "{msg}");
-    let (err, msg) = a
-        .tool("update_memory", json!({ "id": id, "title": "Checkout 🛒" }))
+    let msg = c
+        .fails("update_memory", json!({ "id": id, "title": "Checkout 🛒" }))
         .await;
-    assert!(
-        err && msg.as_str().unwrap().contains("title must be ASCII"),
-        "{msg}"
-    );
+    assert!(msg.contains("title must be ASCII"), "{msg}");
 
-    let (_, list) = a
-        .send(
-            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" }),
-            &[],
+    // Evidence and work notes follow the same rule.
+    let msg = a
+        .fails(
+            "record_evidence",
+            json!({ "title": "结账 bug", "body": "x", "repos": ["shop"] }),
         )
         .await;
+    assert!(msg.contains("title must be ASCII"), "{msg}");
+    let out = a
+        .ok(
+            "record_evidence",
+            json!({ "title": "Checkout retry limit", "body": body, "repos": ["shop"],
+                    "candidate_lesson": "リトライは 3 回まで", "tags": ["结账"] }),
+        )
+        .await;
+    let ev = a
+        .tool_text("get_memory", json!({ "id": out["recorded"]["id"] }))
+        .await;
+    assert!(ev.contains(body) && ev.contains("リトライは 3 回まで"), "{ev}");
+
+    a.next_id += 1;
+    let (_, list) = a
+        .send(json!({ "jsonrpc": "2.0", "id": a.next_id, "method": "tools/list" }), &[])
+        .await;
     let list = list.unwrap();
-    let add = list["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["name"] == "add_memory")
-        .unwrap()
-        .clone();
-    let props = &add["inputSchema"]["properties"];
-    assert!(props["title"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("ASCII"));
-    assert!(props["body"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("Unicode"));
+    let tool = |name: &str| {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    for name in ["add_memory", "record_evidence"] {
+        let props = tool(name)["inputSchema"]["properties"].clone();
+        assert!(props["title"]["description"].as_str().unwrap().contains("ASCII"), "{name}");
+        let body = props["body"]["description"].as_str().unwrap();
+        assert!(body.contains("Unicode") || body.contains("any language"), "{name}");
+    }
 }
 
 #[tokio::test]
 async fn full_http_workflow() {
     let (_dir, hub, state) = setup(Duration::from_secs(600));
 
-    // ---- crash agent is created, joins a repo, writes memory
+    // ---- crash agent is created, joins a repo, records evidence
     let mut crash = client(&state, "10.1.0.5");
     let (status, init) = crash.initialize(&[]).await;
     assert_eq!(status, StatusCode::OK);
@@ -536,193 +647,194 @@ async fn full_http_workflow() {
         .as_str()
         .unwrap()
         .contains("connect_agent"));
+    assert_eq!(crash.tool_names().await.len(), 20);
 
-    let (_, tools) = crash
-        .send(
-            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" }),
-            &[],
-        )
+    let msg = crash.fails("search_memory", json!({ "query": "x" })).await;
+    assert!(msg.contains("not_identified"));
+    let msg = crash.fails("connect_agent", json!({ "name": "crash-bot" })).await;
+    assert!(msg.contains("pass 'role'"), "{msg}");
+    let reg = crash
+        .ok("connect_agent", json!({ "name": "crash-bot", "role": "crash-analysis" }))
         .await;
-    assert_eq!(
-        tools.unwrap()["result"]["tools"].as_array().unwrap().len(),
-        16
-    );
-
-    let (err, msg) = crash.tool("search_memory", json!({ "query": "x" })).await;
-    assert!(err);
-    assert!(msg.as_str().unwrap().contains("not_identified"));
-
-    let (err, msg) = crash
-        .tool("connect_agent", json!({ "name": "crash-bot" }))
-        .await;
-    assert!(err);
-    assert!(msg.as_str().unwrap().contains("pass 'role'"), "{msg}");
-
-    let (err, reg) = crash
-        .tool(
-            "connect_agent",
-            json!({ "name": "crash-bot", "role": "crash-analysis" }),
-        )
-        .await;
-    assert!(!err, "{reg}");
     assert_eq!(reg["created"], true);
-
-    let (err, join) = crash
-        .tool(
-            "add_repo",
-            json!({ "repo": "engine", "description": "Game engine" }),
-        )
+    let join = crash
+        .ok("add_repo", json!({ "repo": "engine", "description": "Game engine" }))
         .await;
-    assert!(!err, "{join}");
     assert_eq!(join["created"], true);
 
-    let (err, added) = crash
-        .tool(
-            "add_memory",
+    let recorded = crash
+        .ok(
+            "record_evidence",
             json!({
-                "scope": "repo", "repo": "engine", "title": "Renderer threading model",
-                "kind": "pitfall", "tags": ["render", "threads"],
-                "body": "The renderer must only be touched from the main thread."
+                "title": "Renderer is main-thread only", "kind": "failure",
+                "body": "Resizing from a worker thread crashed in wgpu (CRASH-1234). Moving the resize to the main loop fixed it.",
+                "repos": ["engine"], "task": "CRASH-1234 resize crash", "outcome": "success",
+                "reason": "anyone touching the renderer from jobs will crash",
+                "candidate_lesson": "Only touch the renderer from the main thread.",
+                "code_refs": ["src/render/mod.rs:42@abc123"], "importance": 4,
+                "tags": ["render", "threads"]
             }),
         )
         .await;
-    assert!(!err, "{added}");
-    let repo_mem = added["created"]["id"].as_str().unwrap().to_string();
-    assert_eq!(repo_mem, "repo/engine/renderer-threading-model");
+    let evidence_id = recorded["recorded"]["id"].as_str().unwrap().to_string();
+    assert!(evidence_id.starts_with("evidence/") && evidence_id.contains("/crash-bot/"), "{evidence_id}");
+    assert_eq!(recorded["recorded"]["source"], "observed");
+    assert!(recorded.get("hints").is_none(), "{recorded}");
+    let msg = crash
+        .fails("record_evidence", json!({ "title": "x", "body": "y", "repos": ["other"] }))
+        .await;
+    assert!(msg.contains("add_repo"), "{msg}");
 
-    let (err, added) = crash
-        .tool(
+    let note = crash
+        .ok(
             "add_memory",
-            json!({ "scope": "agent", "title": "Crash 1234 analysis", "kind": "task-log",
+            json!({ "scope": "agent", "title": "Crash 1234 analysis", "kind": "notes",
                     "body": "Root cause: resize from worker thread." }),
         )
         .await;
-    assert!(!err, "{added}");
-    let agent_mem = added["created"]["id"].as_str().unwrap().to_string();
+    let work_note = note["created"]["id"].as_str().unwrap().to_string();
+    assert_eq!(work_note, "agent/crash-bot/working/crash-1234-analysis");
     assert_eq!(crash.delete().await, StatusCode::NO_CONTENT);
 
-    // ---- perf agent (created via headers) can read but not write others' memory
+    // ---- perf agent (created via headers): no curated memory yet, but evidence is there
     let mut perf = client(&state, "10.1.0.6");
     let (status, _) = perf
-        .initialize(&[
-            ("x-memhub-agent", "perf-bot"),
-            ("x-memhub-role", "perf-opt"),
-        ])
+        .initialize(&[("x-memhub-agent", "perf-bot"), ("x-memhub-role", "perf-opt")])
         .await;
     assert_eq!(status, StatusCode::OK);
+    let hits = perf.ok("search_memory", json!({ "query": "renderer thread" })).await;
+    assert_eq!(hits["count"], 0);
+    assert!(hits["hints"].to_string().contains("search_evidence"), "{hits}");
+    let found = perf.ok("search_evidence", json!({ "query": "renderer" })).await;
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["hits"][0]["id"], evidence_id.as_str());
+    let text = perf.tool_text("get_memory", json!({ "id": evidence_id })).await;
+    assert!(text.starts_with("[memhub] Evidence: a raw, unreviewed observation"), "{text}");
+    assert!(text.contains("main loop"), "{text}");
+    let msg = perf
+        .fails("update_memory", json!({ "id": work_note, "append": "hijack" }))
+        .await;
+    assert!(msg.contains("forbidden"), "{msg}");
 
-    let (err, hits) = perf
-        .tool("search_memory", json!({ "query": "thread" }))
-        .await;
-    assert!(!err);
-    assert_eq!(hits["count"], 2);
-
-    let (err, msg) = perf
-        .tool(
-            "update_memory",
-            json!({ "id": agent_mem, "append": "hijack" }),
-        )
-        .await;
-    assert!(err);
-    assert!(msg.as_str().unwrap().contains("forbidden"), "{msg}");
-
-    let (err, msg) = perf
-        .tool(
-            "update_memory",
-            json!({ "id": repo_mem, "append": "perf note" }),
-        )
-        .await;
-    assert!(err);
-    assert!(msg.as_str().unwrap().contains("add_repo"), "{msg}");
-
-    perf.tool("add_repo", json!({ "repo": "engine" })).await;
-    let (err, upd) = perf
-        .tool(
-            "update_memory",
-            json!({ "id": repo_mem, "append": "Batch draw calls.", "expected_version": 1 }),
-        )
-        .await;
-    assert!(!err, "{upd}");
-    assert_eq!(upd["updated"]["version"], 2);
-
-    let (err, msg) = perf
-        .tool(
-            "update_memory",
-            json!({ "id": repo_mem, "title": "x", "expected_version": 1 }),
-        )
-        .await;
-    assert!(err);
-    assert!(msg.as_str().unwrap().contains("version_conflict"));
-
-    let (err, grouped) = perf
-        .tool(
-            "group_memories",
-            json!({ "group": "rendering", "ids": [repo_mem] }),
-        )
-        .await;
-    assert!(!err, "{grouped}");
-    let (_, groups) = perf
-        .tool("list_memories", json!({ "group_by": "group" }))
-        .await;
-    assert_eq!(groups["groups"]["rendering"][0]["id"], repo_mem);
-
-    // get_memory returns the markdown file as text
-    perf.next_id += 1;
-    let (_, body) = perf
-        .send(
-            json!({ "jsonrpc": "2.0", "id": perf.next_id, "method": "tools/call",
-                    "params": { "name": "get_memory", "arguments": { "id": repo_mem } } }),
-            &[],
-        )
-        .await;
-    let text = body.unwrap()["result"]["content"][0]["text"]
-        .as_str()
+    // ---- the curator turns the evidence into repo memory
+    let (mut cur, _) = curator(&state, "10.1.0.10").await;
+    let status = cur.ok("curation_status", json!({})).await;
+    let engine = status["targets"]
+        .as_array()
         .unwrap()
-        .to_string();
-    assert!(text.starts_with("---\n"));
-    assert!(text.contains("Batch draw calls."));
+        .iter()
+        .find(|t| t["target"] == "repo:engine")
+        .cloned()
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(engine["pending_evidence"], 1, "{status}");
+    let batch = cur.ok("curation_batch", json!({ "target": "repo:engine" })).await;
+    assert_eq!(batch["evidence"].as_array().unwrap().len(), 1, "{batch}");
+    assert_eq!(batch["evidence"][0]["id"], evidence_id.as_str());
+    let cursor = batch["cursor"].as_str().unwrap().to_string();
+    let op = json!({
+        "op": "add", "scope": "repo", "owner": "engine", "folder": "pitfalls",
+        "title": "Renderer threading model", "kind": "pitfall",
+        "body": "The renderer must only be touched from the main thread; resize from a worker crashes.",
+        "applies_to": ["src/render/"],
+        "cites": { "evidence": [evidence_id], "code": ["src/render/mod.rs:42@abc123"] }
+    });
+    let dry = cur
+        .ok("propose_changes", json!({ "target": "repo:engine", "ops": [op], "dry_run": true }))
+        .await;
+    assert_eq!(dry["checks"][0]["ok"], true, "{dry}");
+    let msg = cur
+        .fails("propose_changes", json!({ "target": "repo:engine", "ops": [{ "op": "rewrite" }] }))
+        .await;
+    assert!(msg.contains("malformed operations"), "{msg}");
+    let proposal = cur
+        .ok(
+            "propose_changes",
+            json!({ "target": "repo:engine", "ops": [op], "cursor": cursor, "note": "renderer pitfall" }),
+        )
+        .await;
+    let proposal_id = proposal["id"].as_str().unwrap().to_string();
+    let reviewed = cur
+        .ok(
+            "review_changes",
+            json!({ "proposal_id": proposal_id, "verdicts": [{ "index": 0, "approve": true }] }),
+        )
+        .await;
+    assert_eq!(reviewed["state"], "applied", "{reviewed}");
+    let repo_mem = reviewed["decisions"][0]["applied_id"].as_str().unwrap().to_string();
+    assert_eq!(repo_mem, "repo/engine/pitfalls/renderer-threading-model");
+    let batch = cur.ok("curation_batch", json!({ "target": "repo:engine" })).await;
+    assert!(batch["evidence"].as_array().unwrap().is_empty(), "watermark advanced");
+
+    // ---- agents find it, rate it and dispute it
+    let hits = perf.ok("search_memory", json!({ "query": "renderer thread" })).await;
+    assert_eq!(hits["count"], 1);
+    assert_eq!(hits["hits"][0]["id"], repo_mem.as_str());
+    assert_eq!(hits["hits"][0]["status"], "provisional");
+    assert_eq!(hits["hits"][0]["cites"], 2);
+    let text = perf.tool_text("get_memory", json!({ "id": repo_mem })).await;
+    assert!(text.starts_with("[memhub] provisional: backed by 1 independent source(s)"), "{text}");
+    assert!(text.contains(&evidence_id), "{text}");
+    let msg = perf
+        .fails("update_memory", json!({ "id": repo_mem, "append": "perf note" }))
+        .await;
+    assert!(msg.contains("add_repo") || msg.contains("forbidden"), "{msg}");
+    perf.ok("add_repo", json!({ "repo": "engine" })).await;
+    let msg = perf
+        .fails("update_memory", json!({ "id": repo_mem, "append": "perf note" }))
+        .await;
+    assert!(msg.contains("forbidden") && msg.contains("dispute_memory"), "{msg}");
+
+    let rated = perf
+        .ok("rate_memory", json!({ "id": repo_mem, "rating": "helpful", "note": "saved a crash" }))
+        .await;
+    assert_eq!(rated["feedback"]["helpful"], 1);
+    let disputed = perf
+        .ok(
+            "dispute_memory",
+            json!({ "id": repo_mem, "reason": "Resize is safe from workers since the render queue landed.",
+                    "code_refs": ["src/render/queue.rs:10@def456"] }),
+        )
+        .await;
+    assert_eq!(disputed["disputed"]["status"], "disputed");
+    let dispute_id = disputed["evidence"]["id"].as_str().unwrap().to_string();
+    let hits = perf.ok("search_memory", json!({ "query": "renderer" })).await;
+    assert!(hits["hints"].to_string().contains("disputed"), "{hits}");
+    let text = perf.tool_text("get_memory", json!({ "id": repo_mem })).await;
+    assert!(text.starts_with("[memhub] DISPUTED"), "{text}");
+    let batch = cur.ok("curation_batch", json!({ "target": "repo:engine" })).await;
+    assert_eq!(batch["evidence"][0]["id"], dispute_id.as_str(), "{batch}");
+    assert!(!batch["feedback"].as_array().unwrap().is_empty(), "{batch}");
 
     // ---- another user of crash-bot connects by name via header
     let mut crash2 = client(&state, "10.1.0.7");
     let (status, _) = crash2.initialize(&[("x-memhub-agent", "ghost-bot")]).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "unknown agent without role"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown agent without role");
     let (status, _) = crash2.initialize(&[("x-memhub-agent", "crash-bot")]).await;
     assert_eq!(status, StatusCode::OK);
-    let (err, me) = crash2.tool("whoami", json!({})).await;
-    assert!(!err);
+    let me = crash2.ok("whoami", json!({})).await;
     assert_eq!(me["agent"]["name"], "crash-bot");
     assert_eq!(me["ip"], "10.1.0.7");
     assert_eq!(me["agent"]["repos"], json!(["engine"]));
+    crash2
+        .ok("update_memory", json!({ "id": work_note, "append": "Shared by every crash-bot user." }))
+        .await;
 
     // ---- another user of perf-bot connects by name via the tool
     let mut perf2 = client(&state, "10.1.0.8");
     perf2.initialize(&[]).await;
-    let (err, connected) = perf2
-        .tool("connect_agent", json!({ "name": "perf-bot" }))
-        .await;
-    assert!(!err);
+    let connected = perf2.ok("connect_agent", json!({ "name": "perf-bot" })).await;
     assert_eq!(connected["created"], false);
     assert_eq!(connected["agent"]["role"], "perf-opt");
 
     // ---- protocol errors
     let (status, _) = client(&state, "10.1.0.9")
-        .send(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-            &[],
-        )
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), &[])
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let mut ghost = client(&state, "10.1.0.9");
     ghost.session = Some("nope".into());
     let (status, _) = ghost
-        .send(
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-            &[],
-        )
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), &[])
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, unknown) = perf2
@@ -733,6 +845,15 @@ async fn full_http_workflow() {
         )
         .await;
     assert_eq!(unknown.unwrap()["error"]["code"], -32602);
+    let (_, hidden) = perf2
+        .send(
+            json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                    "params": { "name": "curation_batch", "arguments": { "target": "repo:engine" } } }),
+            &[],
+        )
+        .await;
+    let hidden = hidden.unwrap();
+    assert!(hidden["result"]["isError"] == true || hidden.get("error").is_some(), "{hidden}");
 
     state.close_all("server_shutdown");
 
@@ -745,13 +866,12 @@ async fn full_http_workflow() {
         .collect();
     assert_eq!(
         connects,
-        vec!["10.1.0.5", "10.1.0.6", "10.1.0.7", "10.1.0.7", "10.1.0.8"]
+        vec!["10.1.0.5", "10.1.0.6", "10.1.0.10", "10.1.0.7", "10.1.0.7", "10.1.0.8"]
     );
     assert!(log
         .iter()
         .filter(|r| r["event"] == "connect")
         .all(|r| r["client"] == "test-client 1.0" && r["transport"] == "http"));
-
     let disconnects: Vec<(String, String)> = log
         .iter()
         .filter(|r| r["event"] == "disconnect")
@@ -762,14 +882,28 @@ async fn full_http_workflow() {
             )
         })
         .collect();
-    assert_eq!(disconnects.len(), 5, "every connect has a disconnect");
+    assert_eq!(disconnects.len(), 6, "every connect has a disconnect");
     assert!(disconnects.contains(&("crash-bot".into(), "client_closed".into())));
     assert!(disconnects.contains(&("-".into(), "connect_failed".into())));
     assert!(disconnects.contains(&("perf-bot".into(), "server_shutdown".into())));
+    assert!(disconnects.contains(&("memhub-curator".into(), "server_shutdown".into())));
 
-    let changes: Vec<(String, String)> = log
+    let events = |name: &str| -> Vec<Value> {
+        log.iter().filter(|r| r["event"] == name).cloned().collect()
+    };
+    let recorded: Vec<String> = events("evidence_recorded")
         .iter()
-        .filter(|r| r["event"] == "memory_changed")
+        .map(|r| r["agent"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(recorded, ["crash-bot", "perf-bot"]);
+    assert_eq!(events("memory_rated").len(), 1);
+    assert_eq!(events("memory_disputed").len(), 1);
+    assert_eq!(events("curation_proposed").len(), 1);
+    assert_eq!(events("curation_reviewed").len(), 1);
+    let searches = events("memory_searched");
+    assert!(searches.iter().any(|r| r["hits"] == 0 && r["agent"] == "perf-bot"), "{searches:?}");
+    let changes: Vec<(String, String)> = events("memory_changed")
+        .iter()
         .map(|r| {
             (
                 r["agent"].as_str().unwrap().to_string(),
@@ -777,21 +911,15 @@ async fn full_http_workflow() {
             )
         })
         .collect();
-    assert_eq!(
-        changes,
-        vec![
-            ("crash-bot".into(), "add".into()),
-            ("crash-bot".into(), "add".into()),
-            ("perf-bot".into(), "update".into()),
-            ("perf-bot".into(), "group_add".into()),
-        ]
-    );
-    let update = log.iter().find(|r| r["action"] == "update").unwrap();
-    assert!(update["diff"]
-        .as_str()
-        .unwrap()
-        .contains("+Batch draw calls."));
-    assert_eq!(update["ip"], "10.1.0.6");
+    assert_eq!(changes[0], ("crash-bot".to_string(), "add".to_string()));
+    assert!(changes.contains(&("memhub-curator".to_string(), "add".to_string())), "{changes:?}");
+    assert!(changes.contains(&("crash-bot".to_string(), "update".to_string())), "{changes:?}");
+    let update = log
+        .iter()
+        .find(|r| r["event"] == "memory_changed" && r["action"] == "update" && r["agent"] == "crash-bot")
+        .unwrap();
+    assert!(update["diff"].as_str().unwrap().contains("+Shared by every crash-bot user."));
+    assert_eq!(update["ip"], "10.1.0.7");
 }
 
 #[tokio::test]
@@ -1009,19 +1137,18 @@ async fn memory_reads_are_counted_and_ranked() {
     b.initialize(&[("x-memhub-agent", "bob"), ("x-memhub-role", "dev")])
         .await;
     a.tool("add_repo", json!({ "repo": "shop" })).await;
+    let (mut c, _) = curator(&state, "10.0.0.4").await;
     for (folder, title) in [
         ("", "Overview"),
         ("modules/cart", "Cart rules"),
         ("modules/cart", "Cart pitfalls"),
         ("modules/auth", "Login flow"),
     ] {
-        let (err, out) = a
-            .tool(
-                "add_memory",
-                json!({ "scope": "repo", "repo": "shop", "folder": folder, "title": title, "body": "x" }),
-            )
-            .await;
-        assert!(!err, "{out}");
+        c.ok(
+            "add_memory",
+            json!({ "scope": "repo", "repo": "shop", "folder": folder, "title": title, "body": "x" }),
+        )
+        .await;
     }
 
     for _ in 0..3 {
@@ -1033,9 +1160,12 @@ async fn memory_reads_are_counted_and_ranked() {
     read(&mut b, "repo/shop/overview").await;
     read(&mut a, "repo/shop/overview").await;
 
-    // Listing, browsing and searching are not reads; nor is the admin UI.
+    // Listing, browsing and searching are not reads; nor is the admin UI,
+    // nor the curator's reads.
     a.tool("list_memories", json!({})).await;
     a.tool("search_memory", json!({ "query": "cart" })).await;
+    let (_, out) = read(&mut c, "repo/shop/modules/cart/cart-rules").await;
+    assert_eq!(out["read_count"], 4);
     let detail = a
         .admin_get("/api/admin/memories/repo/shop/modules/cart/cart-rules")
         .await;
@@ -1116,17 +1246,14 @@ async fn memory_reads_are_counted_and_ranked() {
     assert_eq!(local["folders"][0]["read_memories"], 1);
 
     // Moving keeps the count; deleting drops it.
-    let (err, out) = a
-        .tool(
-            "move_memory",
-            json!({ "id": "repo/shop/modules/cart/cart-rules", "folder": "modules/checkout" }),
-        )
-        .await;
-    assert!(!err, "{out}");
+    c.ok(
+        "move_memory",
+        json!({ "id": "repo/shop/modules/cart/cart-rules", "folder": "modules/checkout" }),
+    )
+    .await;
     let (_, out) = read(&mut a, "repo/shop/modules/checkout/cart-rules").await;
     assert_eq!(out["read_count"], 5);
-    a.tool("delete_memory", json!({ "id": "repo/shop/overview" }))
-        .await;
+    c.ok("delete_memory", json!({ "id": "repo/shop/overview" })).await;
     let global = a.admin_get("/api/admin/reads").await;
     assert_eq!(global["total_reads"], 6);
     assert_eq!(global["memory_count"], 3);
@@ -1164,7 +1291,7 @@ async fn memory_reads_are_counted_and_ranked() {
         .all(|k| !k.contains("modules/cart/")));
 
     // Counts survive a restart.
-    drop((a, b, probe));
+    drop((a, b, c, probe));
     state.close_all("server_shutdown");
     drop(state);
     drop(hub);
@@ -1178,46 +1305,51 @@ async fn memory_reads_are_counted_and_ranked() {
     assert_eq!(hub.reads().get(&id).count, 1);
 }
 
+fn stdio_lines(hub: &Arc<Hub>, login: StdioLogin, input: &[Value]) -> Vec<Value> {
+    let input = input
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    serve(hub.clone(), login, input.as_bytes(), &mut out).unwrap();
+    String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
 #[test]
 fn stdio_transport() {
     let dir = tempfile::tempdir().unwrap();
     let hub = Hub::open(HubConfig::new(dir.path())).unwrap();
-    let input = [
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
-                "params": { "protocolVersion": "2024-11-05", "clientInfo": { "name": "cli" } } }),
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": { "name": "connect_agent", "arguments": { "name": "solo", "role": "feature-impl" } } }),
-        json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                "params": { "name": "add_memory", "arguments": { "scope": "agent", "title": "Hello", "body": "world" } } }),
-    ]
-    .iter()
-    .map(|v| v.to_string())
-    .collect::<Vec<_>>()
-    .join("\n");
-
-    let mut out = Vec::new();
-    serve(
-        hub.clone(),
+    let responses = stdio_lines(
+        &hub,
         StdioLogin::default(),
-        input.as_bytes(),
-        &mut out,
-    )
-    .unwrap();
-    let responses: Vec<Value> = String::from_utf8(out)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(responses.len(), 4);
+        &[
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                    "params": { "protocolVersion": "2024-11-05", "clientInfo": { "name": "cli" } } }),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": { "name": "connect_agent", "arguments": { "name": "solo", "role": "feature-impl" } } }),
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": { "name": "add_memory", "arguments": { "scope": "agent", "title": "Hello", "body": "world" } } }),
+            json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
+        ],
+    );
+    assert_eq!(responses.len(), 5);
     assert_eq!(responses[0]["error"]["code"], -32002);
     assert_eq!(responses[1]["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(responses[1]["result"]["serverInfo"]["name"], "memhub2");
     assert_eq!(responses[2]["result"]["isError"], false);
     assert_eq!(
         responses[3]["result"]["structuredContent"]["created"]["id"],
-        "agent/solo/hello"
+        "agent/solo/working/hello"
     );
+    let tools = responses[4]["result"]["tools"].to_string();
+    assert!(tools.contains("record_evidence") && !tools.contains("curation_batch"));
 
     let log = hub.audit().read(&LogQuery::default()).unwrap();
     assert_eq!(log.first().unwrap()["event"], "connect");
@@ -1227,30 +1359,41 @@ fn stdio_transport() {
     assert_eq!(log.last().unwrap()["agent"], "solo");
 
     // A second process for the same agent, identified via --agent.
-    let input = [
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "cli" } } }),
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": { "name": "whoami", "arguments": {} } }),
-    ]
-    .iter()
-    .map(|v| v.to_string())
-    .collect::<Vec<_>>()
-    .join("\n");
-    let mut out = Vec::new();
-    let login = StdioLogin {
-        agent: Some("solo".into()),
-        role: None,
-        instance: Some("  ci-runner-7\n".into()),
-    };
-    serve(hub.clone(), login, input.as_bytes(), &mut out).unwrap();
-    let whoami: Value =
-        serde_json::from_str(String::from_utf8(out).unwrap().lines().nth(1).unwrap()).unwrap();
-    assert_eq!(
-        whoami["result"]["structuredContent"]["agent"]["name"],
-        "solo"
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "cli" } } });
+    let responses = stdio_lines(
+        &hub,
+        StdioLogin {
+            agent: Some("solo".into()),
+            role: None,
+            instance: Some("  ci-runner-7\n".into()),
+            curator: false,
+        },
+        &[
+            init.clone(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "whoami", "arguments": {} } }),
+        ],
     );
+    assert_eq!(responses[1]["result"]["structuredContent"]["agent"]["name"], "solo");
     let log = hub.audit().read(&LogQuery::default()).unwrap();
     let connect = log.iter().rev().find(|r| r["event"] == "connect").unwrap();
     assert_eq!(connect["instance"], "ci-runner-7");
+
+    // `memhub2 stdio --curator` gives a curator session.
+    let responses = stdio_lines(
+        &hub,
+        StdioLogin {
+            agent: Some("memhub-curator".into()),
+            role: Some("curator".into()),
+            instance: None,
+            curator: true,
+        },
+        &[init, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })],
+    );
+    assert!(responses[0]["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("CURATOR SESSION"));
+    assert!(responses[1]["result"]["tools"].to_string().contains("curation_batch"));
 }

@@ -201,7 +201,7 @@ fn token_ok(state: &HttpState, headers: &HeaderMap) -> bool {
     constant_time_eq(given.as_bytes(), expected.as_bytes())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -649,14 +649,14 @@ async fn export_connections(
         Ok((bytes, truncated))
     })
     .await?;
-    let filename = format!("memhub-connections-{}.xlsx", Utc::now().format("%Y-%m-%d"));
+    let filename = format!("memhub2-connections-{}.xlsx", Utc::now().format("%Y-%m-%d"));
     Ok(xlsx_response(bytes, &filename, truncated))
 }
 
 fn xlsx_response(bytes: Vec<u8>, filename: &str, truncated: bool) -> Response {
     let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
         .unwrap_or_else(|_| {
-            HeaderValue::from_static("attachment; filename=\"memhub-connections.xlsx\"")
+            HeaderValue::from_static("attachment; filename=\"memhub2-connections.xlsx\"")
         });
     let mut res = bytes.into_response();
     let headers = res.headers_mut();

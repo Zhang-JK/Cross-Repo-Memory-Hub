@@ -15,6 +15,11 @@
 //! shutdown are saved to [`HttpConfig::resume_file`] and resumable after a
 //! restart the same way.
 //!
+//! A request carrying [`CURATOR_HEADER`] with the configured curator token
+//! gets a curator session (writes experience, sees the curation tools). The
+//! token is checked on `initialize` and again whenever an expired session is
+//! resumed.
+//!
 //! The same router serves the management UI ([`crate::admin`]) and `/health`.
 
 use std::{
@@ -51,6 +56,8 @@ pub const ROLE_HEADER: &str = "x-memhub-role";
 /// Optional label of the running agent copy (e.g. `alice-laptop`), so that
 /// several copies of one agent behind one IP can be told apart and counted.
 pub const INSTANCE_HEADER: &str = "x-memhub-instance";
+/// Curator token; see [`HttpConfig::curator_token`].
+pub const CURATOR_HEADER: &str = "x-memhub-curator-token";
 
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
@@ -62,6 +69,9 @@ pub struct HttpConfig {
     pub idle_timeout: Duration,
     /// Required (as `Authorization: Bearer <token>`) by the admin API when set.
     pub admin_token: Option<String>,
+    /// Token that makes a session a curator (sent in [`CURATOR_HEADER`]).
+    /// `None` disables curator sessions over HTTP.
+    pub curator_token: Option<String>,
     /// How long an expired session can be resumed by its id.
     pub resume_ttl: Duration,
     /// Where sessions open at shutdown are saved for resumption after a
@@ -102,6 +112,7 @@ impl Default for HttpConfig {
             allowed_origins: Vec::new(),
             idle_timeout: Duration::from_secs(60 * 60),
             admin_token: None,
+            curator_token: None,
             resume_ttl: Duration::from_secs(7 * 24 * 60 * 60),
             resume_file: None,
         }
@@ -395,6 +406,19 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
+/// Whether the request asks for a curator session, and whether that is
+/// allowed: `Ok(false)` without the header, `Err` for a wrong token.
+fn curator_requested(config: &HttpConfig, headers: &HeaderMap) -> Result<bool, &'static str> {
+    let Some(given) = header_str(headers, CURATOR_HEADER) else {
+        return Ok(false);
+    };
+    match config.curator_token.as_deref() {
+        None => Err("this server has no curator token configured (--curator-token / MEMHUB2_CURATOR_TOKEN)"),
+        Some(expected) if crate::admin::constant_time_eq(given.as_bytes(), expected.as_bytes()) => Ok(true),
+        Some(_) => Err("invalid curator token"),
+    }
+}
+
 fn json_response(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
@@ -517,6 +541,13 @@ async fn initialize(
     headers: &HeaderMap,
     msg: Message,
 ) -> Response {
+    let curator = match curator_requested(&state.config, headers) {
+        Ok(c) => c,
+        Err(message) => {
+            tracing::warn!(%ip, "rejected curator session: {message}");
+            return rpc_error(StatusCode::FORBIDDEN, protocol::INVALID_REQUEST, message);
+        }
+    };
     let agent = header_str(headers, AGENT_HEADER).map(str::to_owned);
     let role = header_str(headers, ROLE_HEADER).map(str::to_owned);
     let instance = header_str(headers, INSTANCE_HEADER).and_then(clean_instance);
@@ -528,7 +559,7 @@ async fn initialize(
             client: None,
             instance,
         };
-        let (mut conn, response) = McpConnection::initialize(&hub, conn_info, &msg);
+        let (mut conn, response) = McpConnection::initialize(&hub, conn_info, &msg, curator);
         if let Some(agent) = agent {
             if let Err(e) = conn.session_mut().connect(&agent, role.as_deref(), None) {
                 conn.close("connect_failed");
@@ -564,6 +595,7 @@ async fn initialize(
         ip = %conn.session().conn().ip,
         agent = ?conn.session().agent(),
         instance = ?conn.session().conn().instance,
+        curator = conn.session().is_curator(),
         "mcp session opened"
     );
     state
@@ -603,6 +635,7 @@ async fn resume(
         .clone()
         .or_else(|| header_str(headers, AGENT_HEADER).map(str::to_owned));
     let role = header_str(headers, ROLE_HEADER).map(str::to_owned);
+    let curator = curator_requested(&state.config, headers).unwrap_or(false);
     let hub = state.hub.clone();
     let id = session_id.to_string();
     let conn = tokio::task::spawn_blocking(move || {
@@ -613,6 +646,7 @@ async fn resume(
             &record.protocol_version,
             agent.as_deref(),
             role.as_deref(),
+            curator,
         )
     })
     .await

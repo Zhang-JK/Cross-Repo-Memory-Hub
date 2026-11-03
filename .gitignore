@@ -1,3 +1,7 @@
 /target
 /memhub-data
 /.run
+/memhub2-data
+/.run2
+# Holds the LLM API key; only the .example.yaml is committed.
+/config/memhub2-curator.yaml

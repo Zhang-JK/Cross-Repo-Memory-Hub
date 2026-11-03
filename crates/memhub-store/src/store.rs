@@ -35,6 +35,7 @@ const MAX_DESCRIPTION_CHARS: usize = 2000;
 /// memories/repo/<repo-id>/[<folder>/...]<slug>.md
 /// memories/agent/<agent-name>/[<folder>/...]<slug>.md
 /// memories/<scope>/<owner>/<folder>/_index.md   (folder description)
+/// memories/agent/<agent-name>/working/...       (the agent's mutable work area)
 /// trash/<scope>/<owner>/[<folder>/]<slug>.<timestamp>.md   (deleted memories)
 /// ```
 ///
@@ -140,6 +141,7 @@ impl MemoryStore {
                     created_at: now,
                     updated_at: now,
                     version: 1,
+                    experience: new.experience.clone(),
                     extra: BTreeMap::new(),
                 },
                 body: frontmatter::normalize_body(&new.body),
@@ -154,6 +156,23 @@ impl MemoryStore {
             }
         }
         unreachable!("slug suffix space exhausted")
+    }
+
+    /// Writes a complete memory exactly as given (id, versions, timestamps),
+    /// e.g. one ported from another hub. Fails if the id is taken.
+    pub fn import(&self, memory: &Memory) -> Result<()> {
+        let id = &memory.meta.id;
+        validate_name(owner_kind(id.scope), &id.owner)?;
+        validate_name("memory slug", &id.slug)?;
+        normalize_folder(&id.folder)?;
+        let dir = self.folder_dir(id.scope, &id.owner, &id.folder);
+        let _guard = self.lock();
+        fs::create_dir_all(&dir).at(&dir)?;
+        write_new(&self.path_of(id), &frontmatter::render(memory)?)
+            .map_err(|e| match e {
+                StoreError::AlreadyExists(_) => StoreError::AlreadyExists(id.to_string()),
+                e => e,
+            })
     }
 
     pub fn update(&self, id: &MemoryId, patch: MemoryPatch, editor: &str) -> Result<Change> {
@@ -674,6 +693,12 @@ fn apply_patch(memory: &mut Memory, patch: MemoryPatch) -> Result<()> {
     if let Some(body) = patch.body {
         memory.body = body;
     }
+    if let Some(experience) = patch.experience {
+        for r in &experience.cites.code {
+            crate::experience::validate_code_ref(r)?;
+        }
+        meta.experience = experience;
+    }
     if let Some(append) = patch.append {
         let body = &mut memory.body;
         if !body.trim().is_empty() {
@@ -703,6 +728,7 @@ fn changed_fields(before: &Memory, after: &Memory) -> Vec<&'static str> {
     if b.groups != a.groups {
         out.push("groups");
     }
+    out.extend(b.experience.changed(&a.experience));
     if b.extra != a.extra {
         out.push("extra");
     }
@@ -762,7 +788,7 @@ fn temp_in(path: &Path, text: &str) -> Result<tempfile::NamedTempFile> {
     Ok(tmp)
 }
 
-fn write_new(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_new(path: &Path, text: &str) -> Result<()> {
     temp_in(path, text)?.persist_noclobber(path).map_err(|e| {
         if e.error.kind() == io::ErrorKind::AlreadyExists {
             StoreError::AlreadyExists(path.display().to_string())

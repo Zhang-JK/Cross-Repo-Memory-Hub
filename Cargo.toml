@@ -5,10 +5,11 @@ members = [
     "crates/memhub-audit",
     "crates/memhub-app",
     "crates/memhub-mcp",
+    "crates/memhub-curator",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -17,6 +18,7 @@ rust-version = "1.85"
 memhub-store = { path = "crates/memhub-store" }
 memhub-audit = { path = "crates/memhub-audit" }
 memhub-app = { path = "crates/memhub-app" }
+memhub-curator = { path = "crates/memhub-curator" }
 
 anyhow = "1"
 axum = "0.8"
@@ -35,3 +37,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 http-body-util = "0.1"
+ureq = "3"

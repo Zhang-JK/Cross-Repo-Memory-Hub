@@ -1,15 +1,17 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::Utc;
 use memhub_audit::AuditLog;
-use memhub_store::{MemoryStore, Scope};
+use memhub_store::{EvidenceStore, MemoryStore, Scope};
 
 use crate::{
     error::{AppError, Result},
+    feedback::FeedbackStats,
     reads::ReadStats,
+    redirects::Redirects,
     registry::Registry,
     session::{AgentSession, ConnInfo},
 };
@@ -30,31 +32,43 @@ impl HubConfig {
 /// Shared state behind all agent sessions.
 ///
 /// ```text
-/// <data_root>/memories/...   memory files (see memhub_store)
-/// <data_root>/trash/...      deleted memories
-/// <data_root>/registry/...   agent and repo profiles
-/// <data_root>/logs/...       audit log
-/// <data_root>/stats/...      read counts (see [`ReadStats`])
+/// <data_root>/memories/...       experience memories and agent work areas (see memhub_store)
+/// <data_root>/evidence/...       append-only evidence records
+/// <data_root>/trash/...          deleted memories
+/// <data_root>/registry/...       agent and repo profiles
+/// <data_root>/logs/...           audit log
+/// <data_root>/stats/...          read counts ([`ReadStats`]) and feedback ([`FeedbackStats`])
+/// <data_root>/curation/...       curator watermarks and change proposals
+/// <data_root>/redirects.json     old id -> new id ([`Redirects`])
 /// ```
 pub struct Hub {
     config: HubConfig,
     store: MemoryStore,
+    evidence: EvidenceStore,
     registry: Registry,
     audit: AuditLog,
     reads: ReadStats,
+    feedback: FeedbackStats,
+    redirects: Redirects,
+    curation_lock: Mutex<()>,
 }
 
 impl Hub {
     pub fn open(config: HubConfig) -> Result<Arc<Self>> {
         let root = &config.data_root;
         let store = MemoryStore::open(root)?;
+        let evidence = EvidenceStore::open(root)?;
         let registry = Registry::open(root)?;
         let audit = AuditLog::open(root.join("logs"))
             .map_err(|e| AppError::Internal(format!("cannot open audit log: {e}")))?;
         let reads = ReadStats::open(root);
         Ok(Arc::new(Self {
+            feedback: FeedbackStats::open(root),
+            redirects: Redirects::open(root),
+            curation_lock: Mutex::new(()),
             config,
             store,
+            evidence,
             registry,
             audit,
             reads,
@@ -71,6 +85,27 @@ impl Hub {
 
     pub fn store(&self) -> &MemoryStore {
         &self.store
+    }
+
+    pub fn evidence(&self) -> &EvidenceStore {
+        &self.evidence
+    }
+
+    pub fn feedback(&self) -> &FeedbackStats {
+        &self.feedback
+    }
+
+    pub fn redirects(&self) -> &Redirects {
+        &self.redirects
+    }
+
+    pub fn curation_dir(&self) -> PathBuf {
+        self.config.data_root.join("curation")
+    }
+
+    /// Serializes proposal reviews so an operation is never applied twice.
+    pub(crate) fn curation_lock(&self) -> MutexGuard<'_, ()> {
+        self.curation_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn registry(&self) -> &Registry {

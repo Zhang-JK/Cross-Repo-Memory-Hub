@@ -532,6 +532,7 @@ impl Admin {
             body: body.clone().unwrap_or_default(),
             author: ADMIN_ACTOR.to_string(),
             slug: slug.clone(),
+            experience: Default::default(),
         };
         if let Some(markdown) = input.markdown.filter(|m| !m.trim().is_empty()) {
             let placeholder = slug
@@ -555,6 +556,7 @@ impl Admin {
             if body.is_none() {
                 new.body = parsed.body;
             }
+            new.experience = parsed.meta.experience;
         }
 
         let new_folders = self.hub.missing_folders(new.scope, &new.owner, &new.folder)?;

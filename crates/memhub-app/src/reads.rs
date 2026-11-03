@@ -105,6 +105,10 @@ enum Op {
         from: String,
         to: String,
     },
+    Import {
+        id: String,
+        count: u64,
+    },
 }
 
 type Stats = HashMap<String, ReadStat>;
@@ -120,6 +124,7 @@ fn apply(stats: &mut Stats, op: &Op) {
                 stats.entry(to.clone()).or_default().merge(stat);
             }
         }
+        Op::Import { id, count } => stats.entry(id.clone()).or_default().count += count,
     }
 }
 
@@ -176,6 +181,16 @@ impl ReadStats {
             self.change(Op::Rename {
                 from: from.to_string(),
                 to: to.to_string(),
+            });
+        }
+    }
+
+    /// Adds reads counted elsewhere (a memory ported from 1.0) to the total.
+    pub fn import(&self, id: &MemoryId, count: u64) {
+        if count > 0 {
+            self.change(Op::Import {
+                id: id.to_string(),
+                count,
             });
         }
     }

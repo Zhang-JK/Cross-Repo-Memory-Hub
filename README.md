@@ -186,7 +186,8 @@ so configuring the header remains the most robust option.
   front-matter properties and content (rendered or raw file). Add memories into any folder
   (typed in or imported from a `.md` file), move or delete memories, and create, describe or
   delete folders. Each memory shows its read count. **Ranking** ranks memories and folders by
-  agent reads, see [Read counts](#read-counts).
+  agent reads, see [Read counts](#read-counts). **Filter** finds memories by who added or
+  updated them, from which IP and when, see [Filtering memories](#filtering-memories).
 - **Connections**: live instances and connections, plus rolling 7-day and 30-day counts
   (instances, distinct agents, distinct IPs, connections; see
   [Counting instances](#counting-instances)), then one row per MCP session
@@ -226,6 +227,30 @@ Counts are updated in memory immediately. They are written to disk at most every
 when there are new reads, periodically by the server, and at shutdown. A crash can lose the
 last few seconds. Several stdio processes sharing a data directory add up their counts
 instead of overwriting each other.
+
+#### Filtering memories
+
+The **Filter** view (Memories, **Filter** toggle) lists the memories of the selection (all
+memories, or a repo, agent or subfolder picked in the tree) with when, by which agent and from
+which IP each was added and last updated, its number of changes and its read count.
+
+- **Agent** (exact name) and **IP address** (any part of it) keep memories whose add, or one of
+  whose later changes (update, move, grouping), was made by that agent from that IP. Both must
+  match the same change. **Added or updated / Added / Updated** limits them to the add or to
+  the later changes.
+- **Added** and **Updated** are day ranges in the browser's time zone; either end may be left
+  open. Updated is the last change; a memory never changed after it was added doesn't match
+  an Updated range.
+- Clicking an agent, IP or folder in the table filters by it. The filters are kept in the URL.
+
+Agent names and times come from the memory file (`author`, `updated_by`, `created_at`,
+`updated_at`); IPs come from the audit log, following a memory across moves. A change the log
+has no record of (a hand-edited file, a log written before the change) shows "IP unknown" and
+doesn't match an IP filter.
+
+The API is `GET /api/admin/filter?scope=&owner=&folder=&agent=&ip=&by=any|added|updated&added_from=&added_to=&updated_from=&updated_to=&sort=updated|added&limit=`.
+Range bounds are RFC 3339 times (`from` included, `to` excluded) or `YYYY-MM-DD` days in UTC
+(`to` includes that day).
 
 Changes made in the UI skip the per-agent write rules and are audited as agent `(admin)`,
 transport `admin`, with the browser's IP. Deleted memories and folders go to `trash/`.

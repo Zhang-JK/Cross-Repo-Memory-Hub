@@ -736,3 +736,84 @@ async fn selftest_agent_is_omitted_from_the_admin_api() {
     assert_eq!(stats["live_sessions"].as_array().unwrap().len(), 0);
     assert_eq!(stats["connections_today"], 0);
 }
+
+#[tokio::test]
+async fn filter_memories_over_http() {
+    let (_dir, router) = app(None);
+    for title in ["Build notes", "Deploy notes"] {
+        let (status, _) = call(
+            &router,
+            "POST",
+            "/api/admin/memories",
+            Some(json!({ "scope": "repo", "owner": "engine", "title": title })),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, all) = call(&router, "GET", "/api/admin/filter", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(
+        (all["total"].as_u64(), all["matched"].as_u64()),
+        (Some(2), Some(2))
+    );
+    assert_eq!(all["agents"], json!(["(admin)"]));
+    assert_eq!(all["ips"], json!(["10.1.2.3"]));
+    let m = &all["memories"][0];
+    assert_eq!(m["added"]["agent"], "(admin)");
+    assert_eq!(m["added"]["ip"], "10.1.2.3");
+    assert!(m["updated"].is_null());
+    assert_eq!(m["changes"], 0);
+
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let tomorrow = (Utc::now() + Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let hour_ago =
+        (Utc::now() - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for (uri, want) in [
+        (
+            format!("/api/admin/filter?ip=10.1.2&by=added&added_from={today}&added_to={today}"),
+            2,
+        ),
+        (format!("/api/admin/filter?added_from={tomorrow}"), 0),
+        (
+            format!("/api/admin/filter?added_from={hour_ago}&sort=added&limit=1"),
+            2,
+        ),
+        ("/api/admin/filter?agent=nobody".to_string(), 0),
+        ("/api/admin/filter?ip=10.9.9.9".to_string(), 0),
+        (format!("/api/admin/filter?updated_from={today}"), 0),
+        ("/api/admin/filter?scope=agent".to_string(), 0),
+    ] {
+        let (status, res) = call(&router, "GET", &uri, None, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {res}");
+        assert_eq!(res["matched"], want, "{uri}");
+    }
+    let (_, limited) = call(
+        &router,
+        "GET",
+        "/api/admin/filter?sort=added&limit=1",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(limited["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["memories"][0]["id"], "repo/engine/deploy-notes");
+
+    for bad in [
+        "/api/admin/filter?added_from=yesterday",
+        "/api/admin/filter?updated_to=2026-13-01",
+        "/api/admin/filter?by=someone",
+        "/api/admin/filter?sort=title",
+        "/api/admin/filter?scope=team",
+    ] {
+        let (status, res) = call(&router, "GET", bad, None, &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {res}");
+    }
+
+    let (_dir, locked) = app(Some("s3cret"));
+    let (status, _) = call(&locked, "GET", "/api/admin/filter", None, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

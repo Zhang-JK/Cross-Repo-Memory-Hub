@@ -19,9 +19,12 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use memhub_app::{
-    admin::{count_instances, is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter},
+    admin::{
+        count_instances, is_internal_agent, AdminNewMemory, ConnectionSession, LogFilter,
+        MemoryFilter,
+    },
     store::{normalize_folder, MemoryId, Scope},
     Admin, AppError, READ_HISTORY_DAYS,
 };
@@ -60,6 +63,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/memories", get(list_memories).post(add_memory))
         .route("/memories/move", post(move_memory))
         .route("/reads", get(read_ranking))
+        .route("/filter", get(filter_memories))
         .route("/memories/{*id}", get(get_memory).delete(delete_memory))
         .route("/connections", get(connections))
         .route("/connections/summary", get(connection_summary))
@@ -436,6 +440,79 @@ async fn read_ranking(
         admin.read_ranking(scope, owner.as_deref(), folder.as_deref(), days, limit)
     })
     .await?)
+}
+
+#[derive(Deserialize)]
+struct FilterQuery {
+    scope: Option<String>,
+    owner: Option<String>,
+    folder: Option<String>,
+    agent: Option<String>,
+    ip: Option<String>,
+    by: Option<String>,
+    added_from: Option<String>,
+    added_to: Option<String>,
+    updated_from: Option<String>,
+    updated_to: Option<String>,
+    sort: Option<String>,
+    limit: Option<usize>,
+}
+
+/// A range bound: an RFC 3339 time, or a `YYYY-MM-DD` day (UTC). A day as
+/// the `to` bound includes that whole day.
+fn time_bound(
+    name: &str,
+    value: Option<String>,
+    end: bool,
+) -> Result<Option<DateTime<Utc>>, ApiError> {
+    let Some(value) = non_empty(value) else {
+        return Ok(None);
+    };
+    if let Ok(t) = DateTime::parse_from_rfc3339(&value) {
+        return Ok(Some(t.with_timezone(&Utc)));
+    }
+    let day = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
+        ApiError::bad_request(format!(
+            "'{name}' must be an RFC 3339 time or a YYYY-MM-DD date, not '{value}'"
+        ))
+    })?;
+    let day = if end {
+        day.succ_opt().unwrap_or(day)
+    } else {
+        day
+    };
+    Ok(Some(day.and_time(NaiveTime::MIN).and_utc()))
+}
+
+async fn filter_memories(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<FilterQuery>,
+) -> ApiResult {
+    let ip = caller(&state, &headers, peer);
+    let scope = match non_empty(query.scope) {
+        Some(s) => Some(s.parse::<Scope>()?),
+        None => None,
+    };
+    let filter = MemoryFilter {
+        scope,
+        owner: non_empty(query.owner),
+        folder: non_empty(query.folder),
+        agent: non_empty(query.agent),
+        ip: non_empty(query.ip),
+        by: non_empty(query.by).unwrap_or_default().parse()?,
+        added_from: time_bound("added_from", query.added_from, false)?,
+        added_to: time_bound("added_to", query.added_to, true)?,
+        updated_from: time_bound("updated_from", query.updated_from, false)?,
+        updated_to: time_bound("updated_to", query.updated_to, true)?,
+        sort: non_empty(query.sort).unwrap_or_default().parse()?,
+        limit: query
+            .limit
+            .unwrap_or(DEFAULT_LOG_LIMIT)
+            .clamp(1, MAX_LOG_LIMIT),
+    };
+    ok(run(&state, ip, move |admin| admin.filter_memories(&filter)).await?)
 }
 
 async fn get_memory(

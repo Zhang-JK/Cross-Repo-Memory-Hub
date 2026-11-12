@@ -2,10 +2,13 @@ use std::{io::Write, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use memhub_app::{
-    admin::{AdminNewMemory, InstanceCount, LogFilter, WindowCounts},
+    admin::{
+        AdminNewMemory, ChangeRole, InstanceCount, LogFilter, MemoryFilter, MemorySort,
+        WindowCounts,
+    },
     audit::LogQuery,
     clean_instance,
-    store::{MemoryId, Scope},
+    store::{MemoryId, MemoryPatch, Scope},
     AddMemory, AgentSession, ConnInfo, Hub, HubConfig, ADMIN_ACTOR, MAX_INSTANCE_LEN,
 };
 
@@ -681,4 +684,247 @@ fn instance_labels_are_cleaned() {
         clean_instance(&long).unwrap().chars().count(),
         MAX_INSTANCE_LEN
     );
+}
+
+fn ids(found: &memhub_app::admin::FilteredMemories) -> Vec<String> {
+    let mut ids: Vec<String> = found.memories.iter().map(|m| m.id.to_string()).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn filter_memories_by_agent_ip_and_dates() {
+    let (dir, hub) = hub();
+    let mut alice = agent(&hub, "alice", "10.0.0.1");
+    alice.add_repo("engine", None, None).unwrap();
+    let mut bob = agent(&hub, "bob", "10.0.0.2");
+    bob.add_repo("engine", None, None).unwrap();
+    let repo = |title: &str| AddMemory {
+        scope: Scope::Repo,
+        repo: Some("engine".into()),
+        title: title.into(),
+        body: "x".into(),
+        ..Default::default()
+    };
+    let retry = alice.add_memory(repo("Retry policy")).unwrap();
+    let cache = bob.add_memory(repo("Cache notes")).unwrap();
+    let temp = alice.add_memory(repo("Temp")).unwrap();
+    alice.delete_memory(&temp.meta.id, None).unwrap();
+    bob.add_memory(repo("Temp")).unwrap();
+    let bob_vpn = agent(&hub, "bob", "10.0.0.3");
+    bob_vpn
+        .update_memory(
+            &retry.meta.id,
+            MemoryPatch {
+                body: Some("3 retries".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    alice
+        .move_memory(&cache.meta.id, "pitfalls", None, None)
+        .unwrap();
+    hub.admin("192.168.1.9")
+        .add_memory(AdminNewMemory {
+            scope: Scope::Agent,
+            owner: "alice".into(),
+            title: Some("Seed".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    std::fs::write(
+        dir.path().join("memories/repo/engine/legacy.md"),
+        "---\ntitle: Legacy notes\nauthor: carol\ncreated_at: 2026-01-05T08:00:00Z\n\
+         updated_at: 2026-01-05T08:00:00Z\nversion: 1\n---\n\nold\n",
+    )
+    .unwrap();
+
+    let admin = hub.admin("127.0.0.1");
+    let run = |f: MemoryFilter| {
+        admin
+            .filter_memories(&MemoryFilter { limit: 100, ..f })
+            .unwrap()
+    };
+    let all = run(MemoryFilter::default());
+    assert_eq!((all.total, all.matched), (5, 5));
+    assert_eq!(all.agents, vec!["(admin)", "alice", "bob", "carol"]);
+    assert_eq!(
+        all.ips,
+        vec!["10.0.0.1", "10.0.0.2", "10.0.0.3", "192.168.1.9"]
+    );
+
+    let item = |id: &str| {
+        all.memories
+            .iter()
+            .find(|m| m.id.to_string() == id)
+            .unwrap()
+    };
+    let r = item("repo/engine/retry-policy");
+    assert_eq!(
+        (r.added.agent.as_str(), r.added.ip.as_deref()),
+        ("alice", Some("10.0.0.1"))
+    );
+    let u = r.updated.as_ref().unwrap();
+    assert_eq!(
+        (u.agent.as_str(), u.ip.as_deref()),
+        ("bob", Some("10.0.0.3"))
+    );
+    assert_eq!((r.changes, r.version), (1, 2));
+    assert_eq!(r.agents, vec!["alice", "bob"]);
+    assert_eq!(r.ips, vec!["10.0.0.1", "10.0.0.3"]);
+    let c = item("repo/engine/pitfalls/cache-notes");
+    assert_eq!(
+        c.added.ip.as_deref(),
+        Some("10.0.0.2"),
+        "the trail follows the move"
+    );
+    assert_eq!(c.updated.as_ref().unwrap().agent, "alice");
+    let t = item("repo/engine/temp");
+    assert_eq!(
+        (t.added.agent.as_str(), t.added.ip.as_deref()),
+        ("bob", Some("10.0.0.2"))
+    );
+    assert_eq!(
+        t.agents,
+        vec!["bob"],
+        "the deleted earlier memory does not count"
+    );
+    assert!(t.updated.is_none());
+    let legacy = item("repo/engine/legacy");
+    assert_eq!(
+        (legacy.added.agent.as_str(), legacy.added.ip.as_deref()),
+        ("carol", None)
+    );
+    assert_eq!(
+        all.memories.last().unwrap().id.to_string(),
+        "repo/engine/legacy",
+        "most recently changed first"
+    );
+
+    let by = |agent: &str, by: ChangeRole| {
+        ids(&run(MemoryFilter {
+            agent: Some(agent.into()),
+            by,
+            ..Default::default()
+        }))
+    };
+    assert_eq!(
+        by("bob", ChangeRole::Any),
+        vec![
+            "repo/engine/pitfalls/cache-notes",
+            "repo/engine/retry-policy",
+            "repo/engine/temp"
+        ]
+    );
+    assert_eq!(
+        by("bob", ChangeRole::Added),
+        vec!["repo/engine/pitfalls/cache-notes", "repo/engine/temp"]
+    );
+    assert_eq!(
+        by("bob", ChangeRole::Updated),
+        vec!["repo/engine/retry-policy"]
+    );
+    assert_eq!(
+        by("alice", ChangeRole::Updated),
+        vec!["repo/engine/pitfalls/cache-notes"]
+    );
+    assert_eq!(by("(admin)", ChangeRole::Any), vec!["agent/alice/seed"]);
+
+    let ip = |agent: Option<&str>, ip: &str, by: ChangeRole| {
+        ids(&run(MemoryFilter {
+            agent: agent.map(Into::into),
+            ip: Some(ip.into()),
+            by,
+            ..Default::default()
+        }))
+    };
+    assert_eq!(
+        ip(None, "10.0.0.3", ChangeRole::Any),
+        vec!["repo/engine/retry-policy"]
+    );
+    assert!(ip(None, "10.0.0.3", ChangeRole::Added).is_empty());
+    assert_eq!(
+        ip(None, "10.0.0.", ChangeRole::Any).len(),
+        3,
+        "substring; legacy has no IP"
+    );
+    assert_eq!(
+        ip(Some("bob"), "10.0.0.3", ChangeRole::Any),
+        vec!["repo/engine/retry-policy"]
+    );
+    assert!(
+        ip(Some("alice"), "10.0.0.3", ChangeRole::Any).is_empty(),
+        "agent and IP must match the same change"
+    );
+
+    let hour_ago = Utc::now() - Duration::hours(1);
+    let jan = |d: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, d)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+    };
+    let added_old = run(MemoryFilter {
+        added_from: Some(jan(5)),
+        added_to: Some(jan(6)),
+        ..Default::default()
+    });
+    assert_eq!(ids(&added_old), vec!["repo/engine/legacy"]);
+    assert_eq!(
+        run(MemoryFilter {
+            added_from: Some(hour_ago),
+            ..Default::default()
+        })
+        .matched,
+        4
+    );
+    assert!(
+        run(MemoryFilter {
+            added_from: Some(jan(5)),
+            added_to: Some(jan(5)),
+            ..Default::default()
+        })
+        .memories
+        .is_empty(),
+        "the end is exclusive"
+    );
+    assert_eq!(
+        ids(&run(MemoryFilter {
+            updated_from: Some(hour_ago),
+            ..Default::default()
+        })),
+        vec![
+            "repo/engine/pitfalls/cache-notes",
+            "repo/engine/retry-policy"
+        ],
+        "never-updated memories have no update"
+    );
+    assert_eq!(
+        ids(&run(MemoryFilter {
+            agent: Some("bob".into()),
+            by: ChangeRole::Added,
+            updated_from: Some(hour_ago),
+            ..Default::default()
+        })),
+        vec!["repo/engine/pitfalls/cache-notes"]
+    );
+
+    let scoped = run(MemoryFilter {
+        scope: Some(Scope::Repo),
+        owner: Some("engine".into()),
+        folder: Some("pitfalls".into()),
+        ..Default::default()
+    });
+    assert_eq!((scoped.total, scoped.matched), (1, 1));
+
+    let first = admin
+        .filter_memories(&MemoryFilter {
+            sort: MemorySort::Added,
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!((first.matched, first.memories.len()), (5, 1));
+    assert_eq!(first.memories[0].id.to_string(), "agent/alice/seed");
 }

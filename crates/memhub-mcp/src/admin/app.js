@@ -569,6 +569,17 @@ function activityChart(days) {
 // Memories
 // ---------------------------------------------------------------------------
 
+const FILTER_KEYS = ['agent', 'ip', 'by', 'added_from', 'added_to', 'updated_from', 'updated_to', 'sort'];
+const FILTER_DEFAULTS = { by: 'any', sort: 'updated' };
+
+/** Start of a local calendar day (`YYYY-MM-DD`) as an ISO instant; with `end`, the start of the next day. */
+function localDayBound(day, end) {
+  if (!day) return '';
+  const [y, m, d] = day.split('-').map(Number);
+  const t = new Date(y, m - 1, d + (end ? 1 : 0));
+  return isNaN(t) ? '' : t.toISOString();
+}
+
 async function viewMemories(view, params) {
   const st = {
     scope: params.get('scope') || '',
@@ -577,13 +588,18 @@ async function viewMemories(view, params) {
     q: params.get('q') || '',
     id: params.get('id') || '',
     ranking: params.get('view') === 'ranking',
+    filtering: params.get('view') === 'filter',
     days: params.get('days') || '',
+    f: Object.fromEntries(FILTER_KEYS.map((k) => [k, params.get(k) || FILTER_DEFAULTS[k] || ''])),
+    limit: PAGE,
     folders: [],
     mode: 'preview',
   };
+  const filterParams = () => Object.fromEntries(FILTER_KEYS.map((k) => [k, st.f[k] === FILTER_DEFAULTS[k] ? '' : st.f[k]]));
   const sync = () => setRouteParams('memories', st.ranking
     ? { view: 'ranking', scope: st.scope, owner: st.owner, folder: st.folder, days: st.days }
-    : { scope: st.scope, owner: st.owner, folder: st.folder, q: st.q, id: st.id });
+    : st.filtering ? { view: 'filter', scope: st.scope, owner: st.owner, folder: st.folder, ...filterParams() }
+      : { scope: st.scope, owner: st.owner, folder: st.folder, q: st.q, id: st.id });
   const where = { scope: st.scope, owner: st.owner, folder: st.folder };
 
   const treeBox = h('div', { class: 'scroll' });
@@ -594,11 +610,13 @@ async function viewMemories(view, params) {
   const search = h('input', { type: 'search', placeholder: 'Search title, folder, tags, body…', value: st.q });
 
   const modeSwitch = h('div', { class: 'seg' },
-    h('a', { class: st.ranking ? '' : 'on', href: `#/memories${query(where)}`, text: 'Browse' }),
-    h('a', { class: st.ranking ? 'on' : '', href: `#/memories${query({ view: 'ranking', ...where })}`, title: 'Memories ranked by how often agents read them', text: 'Ranking' }));
+    h('a', { class: st.ranking || st.filtering ? '' : 'on', href: `#/memories${query(where)}`, text: 'Browse' }),
+    h('a', { class: st.ranking ? 'on' : '', href: `#/memories${query({ view: 'ranking', ...where })}`, title: 'Memories ranked by how often agents read them', text: 'Ranking' }),
+    h('a', { class: st.filtering ? 'on' : '', href: `#/memories${query({ view: 'filter', ...where })}`, title: 'Filter memories by the agent and IP that added or updated them, and by add / update date', text: 'Filter' }));
   setHead('Memories', st.ranking
     ? 'How often agents read each memory (get_memory), for all memories or the selected folder'
-    : 'Every repo and agent memory, organized in folders and stored as Markdown files with front-matter properties', [
+    : st.filtering ? 'Memories by who added or updated them, from which IP, and when'
+      : 'Every repo and agent memory, organized in folders and stored as Markdown files with front-matter properties', [
     modeSwitch,
     h('button', { type: 'button', on: { click: () => newFolderModal() } }, '+ New folder'),
     h('button', { class: 'primary', type: 'button', on: { click: () => newMemoryModal() } }, '+ New memory')]);
@@ -609,9 +627,46 @@ async function viewMemories(view, params) {
     h('button', { type: 'button', class: st.days === v ? 'on' : '', dataset: { days: v }, text: label,
       on: { click: () => { st.days = v; daysSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.days === v)); sync(); loadRanking(); } } })));
   const treePanel = h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, h('h2', { text: 'Folders' })), treeBox);
+
+  const filterBox = h('div', { class: 'scroll' });
+  const filterTitle = h('h2');
+  const filterCount = h('span', { class: 'muted' });
+  const agentOptions = h('datalist', { id: 'mf-agent-options' });
+  const ipOptions = h('datalist', { id: 'mf-ip-options' });
+  const setFilter = (k, v) => { st.f[k] = v; st.limit = PAGE; sync(); loadFilter(); };
+  const agentInput = filterInput('Agent', st.f.agent, (v) => setFilter('agent', v), 'mf-agent-options');
+  const ipInput = filterInput('IP address', st.f.ip, (v) => setFilter('ip', v), 'mf-ip-options');
+  const choice = (key, options, title) => {
+    const sel = h('select', { title }, options.map(([v, label]) => h('option', { value: v, text: label })));
+    sel.value = st.f[key];
+    sel.addEventListener('change', () => setFilter(key, sel.value));
+    return sel;
+  };
+  const dateInput = (key, title) => {
+    const input = h('input', { type: 'date', class: 'date', title, value: st.f[key] });
+    input.addEventListener('change', () => setFilter(key, input.value));
+    return input;
+  };
+  const dateRange = (label, key, what) => h('span', { class: 'range' }, h('span', { class: 'muted', text: label }),
+    dateInput(`${key}_from`, `${what} on or after this day`), '–', dateInput(`${key}_to`, `${what} on or before this day`));
+  const clearFilters = () => {
+    st.f = Object.fromEntries(FILTER_KEYS.map((k) => [k, FILTER_DEFAULTS[k] || '']));
+    sync(); render();
+  };
+  const filterBar = h('div', { class: 'filters' },
+    agentInput, agentOptions, ipInput, ipOptions,
+    choice('by', [['any', 'Added or updated'], ['added', 'Added'], ['updated', 'Updated']], 'Which change the agent and IP must match'),
+    dateRange('Added', 'added', 'Added'),
+    dateRange('Updated', 'updated', 'Last updated'),
+    choice('sort', [['updated', 'Recently updated first'], ['added', 'Recently added first']], 'Order'),
+    h('button', { type: 'button', class: 'small', text: 'Clear', on: { click: clearFilters } }));
+  const filterNote = h('div', { class: 'filter-note muted', text: 'Agent and IP must match the same change: the add, a later update (edit, move, grouping), or either. IPs come from the audit log, so changes it has no record of (hand-edited files, older logs) have no IP. Dates are days in your browser\'s time zone; a memory never changed after it was added does not match an Updated range.' });
+
   view.replaceChildren(st.ranking
     ? h('div', { class: 'mem-layout ranking' }, treePanel,
       h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, rankTitle, daysSeg), rankBox))
+    : st.filtering ? h('div', { class: 'mem-layout ranking' }, treePanel,
+      h('div', { class: 'panel' }, h('div', { class: 'panel-head' }, filterTitle, filterCount), filterBar, filterNote, filterBox))
     : h('div', { class: 'mem-layout' }, treePanel,
       h('div', { class: 'panel' }, h('div', { class: 'search-row' }, search), h('div', { class: 'panel-head' }, h('h2', { id: 'list-title' }), listCount), listDesc, listBox),
       h('div', { class: 'panel' }, detailBox)));
@@ -670,8 +725,8 @@ async function viewMemories(view, params) {
     sync(); renderTree(); refresh();
   }
 
-  const refresh = () => (st.ranking ? loadRanking() : loadList());
-  const reloadMain = () => (st.ranking ? loadRanking() : Promise.all([loadList(), loadDetail()]));
+  const refresh = () => (st.ranking ? loadRanking() : st.filtering ? loadFilter() : loadList());
+  const reloadMain = () => (st.ranking ? loadRanking() : st.filtering ? loadFilter() : Promise.all([loadList(), loadDetail()]));
   const selectionLabel = () => (st.owner ? `${st.scope}/${st.owner}${st.folder ? `/${st.folder}` : ''}` : st.scope ? `All ${st.scope} memories` : 'All memories');
 
   async function loadRanking() {
@@ -725,6 +780,62 @@ async function viewMemories(view, params) {
         h('div', { class: 'rank-section' }, h('h3', { text: 'Folders' }), h('div', { class: 'table-wrap' }, folderTable)));
     } catch (e) {
       rankBox.replaceChildren(errorBox(e));
+    }
+  }
+
+  let filterSeq = 0;
+  async function loadFilter() {
+    const seq = ++filterSeq;
+    filterTitle.textContent = selectionLabel();
+    filterBox.replaceChildren(loading());
+    try {
+      const r = await api('/filter' + query({
+        scope: st.scope, owner: st.owner, folder: st.folder,
+        agent: st.f.agent, ip: st.f.ip, by: st.f.by === 'any' ? '' : st.f.by,
+        added_from: localDayBound(st.f.added_from), added_to: localDayBound(st.f.added_to, true),
+        updated_from: localDayBound(st.f.updated_from), updated_to: localDayBound(st.f.updated_to, true),
+        sort: st.f.sort === 'updated' ? '' : st.f.sort, limit: st.limit,
+      }));
+      if (seq !== filterSeq) return;
+      agentOptions.replaceChildren(...r.agents.map((a) => h('option', { value: a })));
+      ipOptions.replaceChildren(...r.ips.map((ip) => h('option', { value: ip })));
+      filterCount.textContent = `${r.matched} of ${r.total} memories`;
+      if (!r.memories.length) {
+        filterBox.replaceChildren(h('div', { class: 'empty' }, r.total ? 'No memory matches these filters.' : 'This folder is empty.',
+          r.total ? h('div', {}, h('button', { class: 'link', type: 'button', text: 'Clear filters', on: { click: clearFilters } })) : null));
+        return;
+      }
+      const pick = (key, value, input) => { input.value = value; setFilter(key, value); };
+      const agentLink = (name) => h('button', { class: 'link', type: 'button', title: `Only memories ${name === '(admin)' ? 'changed in this admin UI' : `added or updated by ${name}`}`,
+        on: { click: () => pick('agent', name, agentInput) } }, agentLabel(name));
+      const ipLink = (ip) => (ip
+        ? h('button', { class: 'link mono', type: 'button', title: `Only memories added or updated from ${ip}`, text: ip, on: { click: () => pick('ip', ip, ipInput) } })
+        : h('span', { class: 'muted', title: 'The audit log has no record of this change', text: 'IP unknown' }));
+      const stamp = (s) => (s
+        ? h('td', { class: 'nowrap' }, h('span', { title: s.at, text: fmtTime(s.at) }), h('div', { class: 'who' }, agentLink(s.agent), ipLink(s.ip)))
+        : h('td', { class: 'muted', title: 'Not changed since it was added', text: 'never' }));
+      const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+      const table = h('table', { class: 'rank-table filter-table' },
+        h('thead', {}, h('tr', {}, ['Memory', 'Folder', 'Added', 'Last updated', 'Changes', 'Agents · IPs', 'Reads'].map((c) => h('th', { text: c })))),
+        h('tbody', {}, r.memories.map((m) => {
+          const { scope, owner, folder } = parseId(m.id);
+          return h('tr', {},
+            h('td', { class: 'wrap' }, h('a', { href: memoryHash(m.id), title: 'Open this memory', text: m.title }), h('div', { class: 'id mono muted', text: m.id })),
+            h('td', { class: 'wrap' }, h('button', { class: 'link folder-link', type: 'button', title: 'Filter inside this folder', on: { click: () => select(scope, owner, folder) } },
+              icon('folder'), `${scope}/${owner}${folder ? `/${folder}` : ''}`)),
+            stamp(m.added),
+            stamp(m.updated),
+            h('td', { class: 'num' }, m.changes ? h('a', { href: `#/updates${query({ memory: m.id, days: 'all' })}`, title: 'Change history in the update log', text: String(m.changes) }) : '0'),
+            h('td', { class: 'nowrap', title: [`Agents: ${m.agents.join(', ') || '—'}`, `IPs: ${m.ips.join(', ') || '—'}`].join('\n'),
+              text: `${plural(m.agents.length, 'agent')} · ${plural(m.ips.length, 'IP')}` }),
+            h('td', { class: 'num', text: String(m.reads) }));
+        })));
+      const more = r.matched > r.memories.length
+        ? h('div', { class: 'empty' }, h('button', { type: 'button', text: 'Show more', on: { click: () => { st.limit += PAGE; loadFilter(); } } }))
+        : null;
+      filterBox.replaceChildren(h('div', { class: 'table-wrap' }, table), more);
+    } catch (e) {
+      if (seq === filterSeq) filterBox.replaceChildren(errorBox(e));
     }
   }
 

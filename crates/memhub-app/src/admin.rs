@@ -137,6 +137,134 @@ pub struct RankedFolder {
     pub read_memories: usize,
 }
 
+/// Which change of a memory the agent and IP filters of
+/// [`Admin::filter_memories`] look at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChangeRole {
+    /// The add or any later change.
+    #[default]
+    Any,
+    Added,
+    /// Any change after the add (update, move, grouping).
+    Updated,
+}
+
+impl std::str::FromStr for ChangeRole {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "" | "any" => Ok(Self::Any),
+            "added" => Ok(Self::Added),
+            "updated" => Ok(Self::Updated),
+            other => Err(AppError::Invalid(format!(
+                "'by' must be any, added or updated, not '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Order of [`Admin::filter_memories`] results, newest first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemorySort {
+    #[default]
+    Updated,
+    Added,
+}
+
+impl std::str::FromStr for MemorySort {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "" | "updated" => Ok(Self::Updated),
+            "added" => Ok(Self::Added),
+            other => Err(AppError::Invalid(format!(
+                "'sort' must be updated or added, not '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Filter for [`Admin::filter_memories`]. Time ranges include `from` and
+/// exclude `to`.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilter {
+    pub scope: Option<Scope>,
+    pub owner: Option<String>,
+    /// Folder below the owner, subfolders included.
+    pub folder: Option<String>,
+    /// Exact agent name.
+    pub agent: Option<String>,
+    /// Substring of the client IP.
+    pub ip: Option<String>,
+    pub by: ChangeRole,
+    pub added_from: Option<DateTime<Utc>>,
+    pub added_to: Option<DateTime<Utc>>,
+    /// Range of the last update; memories never changed after the add don't match.
+    pub updated_from: Option<DateTime<Utc>>,
+    pub updated_to: Option<DateTime<Utc>>,
+    pub sort: MemorySort,
+    pub limit: usize,
+}
+
+impl MemoryFilter {
+    fn has_update_range(&self) -> bool {
+        self.updated_from.is_some() || self.updated_to.is_some()
+    }
+}
+
+/// Result of [`Admin::filter_memories`].
+#[derive(Debug, Clone, Serialize)]
+pub struct FilteredMemories {
+    /// Memories in the selected scope / owner / folder.
+    pub total: usize,
+    /// Memories matching the filter, before `limit`.
+    pub matched: usize,
+    pub memories: Vec<FilteredMemory>,
+    /// Every agent that added or changed a memory of the selection, sorted.
+    pub agents: Vec<String>,
+    /// Every IP a memory of the selection was added or changed from, sorted.
+    pub ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FilteredMemory {
+    pub id: MemoryId,
+    pub title: String,
+    pub kind: String,
+    pub tags: Vec<String>,
+    pub version: u64,
+    pub reads: u64,
+    pub added: ChangeStamp,
+    /// The last change after the add; `None` if the memory was never changed.
+    pub updated: Option<ChangeStamp>,
+    /// Audited changes after the add.
+    pub changes: usize,
+    /// Distinct agents that added or changed the memory.
+    pub agents: Vec<String>,
+    /// Distinct IPs the memory was added or changed from.
+    pub ips: Vec<String>,
+}
+
+/// When and by whom a memory was added or last changed. Agent and time come
+/// from the memory file; the IP comes from the audit log and is `None` when
+/// the log has no record of the change.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeStamp {
+    pub at: DateTime<Utc>,
+    pub agent: String,
+    pub ip: Option<String>,
+}
+
+/// Audited changes of one memory, following it across moves.
+#[derive(Debug, Default)]
+struct ChangeTrail {
+    added: Option<(String, String)>,
+    /// `(agent, ip)` of every later change, oldest first.
+    changes: Vec<(String, String)>,
+}
+
 /// Input for [`Admin::add_memory`]. With `markdown`, the file's front matter
 /// supplies any property not given explicitly.
 #[derive(Debug, Clone, Default)]
@@ -512,6 +640,94 @@ impl Admin {
             memories: ranked,
             folders,
         })
+    }
+
+    /// Memories of a scope / owner / folder filtered by the agent and IP
+    /// that added or changed them and by when they were added and last
+    /// updated, newest first.
+    pub fn filter_memories(&self, filter: &MemoryFilter) -> Result<FilteredMemories> {
+        let folder = filter.folder.as_deref().map(normalize_folder).transpose()?;
+        let memories = self.hub.store().list(&Filter {
+            scope: filter.scope,
+            owner: filter.owner.clone(),
+            folder: folder.filter(|f| !f.is_empty()),
+            ..Default::default()
+        })?;
+        let mut trails = self.change_trails()?;
+        let reads = self.hub.reads().all();
+        let mut agents = BTreeMap::<String, ()>::new();
+        let mut ips = BTreeMap::<String, ()>::new();
+        let mut matched = Vec::new();
+        let total = memories.len();
+        for memory in memories {
+            let meta = memory.meta;
+            let trail = trails.remove(&meta.id.to_string()).unwrap_or_default();
+            let item = filtered_item(&meta, &trail, &reads);
+            for agent in item.agents.iter().filter(|a| !is_internal_agent(a)) {
+                agents.insert(agent.clone(), ());
+            }
+            for ip in &item.ips {
+                ips.insert(ip.clone(), ());
+            }
+            if filter_matches(filter, &item, &trail) {
+                matched.push(item);
+            }
+        }
+        match filter.sort {
+            MemorySort::Updated => matched.sort_by_key(|m| {
+                std::cmp::Reverse(m.updated.as_ref().map_or(m.added.at, |u| u.at))
+            }),
+            MemorySort::Added => matched.sort_by_key(|m| std::cmp::Reverse(m.added.at)),
+        }
+        let count = matched.len();
+        matched.truncate(filter.limit);
+        Ok(FilteredMemories {
+            total,
+            matched: count,
+            memories: matched,
+            agents: agents.into_keys().collect(),
+            ips: ips.into_keys().collect(),
+        })
+    }
+
+    /// Agent and IP of every audited change of each existing memory, by
+    /// memory id. A move carries the trail over to the new id; a delete
+    /// drops it, so a memory re-added under the same id starts afresh.
+    fn change_trails(&self) -> Result<HashMap<String, ChangeTrail>> {
+        let mut trails: HashMap<String, ChangeTrail> = HashMap::new();
+        for record in self.read_log(None)? {
+            if str_field(&record, "event") != "memory_changed" {
+                continue;
+            }
+            let id = str_field(&record, "memory_id").to_string();
+            let who = (
+                str_field(&record, "agent").to_string(),
+                str_field(&record, "ip").to_string(),
+            );
+            match str_field(&record, "action") {
+                "add" => {
+                    trails.insert(
+                        id,
+                        ChangeTrail {
+                            added: Some(who),
+                            changes: Vec::new(),
+                        },
+                    );
+                }
+                "delete" => {
+                    trails.remove(&id);
+                }
+                "move" => {
+                    let mut trail = trails
+                        .remove(str_field(&record, "previous_id"))
+                        .unwrap_or_default();
+                    trail.changes.push(who);
+                    trails.insert(id, trail);
+                }
+                _ => trails.entry(id).or_default().changes.push(who),
+            }
+        }
+        Ok(trails)
     }
 
     pub fn add_memory(&self, input: AdminNewMemory) -> Result<Memory> {
@@ -1058,6 +1274,106 @@ impl Admin {
         stats.recent_updates = recent;
         Ok(stats)
     }
+}
+
+fn filtered_item(
+    meta: &MemoryMeta,
+    trail: &ChangeTrail,
+    reads: &HashMap<String, ReadStat>,
+) -> FilteredMemory {
+    let added = ChangeStamp {
+        at: meta.created_at,
+        agent: meta.author.clone(),
+        ip: trail.added.as_ref().map(|(_, ip)| ip.clone()),
+    };
+    let last = trail.changes.last();
+    let changed = !meta.updated_by.is_empty() || meta.version > 1 || last.is_some();
+    let updated = changed.then(|| ChangeStamp {
+        at: meta.updated_at,
+        agent: if meta.updated_by.is_empty() {
+            last.map_or_else(|| "unknown".to_string(), |(agent, _)| agent.clone())
+        } else {
+            meta.updated_by.clone()
+        },
+        ip: last.map(|(_, ip)| ip.clone()),
+    });
+    let mut agents: Vec<String> = Vec::new();
+    let mut ips: Vec<String> = Vec::new();
+    let named = [Some(&added.agent), updated.as_ref().map(|u| &u.agent)];
+    let audited = trail.added.iter().chain(&trail.changes);
+    for agent in named
+        .into_iter()
+        .flatten()
+        .chain(audited.clone().map(|(a, _)| a))
+    {
+        if !agent.is_empty() && !agents.contains(agent) {
+            agents.push(agent.clone());
+        }
+    }
+    for (_, ip) in audited {
+        if !ip.is_empty() && !ips.contains(ip) {
+            ips.push(ip.clone());
+        }
+    }
+    FilteredMemory {
+        id: meta.id.clone(),
+        title: meta.title.clone(),
+        kind: meta.kind.clone(),
+        tags: meta.tags.clone(),
+        version: meta.version,
+        reads: reads.get(&meta.id.to_string()).map_or(0, |r| r.count),
+        added,
+        updated,
+        changes: trail.changes.len(),
+        agents,
+        ips,
+    }
+}
+
+/// Agent and IP must match the same change: the add, or one later change.
+fn filter_matches(filter: &MemoryFilter, item: &FilteredMemory, trail: &ChangeTrail) -> bool {
+    let in_range = |at: DateTime<Utc>, from: Option<DateTime<Utc>>, to: Option<DateTime<Utc>>| {
+        from.is_none_or(|f| at >= f) && to.is_none_or(|t| at < t)
+    };
+    if !in_range(item.added.at, filter.added_from, filter.added_to) {
+        return false;
+    }
+    if filter.has_update_range()
+        && !item
+            .updated
+            .as_ref()
+            .is_some_and(|u| in_range(u.at, filter.updated_from, filter.updated_to))
+    {
+        return false;
+    }
+    if filter.agent.is_none() && filter.ip.is_none() {
+        return true;
+    }
+    let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+    if filter.by != ChangeRole::Updated {
+        candidates.push((&item.added.agent, item.added.ip.as_deref()));
+        if let Some((agent, ip)) = &trail.added {
+            candidates.push((agent, Some(ip)));
+        }
+    }
+    if filter.by != ChangeRole::Added {
+        if let Some(u) = &item.updated {
+            candidates.push((&u.agent, u.ip.as_deref()));
+        }
+        candidates.extend(
+            trail
+                .changes
+                .iter()
+                .map(|(a, ip)| (a.as_str(), Some(ip.as_str()))),
+        );
+    }
+    candidates.into_iter().any(|(agent, ip)| {
+        filter.agent.as_deref().is_none_or(|a| a == agent)
+            && filter
+                .ip
+                .as_deref()
+                .is_none_or(|want| ip.is_some_and(|ip| ip.contains(want)))
+    })
 }
 
 fn str_field<'a>(record: &'a Value, key: &str) -> &'a str {

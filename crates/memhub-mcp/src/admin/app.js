@@ -572,10 +572,13 @@ function activityChart(days) {
 const FILTER_KEYS = ['agent', 'ip', 'by', 'added_from', 'added_to', 'updated_from', 'updated_to', 'sort'];
 const FILTER_DEFAULTS = { by: 'any', sort: 'updated' };
 
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 /** Start of a local calendar day (`YYYY-MM-DD`) as an ISO instant; with `end`, the start of the next day. */
 function localDayBound(day, end) {
-  if (!day) return '';
+  if (!DAY_RE.test(day || '')) return '';
   const [y, m, d] = day.split('-').map(Number);
+  if (y < 1970) return '';
   const t = new Date(y, m - 1, d + (end ? 1 : 0));
   return isNaN(t) ? '' : t.toISOString();
 }
@@ -643,8 +646,10 @@ async function viewMemories(view, params) {
     return sel;
   };
   const dateInput = (key, title) => {
-    const input = h('input', { type: 'date', class: 'date', title, value: st.f[key] });
-    input.addEventListener('change', () => setFilter(key, input.value));
+    const input = h('input', { type: 'date', class: 'date', title, value: st.f[key], min: '1970-01-01', max: '9999-12-31' });
+    // While a day is typed in, the input passes through partial values such as a 5-digit year.
+    input.addEventListener('change', () => { if (!input.value || (DAY_RE.test(input.value) && input.validity.valid)) setFilter(key, input.value); });
+    input.addEventListener('blur', () => { if (input.value !== st.f[key]) input.value = st.f[key]; });
     return input;
   };
   const dateRange = (label, key, what) => h('span', { class: 'range' }, h('span', { class: 'muted', text: label }),
@@ -830,10 +835,10 @@ async function viewMemories(view, params) {
               text: `${plural(m.agents.length, 'agent')} · ${plural(m.ips.length, 'IP')}` }),
             h('td', { class: 'num', text: String(m.reads) }));
         })));
-      const more = r.matched > r.memories.length
-        ? h('div', { class: 'empty' }, h('button', { type: 'button', text: 'Show more', on: { click: () => { st.limit += PAGE; loadFilter(); } } }))
-        : null;
-      filterBox.replaceChildren(h('div', { class: 'table-wrap' }, table), more);
+      filterBox.replaceChildren(h('div', { class: 'table-wrap' }, table));
+      if (r.matched > r.memories.length) {
+        filterBox.append(h('div', { class: 'empty' }, h('button', { type: 'button', text: 'Show more', on: { click: () => { st.limit += PAGE; loadFilter(); } } })));
+      }
     } catch (e) {
       if (seq === filterSeq) filterBox.replaceChildren(errorBox(e));
     }
